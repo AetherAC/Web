@@ -74,8 +74,8 @@ onMounted(async () => {
           <div class="panel-heading"><div><Github :size="19" /><h2>GitHub Sync</h2></div><RefreshCw :size="15" :class="{ spinning: syncing }" /></div>
           <div v-if="syncing" class="sync-loading">正在同步仓库进度…</div>
           <template v-else-if="github?.configured">
-            <a class="repo-card" :href="github.repository?.url" target="_blank" rel="noreferrer">
-              <span>REPOSITORY</span><b>{{ github.repository?.name }}</b><p>{{ github.repository?.description || 'AetherAC development repository' }}</p><ArrowUpRight :size="16" />
+            <a class="repo-card">
+              <span>REPOSITORY - CLOSE SOURCE</span><b>{{ github.repository?.name }}</b><p>{{ github.repository?.description || 'AetherAC development repository' }}</p>
             </a>
             <div class="github-metrics">
               <div><strong>{{ github.totals?.completion }}%</strong><span>ISSUE COMPLETION</span></div>
