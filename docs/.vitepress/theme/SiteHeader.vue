@@ -30,7 +30,7 @@ const links = [
     </nav>
     <div v-if="open" class="mobile-links">
       <a v-for="link in links" :key="link.href" :href="link.href" @click="open = false">{{ link.label }}</a>
-      <a href="mailto:contact@aetherac.abnt.it">contact@aetherac.abnt.it</a>
+      <a href="mailto:contact@aetherac.abnt.it">contact@abnt.it</a>
     </div>
   </header>
 </template>
