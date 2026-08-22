@@ -113,7 +113,7 @@ onMounted(async () => {
         <div class="home-news-grid"><a v-for="(post,index) in posts" :key="post.id" :href="`/news?post=${post.slug}`"><div><span>0{{ index + 1 }}</span><Radio :size="17" /></div><time>{{ formatDate(post.published_at) }}</time><h3>{{ post.title }}</h3><p>{{ post.summary }}</p><b>READ TRANSMISSION <ArrowRight :size="13" /></b></a></div>
       </section>
 
-      <section class="home-cta home-container"><div class="cta-lines"></div><ShieldCheck :size="38" /><span>TECHNICAL PREVIEW</span><h2>让每一个判断，<br>都经得起复核。</h2><p>参与 AetherAC 的性能、兼容性与证据工作流验证。</p><a class="primary-button" href="mailto:contact@aetherac.abnt.it">联系 contact@aetherac.abnt.it <ArrowRight :size="16" /></a></section>
+      <section class="home-cta home-container"><div class="cta-lines"></div><ShieldCheck :size="38" /><span>TECHNICAL PREVIEW</span><h2>让每一个判断，<br>都经得起复核。</h2><p>参与 AetherAC 的性能、兼容性与证据工作流验证。</p><a class="primary-button" href="mailto:contact@abnt.it">联系 contact@abnt.it <ArrowRight :size="16" /></a></section>
     </main>
     <SiteFooter />
   </div>
