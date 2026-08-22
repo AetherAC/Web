@@ -18,8 +18,9 @@ const githubRequest = async (path, token) => {
   return response.json()
 }
 
-export default async function handler(_request, response) {
-  const repositoryName = process.env.GITHUB_REPOSITORY
+export default async function handler(request, response) {
+  const requested = request?.query?.repository
+  const repositoryName = requested || process.env.GITHUB_REPOSITORY
   const token = process.env.GITHUB_TOKEN
   if (!repositoryName || !token || !repositoryName.includes('/')) {
     return json(response, 200, {

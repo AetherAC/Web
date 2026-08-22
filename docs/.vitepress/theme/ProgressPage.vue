@@ -18,11 +18,20 @@ const stages = ref<ProgressEntry[]>([])
 const cmsSource = ref('fallback')
 const github = ref<GithubProgress | null>(null)
 const syncing = ref(true)
+const repositories = ref<Array<{ name: string; label?: string }>>([])
 
 onMounted(async () => {
   const cms = await fetchProgress()
   stages.value = cms.data
   cmsSource.value = cms.source
+  try {
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
+    const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+    if (supabaseUrl && supabaseKey) {
+      const response = await fetch(`${supabaseUrl}/rest/v1/repositories?enabled=eq.true&select=name,label&order=created_at.asc`, { headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` } })
+      if (response.ok) repositories.value = await response.json()
+    }
+  } catch { /* fallback to deployment repository */ }
   const syncEnabled = location.hostname === 'aetherac.abnt.it' || import.meta.env.VITE_ENABLE_GITHUB_SYNC === 'true'
   if (!syncEnabled) {
     github.value = { configured: false, message: '本地静态预览未启用 GitHub 同步；生产域名会自动连接 Vercel API。' }
@@ -30,7 +39,7 @@ onMounted(async () => {
     return
   }
   try {
-    const response = await fetch('/api/github-progress')
+    const response = await fetch(`/api/github-progress${repositories.value[0] ? `?repository=${encodeURIComponent(repositories.value[0].name)}` : ''}`)
     github.value = response.ok ? await response.json() : { configured: false, message: 'GitHub 同步接口尚未配置。' }
   } catch {
     github.value = { configured: false, message: '本地预览未连接 Vercel API。' }
