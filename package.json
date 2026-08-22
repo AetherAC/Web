@@ -1,0 +1,19 @@
+{
+  "name": "aetherac-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev docs",
+    "build": "vitepress build docs",
+    "preview": "vitepress preview docs",
+    "test:api": "node tests/api-smoke.mjs"
+  },
+  "dependencies": {
+    "@fontsource-variable/manrope": "^5.2.6",
+    "@fontsource-variable/plus-jakarta-sans": "^5.2.6",
+    "@supabase/supabase-js": "^2.57.4",
+    "lucide-vue-next": "^0.468.0",
+    "vitepress": "^1.6.3",
+    "vue": "^3.5.13"
+  }
+}
