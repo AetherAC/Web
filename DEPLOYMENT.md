@@ -20,7 +20,7 @@ aetherac.abnt.it
 4. Copy the Project URL and anon key into the Vercel environment variables:
    - `VITE_SUPABASE_URL`
    - `VITE_SUPABASE_ANON_KEY`
-5. Deploy once, open `/studio`, and request a magic link for `contact@aetherac.abnt.it`.
+5. Deploy once, open `/register`, and create the first account for `contact@abnt.it`.
 6. After that user exists, execute the bootstrap query at the bottom of `supabase/schema.sql`.
 
 The anon key is public by design. Do not use `service_role` in VitePress or any `VITE_*` variable.

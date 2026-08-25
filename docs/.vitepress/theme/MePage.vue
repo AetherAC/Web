@@ -1,0 +1,10 @@
+<script setup lang="ts">
+import { ref, watch } from 'vue'
+import { ArrowUpRight, CreditCard, LogOut, Package, ReceiptText, UserRound } from 'lucide-vue-next'
+import SiteHeader from './SiteHeader.vue';import SiteFooter from './SiteFooter.vue';import {supabase,useAuth} from './auth'
+const auth=useAuth();const orders=ref<any[]>([])
+watch(()=>auth.ready.value,async ready=>{if(!ready)return;if(!auth.user.value){auth.requireUser('/me');return}const {data}=await supabase!.from('orders').select('*').order('created_at',{ascending:false});orders.value=data??[]},{immediate:true})
+const total=()=>orders.value.filter(x=>x.status==='paid').reduce((n,x)=>n+x.amount_minor,0)
+const money=(n:number,c='USD')=>new Intl.NumberFormat('zh-CN',{style:'currency',currency:c}).format(n/100)
+</script>
+<template><div class="fluent-page"><SiteHeader/><main class="account-main"><section class="account-head"><div class="account-avatar"><UserRound/></div><div><p>我的账户</p><h1>{{auth.user.value?.user_metadata?.display_name||auth.user.value?.email}}</h1><span>{{auth.group.value}} · {{auth.user.value?.email_confirmed_at?'邮箱已验证':'邮箱未验证'}}</span></div><button @click="auth.signOut"><LogOut :size="17"/>退出</button></section><section class="account-metrics"><article><CreditCard/><span>累计消费</span><strong>{{money(total(),orders[0]?.currency||'USD')}}</strong></article><article><ReceiptText/><span>订单数量</span><strong>{{orders.length}}</strong></article><article><Package/><span>已完成购买</span><strong>{{orders.filter(x=>x.status==='paid').length}}</strong></article></section><section class="order-history"><header><div><p>ORDER HISTORY</p><h2>购买记录</h2></div><a href="/buy">购买 Artifact <ArrowUpRight :size="16"/></a></header><div class="order-table"><a v-for="o in orders" :key="o.id" :href="`/order/${o.id}`"><span><b>{{o.sku}}</b><small>{{new Date(o.created_at).toLocaleString('zh-CN')}}</small></span><span>{{o.provider}}</span><span>{{money(o.amount_minor,o.currency)}}</span><em :class="`order-${o.status}`">{{o.status}}</em><ArrowUpRight :size="16"/></a><div v-if="!orders.length" class="fluent-empty">还没有订单。</div></div></section></main><SiteFooter/></div></template>

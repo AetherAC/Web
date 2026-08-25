@@ -9,7 +9,8 @@ const links = [
   { label: '兼容性', href: '/#compatibility' },
   { label: '开发进度', href: '/progress' },
   { label: 'Blog', href: '/blog' },
-  { label: 'News', href: '/news' }
+  { label: 'News', href: '/news' },
+  { label: '购买', href: '/buy' }
 ]
 </script>
 
@@ -23,14 +24,14 @@ const links = [
       <div class="desktop-links">
         <a v-for="link in links" :key="link.href" :href="link.href">{{ link.label }}</a>
       </div>
-      <a class="nav-contact" href="mailto:contact@aetherac.abnt.it">联系团队 <ArrowUpRight :size="14" /></a>
+      <a class="nav-contact" href="/me">我的账户 <ArrowUpRight :size="14" /></a>
       <button class="nav-toggle" :aria-expanded="open" aria-label="切换菜单" @click="open = !open">
         <X v-if="open" :size="21" /><Menu v-else :size="21" />
       </button>
     </nav>
     <div v-if="open" class="mobile-links">
       <a v-for="link in links" :key="link.href" :href="link.href" @click="open = false">{{ link.label }}</a>
-      <a href="mailto:contact@aetherac.abnt.it">contact@abnt.it</a>
+      <a href="/me">我的账户</a>
     </div>
   </header>
 </template>

@@ -1,6 +1,9 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
+  vite: {
+    envDir: process.cwd()
+  },
   lang: 'zh-CN',
   title: 'AetherAC',
   description: '为 Minecraft Java 与 Bedrock 网络打造的证据驱动型服务端反作弊系统。',

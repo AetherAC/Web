@@ -10,9 +10,9 @@ import { ShieldCheck, ArrowUpRight } from 'lucide-vue-next'
         <p>服务器可观察行为的确定性防线。</p>
       </div>
       <div class="footer-nav">
-        <a href="/progress">开发进度</a><a href="/blog">Blog</a><a href="/news">News</a><a href="/studio">内容管理</a>
+        <a href="/progress">开发进度</a><a href="/blog">Blog</a><a href="/news">News</a><a href="/buy">购买</a><a href="/admin">管理</a>
       </div>
-      <a class="footer-email" href="mailto:contact@aetherac.abnt.it">contact@aetherac.abnt.it <ArrowUpRight :size="15" /></a>
+      <a class="footer-email" href="mailto:contact@abnt.it">contact@abnt.it <ArrowUpRight :size="15" /></a>
     </div>
     <div class="footer-bottom"><span>© 2026 AetherAC</span><span>Not affiliated with Mojang Studios or Microsoft.</span></div>
   </footer>
