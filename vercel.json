@@ -6,7 +6,7 @@
   "outputDirectory": "docs/.vitepress/dist",
   "cleanUrls": true,
   "rewrites": [
-    { "source": "/order/:order_id", "destination": "/order.html?order_id=:order_id" },
+    { "source": "/order/:order_id", "destination": "/order?order_id=:order_id" },
     { "source": "/v1/callback/:provider", "destination": "/api/payment-callback?provider=:provider" }
   ],
   "headers": [
