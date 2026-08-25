@@ -1,5 +1,6 @@
 create extension if not exists pgcrypto;
 create schema if not exists private;
+drop table if exists public.site_admins cascade;
 
 do $$ begin create type public.user_group as enum ('default','read','coworker','admin'); exception when duplicate_object then null; end $$;
 do $$ begin create type public.content_kind as enum ('blog','news'); exception when duplicate_object then null; end $$;
@@ -64,6 +65,8 @@ create table if not exists public.orders (
   created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
 create unique index if not exists orders_provider_reference on public.orders(provider, provider_order_id) where provider_order_id is not null;
+create index if not exists orders_user_id_idx on public.orders(user_id);
+create index if not exists orders_artifact_id_idx on public.orders(artifact_id);
 create table if not exists public.refund_requests (
   id uuid primary key default gen_random_uuid(), order_id uuid not null references public.orders(id) on delete restrict,
   user_id uuid not null references auth.users(id) on delete restrict, reason_code text not null, reason_detail text not null,
@@ -71,6 +74,7 @@ create table if not exists public.refund_requests (
   admin_note text not null default '', created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
 create unique index if not exists one_refund_per_order on public.refund_requests(order_id);
+create index if not exists refund_requests_user_id_idx on public.refund_requests(user_id);
 create table if not exists public.installation_snapshots (
   id bigint generated always as identity primary key, captured_at timestamptz not null default now(),
   installed_hwid bigint not null default 0, running_hwid bigint not null default 0, source text not null default 'sentry'
@@ -121,22 +125,33 @@ create policy profiles_admin_update on public.user_profiles for update to authen
 using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
 create policy published_posts_read on public.posts for select to anon,authenticated
 using (status='published' or (select private.current_user_group()) in ('read','coworker','admin'));
-create policy editor_posts_write on public.posts for all to authenticated
+create policy editor_posts_insert on public.posts for insert to authenticated
+with check ((select private.current_user_group()) in ('coworker','admin'));
+create policy editor_posts_update on public.posts for update to authenticated
 using ((select private.current_user_group()) in ('coworker','admin')) with check ((select private.current_user_group()) in ('coworker','admin'));
+create policy editor_posts_delete on public.posts for delete to authenticated
+using ((select private.current_user_group()) in ('coworker','admin'));
 create policy progress_read on public.progress_entries for select to anon,authenticated using (true);
-create policy editor_progress_write on public.progress_entries for all to authenticated
+create policy editor_progress_insert on public.progress_entries for insert to authenticated
+with check ((select private.current_user_group()) in ('coworker','admin'));
+create policy editor_progress_update on public.progress_entries for update to authenticated
 using ((select private.current_user_group()) in ('coworker','admin')) with check ((select private.current_user_group()) in ('coworker','admin'));
+create policy editor_progress_delete on public.progress_entries for delete to authenticated
+using ((select private.current_user_group()) in ('coworker','admin'));
 create policy repositories_read on public.repositories for select to anon,authenticated using (enabled or (select private.current_user_group()) in ('read','coworker','admin'));
-create policy repositories_admin_write on public.repositories for all to authenticated
-using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+create policy repositories_admin_insert on public.repositories for insert to authenticated with check ((select private.current_user_group())='admin');
+create policy repositories_admin_update on public.repositories for update to authenticated using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+create policy repositories_admin_delete on public.repositories for delete to authenticated using ((select private.current_user_group())='admin');
 create policy settings_admin on public.site_settings for all to authenticated
 using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
 create policy artifacts_read on public.artifacts for select to anon,authenticated using (active or (select private.current_user_group())='admin');
-create policy artifacts_admin on public.artifacts for all to authenticated
-using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+create policy artifacts_admin_insert on public.artifacts for insert to authenticated with check ((select private.current_user_group())='admin');
+create policy artifacts_admin_update on public.artifacts for update to authenticated using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+create policy artifacts_admin_delete on public.artifacts for delete to authenticated using ((select private.current_user_group())='admin');
 create policy providers_read on public.payment_providers for select to authenticated using (enabled or (select private.current_user_group())='admin');
-create policy providers_admin on public.payment_providers for all to authenticated
-using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+create policy providers_admin_insert on public.payment_providers for insert to authenticated with check ((select private.current_user_group())='admin');
+create policy providers_admin_update on public.payment_providers for update to authenticated using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+create policy providers_admin_delete on public.payment_providers for delete to authenticated using ((select private.current_user_group())='admin');
 create policy own_orders_read on public.orders for select to authenticated
 using ((select auth.uid())=user_id or (select private.current_user_group())='admin');
 create policy admin_orders_update on public.orders for update to authenticated
