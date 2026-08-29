@@ -118,7 +118,26 @@ create table if not exists public.refund_requests (
   evidence_paths text[] not null default '{}', status public.refund_status not null default 'submitted',
   admin_note text not null default '', created_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
-create unique index if not exists one_refund_per_order on public.refund_requests(order_id);
+-- 一个订单同时只能有一条在途退款申请，但被拒或已结束之后要能重提。
+--
+-- 原来这里是无条件唯一索引，那等于「一个订单一辈子只能申请一次退款」——第一次因为证据不足被拒，
+-- 用户补齐材料也无法再提，而 §10.3 要求拒绝时必须填理由，隐含了「理由被解决之后可以再来」。
+-- 换成部分唯一索引：终态（已拒绝/已完成/失败）不占位，其余状态占位。并发下的两次提交仍然只有
+-- 一条能落库，这一点不能只靠接口先查一遍——两个请求会同时读到零行。
+--
+-- 已有数据里如果同一个订单有多条非终态记录（旧索引不可能允许，但手工改过库就有可能），
+-- 建索引会失败，所以先把除最新一条以外的都标成拒绝。
+drop index if exists public.one_refund_per_order;
+update public.refund_requests set status='rejected',
+  decision_note = case when decision_note = '' then '系统对账：同一订单存在多条在途申请，保留最新一条' else decision_note end
+where id in (
+  select id from (
+    select id, row_number() over (partition by order_id order by created_at desc, id desc) as rank
+    from public.refund_requests where status not in ('rejected','completed','failed')
+  ) ranked where rank > 1
+);
+create unique index if not exists one_open_refund_per_order on public.refund_requests(order_id)
+  where status not in ('rejected','completed','failed');
 create index if not exists refund_requests_user_id_idx on public.refund_requests(user_id);
 create table if not exists public.installation_snapshots (
   id bigint generated always as identity primary key, captured_at timestamptz not null default now(),

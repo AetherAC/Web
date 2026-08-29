@@ -85,7 +85,8 @@ import {
   ORDER_STATUS_LABEL,
   ORDER_TRANSITIONS,
   REFUND_APPROVER_GROUPS,
-  REFUND_INITIATOR_GROUPS,
+  REFUND_INITIATOR_ROLES,
+  REFUND_PROXY_GROUPS,
   REFUND_STATUSES,
   REFUND_STATUS_LABEL,
   REFUND_TRANSITIONS,
@@ -108,6 +109,7 @@ import {
   setting,
   settleApproval
 } from '../api/_lib/notify.mjs'
+import { orderNoOf, requestRefund } from '../api/refund-request.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
@@ -1166,10 +1168,19 @@ assert(!canRefundTransition('pending', 'completed'), '不能跳过执行段')
 assert(!canRefundTransition('rejected', 'pending'), '已拒绝是终态')
 assert(assertRefundTransition('completed', 'executing').error.includes('终态'), '已完成是终态')
 
-// §10.7：只有售后、客服、管理员能发起。presale 的 rank 和 postsale 一样，所以这里必须是名单不是阈值。
-assert(!REFUND_INITIATOR_GROUPS.includes('presale'), '售前不该碰钱，尽管 rank 和售后相同')
+// §10.7：能代提的是售后、客服、管理员。presale 的 rank 和 postsale 一样，所以这里必须是名单不是阈值。
+assert(!REFUND_PROXY_GROUPS.includes('presale'), '售前不该碰钱，尽管 rank 和售后相同')
 assert(rankOf('presale') === rankOf('postsale'), '这两个组同 rank——正是不能用阈值的原因')
-for (const g of REFUND_INITIATOR_GROUPS) assert(rankOf(g) >= RANK.STAFF, `${g} 至少是员工级`)
+for (const g of REFUND_PROXY_GROUPS) assert(rankOf(g) >= RANK.STAFF, `${g} 至少是员工级`)
+// 用户本人不在代提名单里，但必须能给自己的订单提——§13.3 的第一个入口就是用户订单页。
+assert(!REFUND_PROXY_GROUPS.includes('user') && !REFUND_PROXY_GROUPS.includes('default'),
+  '代提名单不含用户本人，那是另一条路径')
+assert(REFUND_INITIATOR_ROLES.includes('user'), 'initiator_role 必须能记「用户自己提的」')
+const roleCheck = schemaSql.match(/refund_requests_initiator_role_check\s*\n?\s*check \(initiator_role in \(([^)]*)\)\)/)
+assert(roleCheck, 'schema.sql 必须有 initiator_role 的 check')
+const sqlRoles = roleCheck[1].split(',').map(s => s.trim().replace(/^'|'$/g, ''))
+assert(sqlRoles.length === REFUND_INITIATOR_ROLES.length, 'initiator_role 的取值数量两边要一致')
+for (const r of REFUND_INITIATOR_ROLES) assert(sqlRoles.includes(r), `initiator_role 的 check 缺 '${r}'`)
 assert(REFUND_APPROVER_GROUPS.length === 1 && REFUND_APPROVER_GROUPS[0] === 'admin', '只有管理员能审批')
 
 // §13.5 的拒绝日志。
@@ -1191,10 +1202,17 @@ const recorder = (results = {}) => {
     rec.tables.push(table)
     const entry = { table, op: null, payload: null, filters: {}, selected: null }
     calls.push(entry)
-    const result = results[table] ?? { data: null, error: null }
+    // 同一张表可以按调用顺序给不同结果（refund-request 会先查在途申请再插入），所以数组按次消费；
+    // 用完之后重复最后一个，免得每个用例都要把不关心的调用也列全。
+    const slot = results[table]
+    const result = Array.isArray(slot)
+      ? (slot.length > 1 ? slot.shift() : slot[0]) ?? { data: null, error: null }
+      : slot ?? { data: null, error: null }
     const link = {
       eq(col, val) { entry.filters[col] = val; return link },
       select(cols) { entry.selected = cols ?? '*'; return link },
+      order(col, opts) { entry.order = { col, ...opts }; return link },
+      limit(n) { entry.limit = n; return link },
       single: async () => result,
       maybeSingle: async () => result,
       then: (resolve, reject) => Promise.resolve(result).then(resolve, reject)
@@ -1304,3 +1322,184 @@ assert(await setting(recorder({ site_settings: { data: { value: { value: 0 } }, 
 assert(await setting(recorder({ site_settings: { data: null, error: { message: 'boom' } } }), 'k', 48) === 48, '读失败也给 fallback')
 
 console.log('Notification and audit writes: OK')
+
+// --- §10.2 / §13.3 发起退款 ------------------------------------------------------------------------
+// 这个接口跑在 service client 上，所以「谁的订单」「金额上限」「只允许一条在途」三件事全靠这里的
+// 代码，没有 RLS 兜底。下面按这三条各钉一遍。
+const BUYER = '33333333-3333-4333-8333-333333333333'
+const AGENT = '44444444-4444-4444-8444-444444444444'
+const RORDER = '55555555-5555-4555-8555-555555555555'
+// 真 uuid 而不是 'r1'：审批通知的按钮 target 要过 uuid 校验，假数据得和真实的 refund.id 同形，
+// 否则测试会在一个真实环境里不存在的地方失败。
+const REFUND = '66666666-6666-4666-8666-666666666666'
+const paidRow = {
+  id: RORDER, user_id: BUYER, status: 'paid',
+  amount_minor: 10000, paid_amount_minor: 9500, currency: 'USD', paid_currency: 'USD'
+}
+// 一个能跑通全程的 db：查订单 → 查在途申请（无）→ 插入 → 写审计 → 插通知。
+const refundDb = (order = paidRow, existing = null, insert = { data: { id: REFUND }, error: null }) => recorder({
+  orders: { data: order, error: null },
+  refund_requests: [{ data: existing, error: null }, insert],
+  notifications: { data: { id: 'n1' }, error: null }
+})
+
+let rdb = refundDb()
+let out = await requestRefund(rdb, { userId: BUYER, group: 'default' }, {
+  order_id: RORDER, reason_code: 'not_working', reason_detail: '装不上'
+})
+assert(out.status === 201, '用户给自己的已支付订单提退款应成功')
+assert(out.body.notified === true, '审批通知发出去了')
+let ins = rdb.calls.find(c => c.table === 'refund_requests' && c.op === 'insert').payload
+assert(ins.status === 'pending', '新申请落在待审批')
+assert(ins.initiator_role === 'user', '用户自己提的记成 user')
+assert(ins.user_id === BUYER, 'user_id 记订单的主人，不是发起人——代提时这两者不同')
+assert(ins.amount_minor === 9500, '没给金额时取实付金额，不是下单金额')
+assert(ins.currency === 'USD', '币种跟实付走')
+// 订单状态不能在这里被改。§13.3 规定审批通过才进 REFUND_PENDING。
+assert(!rdb.calls.some(c => c.table === 'orders' && c.op === 'update'), '提交申请不改订单状态')
+assert(!rdb.tables.includes('order_status_log'), '没有状态变更就不该写状态日志，否则 §12.4 里出现假条目')
+assert(rdb.tables.includes('refund_audit_log'), '申请本身的痕迹要进审计')
+
+// §10.2：原因必填。
+for (const detail of ['', '   ', undefined, null]) {
+  const answer = await requestRefund(refundDb(), { userId: BUYER, group: 'default' },
+    { order_id: RORDER, reason_detail: detail })
+  assert(answer.status === 400 && answer.body.error.includes('原因'), `空原因（${JSON.stringify(detail)}）应拒`)
+}
+// 订单号格式不对要答 400 而不是 500，同 cancel-order 的处理。
+for (const badId of ['', null, 'not-a-uuid', "' or 1=1--", `${RORDER}x`]) {
+  const answer = await requestRefund(refundDb(), { userId: BUYER, group: 'default' },
+    { order_id: badId, reason_detail: '理由' })
+  assert(answer.status === 400, `订单号 ${JSON.stringify(badId)} 应答 400`)
+}
+
+// 别人的订单：普通用户要拿到和「订单不存在」一模一样的答复，否则这就是个订单号探测接口。
+const otherAnswer = await requestRefund(refundDb(), { userId: AGENT, group: 'default' },
+  { order_id: RORDER, reason_detail: '理由' })
+const missingAnswer = await requestRefund(refundDb(null), { userId: BUYER, group: 'default' },
+  { order_id: RORDER, reason_detail: '理由' })
+assert(otherAnswer.status === missingAnswer.status && otherAnswer.body.error === missingAnswer.body.error,
+  '别人的订单和不存在的订单必须给同一个答复')
+assert(otherAnswer.status === 404, '两者都是 404')
+
+// §10.7：代提。售前不在名单里，尽管 rank 和售后相同。
+for (const group of ['postsale', 'cs', 'admin']) {
+  const answer = await requestRefund(refundDb(), { userId: AGENT, group }, { order_id: RORDER, reason_detail: '客诉' })
+  assert(answer.status === 201, `${group} 可以代提`)
+}
+for (const group of ['presale', 'coworker', 'read', 'default']) {
+  const answer = await requestRefund(refundDb(), { userId: AGENT, group }, { order_id: RORDER, reason_detail: '客诉' })
+  assert(answer.status === 404, `${group} 不能代提别人的订单`)
+}
+rdb = refundDb()
+await requestRefund(rdb, { userId: AGENT, group: 'cs' }, { order_id: RORDER, reason_detail: '客诉' })
+ins = rdb.calls.find(c => c.table === 'refund_requests' && c.op === 'insert').payload
+assert(ins.initiator_role === 'cs' && ins.initiated_by === AGENT, '代提要记下是谁以什么身份提的')
+assert(ins.user_id === BUYER, '代提时 user_id 仍是订单主人')
+
+// §10.2 的金额上限。这条是整个接口里最贵的一条：过不了就是能退出比实付更多的钱。
+const overAnswer = await requestRefund(refundDb(), { userId: AGENT, group: 'cs' },
+  { order_id: RORDER, reason_detail: '理由', amount_minor: 9501 })
+assert(overAnswer.status === 400 && overAnswer.body.error.includes('不得超过实付'), '超过实付金额必须拒')
+// 上限是实付而不是下单金额——用了券的订单这两者不同，按下单金额退就是白送折扣那部分。
+assert(paidRow.amount_minor > paidRow.paid_amount_minor, '这个用例的订单用过券，两个金额不同')
+const listAnswer = await requestRefund(refundDb(), { userId: AGENT, group: 'cs' },
+  { order_id: RORDER, reason_detail: '理由', amount_minor: 10000 })
+assert(listAnswer.status === 400, '按下单金额退款必须被拒——差额就是券的折扣')
+for (const amount of [0, -1, 95.5, '9500', NaN]) {
+  const answer = await requestRefund(refundDb(), { userId: AGENT, group: 'cs' },
+    { order_id: RORDER, reason_detail: '理由', amount_minor: amount })
+  assert(answer.status === 400, `金额 ${JSON.stringify(amount)} 应拒`)
+}
+rdb = refundDb()
+out = await requestRefund(rdb, { userId: AGENT, group: 'cs' },
+  { order_id: RORDER, reason_detail: '只退一半', amount_minor: 4750 })
+assert(out.status === 201, '合法的部分退款可以提')
+assert(rdb.calls.find(c => c.table === 'refund_requests' && c.op === 'insert').payload.amount_minor === 4750, '部分金额落库')
+
+// 用户不能自己挑金额，且必须是明确拒绝而不是静默忽略——静默忽略会让用户以为部分退款提上去了。
+const userAmount = await requestRefund(refundDb(), { userId: BUYER, group: 'default' },
+  { order_id: RORDER, reason_detail: '理由', amount_minor: 100 })
+assert(userAmount.status === 403 && userAmount.body.error.includes('客服'), '用户指定金额要被明确拒绝')
+
+// §14 的 refund_cs_can_edit_amount 开关：关掉时客服不能改，管理员不受影响。
+const noEdit = table => recorder({
+  orders: { data: paidRow, error: null },
+  refund_requests: [{ data: null, error: null }, { data: { id: REFUND }, error: null }],
+  notifications: { data: { id: 'n1' }, error: null },
+  site_settings: { data: { value: { value: false } }, error: null }
+})
+const csBlocked = await requestRefund(noEdit(), { userId: AGENT, group: 'cs' },
+  { order_id: RORDER, reason_detail: '理由', amount_minor: 4000 })
+assert(csBlocked.status === 403 && csBlocked.body.error.includes('不允许客服修改'), '开关关掉时客服不能改金额')
+const adminAllowed = await requestRefund(noEdit(), { userId: AGENT, group: 'admin' },
+  { order_id: RORDER, reason_detail: '理由', amount_minor: 4000 })
+assert(adminAllowed.status === 201, '那个开关的字面意思是「客服是否可改」，管理员不受约束')
+// 开关只在真要改金额时才读——不改金额的申请不该被一个无关开关挡住。
+const untouched = noEdit()
+await requestRefund(untouched, { userId: AGENT, group: 'cs' }, { order_id: RORDER, reason_detail: '理由' })
+assert(!untouched.tables.includes('site_settings'), '不改金额时不必读那个开关')
+
+// §13.2 的不可退状态。
+for (const status of ['pending', 'failed', 'cancelled', 'refund_pending', 'refunded']) {
+  const answer = await requestRefund(refundDb({ ...paidRow, status }), { userId: BUYER, group: 'default' },
+    { order_id: RORDER, reason_detail: '理由' })
+  assert(answer.status === 409, `${status} 的订单不能提退款`)
+  assert(answer.body.error.length > 0, `${status} 要给出说明——§13.2 的悬浮文案就是这句`)
+}
+
+// 在途申请要拦住第二次提交。申请提交时订单还是 paid，所以光看订单状态查不出来。
+for (const status of ['pending', 'approved', 'transferred', 'executing']) {
+  const answer = await requestRefund(refundDb(paidRow, { id: 'r0', status }), { userId: BUYER, group: 'default' },
+    { order_id: RORDER, reason_detail: '理由' })
+  assert(answer.status === 409, `已有${status}的申请时不能再提`)
+}
+for (const status of ['rejected', 'completed']) {
+  const answer = await requestRefund(refundDb(paidRow, { id: 'r0', status }), { userId: BUYER, group: 'default' },
+    { order_id: RORDER, reason_detail: '理由' })
+  assert(answer.status === 201, `${status} 的旧申请不该挡住新申请——§10.3 要求拒绝必须填理由，隐含理由被解决后可重提`)
+}
+// 并发：两个请求同时读到零行、同时插入，只有索引能挡住。23505 要翻译成 409 而不是 500。
+const raced = await requestRefund(
+  refundDb(paidRow, null, { data: null, error: { code: '23505', message: 'duplicate key' } }),
+  { userId: BUYER, group: 'default' }, { order_id: RORDER, reason_detail: '理由' })
+assert(raced.status === 409 && raced.body.error.includes('在途'), '唯一约束冲突要答 409')
+const insFailed = await requestRefund(
+  refundDb(paidRow, null, { data: null, error: { code: 'XX000', message: 'boom' } }),
+  { userId: BUYER, group: 'default' }, { order_id: RORDER, reason_detail: '理由' })
+assert(insFailed.status === 500, '其他写入错误仍是 500')
+
+// 证据路径只做形状检查——归属由 storage 的 RLS 策略在上传时管。
+const tooManyFiles = await requestRefund(refundDb(), { userId: BUYER, group: 'default' },
+  { order_id: RORDER, reason_detail: '理由', evidence_paths: Array(11).fill('a/b.png') })
+assert(tooManyFiles.status === 400, '证据文件数量要有上限')
+const traversal = await requestRefund(refundDb(), { userId: BUYER, group: 'default' },
+  { order_id: RORDER, reason_detail: '理由', evidence_paths: ['../../etc/passwd'] })
+assert(traversal.status === 400, '带 .. 的路径要拒')
+rdb = refundDb()
+await requestRefund(rdb, { userId: BUYER, group: 'default' },
+  { order_id: RORDER, reason_detail: '理由', evidence_paths: ['a/b.png', '', '  ', 'c/d.png'] })
+assert(rdb.calls.find(c => c.table === 'refund_requests' && c.op === 'insert').payload.evidence_paths.length === 2,
+  '空路径被过滤掉，不该留下空串')
+
+// §10.3 的审批通知：插不进去时申请仍然算成功，但要如实告知。管理员还能从待审批列表看到。
+const notifyBroken = recorder({
+  orders: { data: paidRow, error: null },
+  refund_requests: [{ data: null, error: null }, { data: { id: REFUND }, error: null }],
+  notifications: { data: null, error: { message: 'boom' } }
+})
+out = await requestRefund(notifyBroken, { userId: BUYER, group: 'default' }, { order_id: RORDER, reason_detail: '理由' })
+assert(out.status === 201 && out.body.notified === false, '通知失败不该让已落库的申请回报失败')
+// 通知必须是 refund_approval，否则 §9.6 的强制置顶不会生效。
+rdb = refundDb()
+await requestRefund(rdb, { userId: BUYER, group: 'default' }, { order_id: RORDER, reason_detail: '装不上' })
+const notif = rdb.calls.find(c => c.table === 'notifications' && c.op === 'insert').payload
+assert(notif.kind === 'refund_approval' && notif.state === 'pending', '审批通知的类型和状态')
+assert(notif.scope === 'admin' && notif.recipient_id === null, '发给全体管理员，不是某一个')
+assert(notif.actions.length === 3, '三个按钮：批准、拒绝、转交')
+assert(notif.body.includes('装不上'), '退款原因要出现在通知正文里，否则审批人得再点一次才能看到')
+
+assert(orderNoOf(RORDER) === '55555555', '订单号取 id 前 8 位')
+assert(orderNoOf(null) === '', 'id 缺失时不要渲染出 "null"')
+
+console.log('Refund requests: OK')

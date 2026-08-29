@@ -79,12 +79,20 @@ export const REFUND_TRANSITIONS = {
 }
 
 /**
- * §10.7：只有这三个组能发起退款。
+ * §10.7：能替别人提退款的三个组。
+ *
+ * 名字里的「代提」是关键。用户本人当然能给自己的订单提退款——§13.3 把用户订单页列为三个入口之一，
+ * §13.2 还要求那个按钮在不可退时置灰并给悬浮说明，而用户根本没有的按钮不需要置灰。这份名单管的是
+ * 「替另一个人提」：客服在工作台里代提，管理员在订单详情里代提。schema 那边的
+ * refund_requests_initiator_role_check 允许 'user'，说的是同一件事。
  *
  * 写成枚举而不是 rank 阈值，因为 presale 的 rank 是 777、和 postsale 一样，用阈值会把售前
  * 一起放进来——而售前不该碰钱。这和 shared/groups.mjs 里 EDITOR_GROUPS 是同一个理由。
  */
-export const REFUND_INITIATOR_GROUPS = ['postsale', 'cs', 'admin']
+export const REFUND_PROXY_GROUPS = ['postsale', 'cs', 'admin']
+
+/** initiator_role 的取值，和 refund_requests_initiator_role_check 逐字对齐。 */
+export const REFUND_INITIATOR_ROLES = ['user', ...REFUND_PROXY_GROUPS]
 
 /** 只有 admin 能审批。转交也是审批动作的一种，所以同一份名单。 */
 export const REFUND_APPROVER_GROUPS = ['admin']
