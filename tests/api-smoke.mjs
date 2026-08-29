@@ -80,6 +80,25 @@ import {
   validateAction as validateNotifAction,
   validateNotification
 } from '../shared/notifications.mjs'
+import {
+  ORDER_STATUSES,
+  ORDER_STATUS_LABEL,
+  ORDER_TRANSITIONS,
+  REFUND_APPROVER_GROUPS,
+  REFUND_INITIATOR_GROUPS,
+  REFUND_STATUSES,
+  REFUND_STATUS_LABEL,
+  REFUND_TRANSITIONS,
+  TERMINAL_ORDER_STATUSES,
+  assertRefundTransition,
+  assertTransition,
+  canRefundTransition,
+  canRequestRefund,
+  canTransition,
+  rejectionLogEntry,
+  transitionLabel,
+  validateRefundAmount
+} from '../shared/orders.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
@@ -1034,3 +1053,120 @@ for (const t of NOTIF_ACTION_TYPES) {
 }
 
 console.log('Notification shapes and refund approval: OK')
+
+// --- §13 订单与退款状态机 ---------------------------------------------------------------------------
+// 三份声明必须一致：shared/orders.mjs（界面和接口共用）、public.order_status 枚举、
+// refund_requests_status_check。JS 多一个值时的后果最隐蔽——校验放行、Postgres 拒收。
+const orderEnum = schemaSql.match(/create type public\.order_status as enum \(([^)]*)\)/)
+assert(orderEnum, 'schema.sql 必须声明 public.order_status')
+const sqlOrderStatuses = orderEnum[1].split(',').map(s => s.trim().replace(/^'|'$/g, ''))
+assert(sqlOrderStatuses.length === ORDER_STATUSES.length,
+  `order_status 枚举有 ${sqlOrderStatuses.length} 个值，ORDER_STATUSES 有 ${ORDER_STATUSES.length} 个`)
+for (const s of ORDER_STATUSES) {
+  assert(sqlOrderStatuses.includes(s), `public.order_status 缺 '${s}'`)
+  assert(ORDER_STATUS_LABEL[s], `${s} 需要中文标签`)
+  assert(Array.isArray(ORDER_TRANSITIONS[s]), `${s} 必须在迁移表里有一条（终态写空数组）`)
+}
+for (const s of sqlOrderStatuses) {
+  assert(ORDER_STATUSES.includes(s), `枚举允许 '${s}' 但 ORDER_STATUSES 没有——库里会出现前端认不出的订单`)
+}
+// expired 曾经在 JS 那份里，枚举里从来没有。这条断言防止它被谁又加回来。
+assert(!ORDER_STATUSES.includes('expired'), '没有 expired 这个状态，废弃结账单落到 cancelled')
+
+const refundCheck = schemaSql.match(/refund_requests_status_check\s*\n?\s*check \(status in \(([^)]*)\)\)/)
+assert(refundCheck, 'schema.sql 必须有 refund_requests_status_check')
+const sqlRefundStatuses = refundCheck[1].split(',').map(s => s.trim().replace(/^'|'$/g, ''))
+for (const s of REFUND_STATUSES) {
+  assert(sqlRefundStatuses.includes(s), `refund_requests_status_check 缺 '${s}'`)
+  assert(REFUND_STATUS_LABEL[s], `${s} 需要中文标签`)
+  assert(Array.isArray(REFUND_TRANSITIONS[s]), `${s} 必须在退款迁移表里有一条`)
+}
+for (const s of sqlRefundStatuses) {
+  assert(REFUND_STATUSES.includes(s), `check 允许 '${s}' 但 REFUND_STATUSES 没有`)
+}
+
+// 迁移表不能指向不存在的状态——一条指向 typo 的出边会让按钮亮着但接口永远拒。
+for (const [from, outs] of Object.entries(ORDER_TRANSITIONS)) {
+  for (const to of outs) assert(ORDER_STATUSES.includes(to), `ORDER_TRANSITIONS.${from} 指向未知状态 ${to}`)
+}
+for (const [from, outs] of Object.entries(REFUND_TRANSITIONS)) {
+  for (const to of outs) assert(REFUND_STATUSES.includes(to), `REFUND_TRANSITIONS.${from} 指向未知状态 ${to}`)
+}
+
+// §13.1：退款只能从 PAID 出发。这是整节的地基，所以逐个状态钉一遍而不是只测 paid。
+for (const s of ORDER_STATUSES) {
+  assert(canTransition(s, 'refund_pending') === (s === 'paid'),
+    `只有已支付订单能进入退款中，${s} 不该能`)
+}
+// §13 状态图里那个「无法退款」按钮：退款中要能退回已支付，否则订单永久卡住。
+assert(canTransition('refund_pending', 'paid'), '退款中必须能退回已支付（无法退款）')
+assert(canTransition('refund_pending', 'refunded'), '退款中必须能到已退款')
+// paid → paid 不是合法迁移，尽管 §13.5 要求记一条 PAID → PAID 的日志。
+assert(!canTransition('paid', 'paid'), 'paid → paid 是审计记录而不是迁移，否则幂等检查全部失效')
+assert(!canTransition('refunded', 'paid') && !canTransition('cancelled', 'paid'), '终态不能回头')
+assert(canTransition('unknown', 'paid') === false, '未知状态返回 false 而不是抛——调用方在决定按钮亮不亮')
+assert(TERMINAL_ORDER_STATUSES.includes('refunded') && TERMINAL_ORDER_STATUSES.includes('cancelled'), '终态列表')
+assert(!TERMINAL_ORDER_STATUSES.includes('paid'), '已支付不是终态')
+
+// §13.4 的日志形式。库里存小写，渲染时才大写——两者分开是有意的。
+assert(transitionLabel('paid', 'refund_pending') === 'PAID → REFUND_PENDING', '§13.4 的日志形式')
+
+// 非法迁移的错误信息要说清合法的下一步，否则管理员只知道被拒不知道能干什么。
+const terminalErr = assertTransition('cancelled', 'paid')
+assert(terminalErr.ok === false && terminalErr.error.includes('终态'), '终态的错误信息要说明它是终态')
+const illegalErr = assertTransition('pending', 'refunded')
+assert(illegalErr.ok === false && illegalErr.error.includes('已支付') && illegalErr.error.includes('已取消'),
+  '非法迁移要列出合法的下一步')
+assert(assertTransition('paid', 'refund_pending').ok === true, '合法迁移放行')
+assert(assertTransition('nope', 'paid').error.includes('未知的订单状态'), '未知状态单独一句')
+
+// §13.2：灰按钮的悬浮文案。每种拒绝理由都要不同，否则用户看到同一句话却是不同原因。
+const paidOrder = { status: 'paid', paid_amount_minor: 9900 }
+const okRefund = canRequestRefund(paidOrder)
+assert(okRefund.ok === true && okRefund.maxAmountMinor === 9900, '已支付订单可退，上限是实付金额')
+const reasons = new Set()
+for (const s of ORDER_STATUSES) {
+  const r = canRequestRefund({ status: s, paid_amount_minor: 9900 })
+  assert(r.ok === (s === 'paid'), `${s} 的可退性`)
+  if (!r.ok) { assert(r.reason.length > 0, `${s} 必须有悬浮文案`); reasons.add(r.reason) }
+}
+assert(reasons.size === ORDER_STATUSES.length - 1, '每种不可退的原因要有各自的文案')
+assert(canRequestRefund(null).ok === false, '订单不存在')
+// 在途申请要拦。申请刚提交时订单还是 paid，光看状态会让同一单被提两次。
+assert(canRequestRefund(paidOrder, { status: 'pending' }).ok === false, '已有待审批申请时不能再提')
+assert(canRequestRefund(paidOrder, { status: 'executing' }).ok === false, '执行中不能再提')
+assert(canRequestRefund(paidOrder, { status: 'rejected' }).ok === true, '被拒过可以重提')
+assert(canRequestRefund(paidOrder, { status: 'completed' }).ok === true, '已完成的旧申请不拦新的')
+assert(canRequestRefund({ status: 'paid', paid_amount_minor: 0 }).ok === false, '零金额订单没有可退金额')
+// 老订单没有 paid_amount_minor（那是这次加的列），要退回 amount_minor。
+assert(canRequestRefund({ status: 'paid', amount_minor: 500 }).maxAmountMinor === 500, '老订单退回 amount_minor')
+
+// §10.2：金额可改但不得超过实付，且只收整数。
+assert(validateRefundAmount(paidOrder, 9900).ok === true, '全额退款')
+assert(validateRefundAmount(paidOrder, 1).ok === true, '部分退款')
+assert(validateRefundAmount(paidOrder, 9901).ok === false, '超过实付应拒')
+assert(validateRefundAmount(paidOrder, 0).ok === false, '零金额应拒')
+assert(validateRefundAmount(paidOrder, -1).ok === false, '负金额应拒')
+assert(validateRefundAmount(paidOrder, 99.5).ok === false, '浮点金额应拒——钱只走最小货币单位的整数')
+assert(validateRefundAmount(paidOrder, '99').ok === false, '字符串金额应拒')
+
+// §10.4 的退款迁移。转交绕回待审批，因为接手的人还得批或拒。
+assert(canRefundTransition('transferred', 'pending'), '转交后回到待审批')
+assert(canRefundTransition('failed', 'executing'), '失败可重试——新建申请会丢掉整条审批链')
+assert(!canRefundTransition('pending', 'completed'), '不能跳过执行段')
+assert(!canRefundTransition('rejected', 'pending'), '已拒绝是终态')
+assert(assertRefundTransition('completed', 'executing').error.includes('终态'), '已完成是终态')
+
+// §10.7：只有售后、客服、管理员能发起。presale 的 rank 和 postsale 一样，所以这里必须是名单不是阈值。
+assert(!REFUND_INITIATOR_GROUPS.includes('presale'), '售前不该碰钱，尽管 rank 和售后相同')
+assert(rankOf('presale') === rankOf('postsale'), '这两个组同 rank——正是不能用阈值的原因')
+for (const g of REFUND_INITIATOR_GROUPS) assert(rankOf(g) >= RANK.STAFF, `${g} 至少是员工级`)
+assert(REFUND_APPROVER_GROUPS.length === 1 && REFUND_APPROVER_GROUPS[0] === 'admin', '只有管理员能审批')
+
+// §13.5 的拒绝日志。
+const rej = rejectionLogEntry('o1', 'a1', 'admin', '证据不足')
+assert(rej.from_status === 'paid' && rej.to_status === 'paid', '拒绝记 PAID → PAID')
+assert(rej.note.includes('证据不足'), '拒绝理由必须进日志——§10.3 要求拒绝必须填理由')
+assert(transitionLabel(rej.from_status, rej.to_status) === 'PAID → PAID', '渲染成 §13.5 要求的形式')
+
+console.log('Order and refund state machine: OK')

@@ -26,8 +26,11 @@ export const AMOUNT_OPERATORS = ['gt', 'gte', 'lt', 'lte', 'eq', 'neq']
 /** §1.3 的动作类型。 */
 export const ACTION_TYPES = ['delta', 'percent', 'fixed']
 
-/** 订单状态，和 schema.sql 的 order_status 枚举对齐。历史订单条件按它计数。 */
-export const ORDER_STATUSES = ['pending', 'paid', 'failed', 'cancelled', 'expired', 'refund_pending', 'refunded']
+// 订单状态的唯一声明在 shared/orders.mjs（那边还管迁移图）。这里转发出来，让券的历史订单条件和
+// 订单页读同一份取值——之前这个文件自己列了一份，多出一个枚举里根本不存在的 expired，于是
+// statuses:['expired'] 能过校验、查库时才被 Postgres 拒掉。
+export { ORDER_STATUSES } from './orders.mjs'
+import { ORDER_STATUSES, ORDER_STATUS_LABEL } from './orders.mjs'
 
 const isInt = v => Number.isInteger(v)
 const isNonNegInt = v => Number.isInteger(v) && v >= 0
@@ -267,8 +270,8 @@ export function describeCondition(c) {
     return `商品 SKU ${T[c.op] ?? c.op} ${c.value}`
   }
   if (c.type === 'order_history') {
-    const S = { pending: '待支付', paid: '已支付', failed: '支付失败', cancelled: '已取消', expired: '已过期', refund_pending: '退款中', refunded: '已退款' }
-    return `历史${c.statuses.map(s => S[s] ?? s).join('/')}订单数${OP_TEXT[c.op] ?? c.op} ${c.count} 笔`
+    // 标签也从 orders.mjs 取，不再本地抄一份——抄的那份和取值列表会各自漂移。
+    return `历史${c.statuses.map(s => ORDER_STATUS_LABEL[s] ?? s).join('/')}订单数${OP_TEXT[c.op] ?? c.op} ${c.count} 笔`
   }
   if (c.type === 'first_order') return c.value ? '仅限首次购买' : '仅限已购买过的用户'
   if (c.type === 'user_group') return `用户组属于 ${c.groups.join('、')}`
