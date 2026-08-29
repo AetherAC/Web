@@ -1,4 +1,5 @@
 import { bodyOf, requireUser, send } from './_lib/server.mjs'
+import { driverFor } from './_lib/payments.mjs'
 const values = (order) => ({
   order_id: order.id, sku: order.sku, amount_minor: order.amount_minor,
   amount: (order.amount_minor / 100).toFixed(2), currency: order.currency
@@ -31,7 +32,8 @@ export default async function handler(req, res) {
     }).select().single()
     if (error) throw error
     const config = provider.public_config || {}
-    const vars = { ...values(order), callback_url: `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}/v1/callback/${provider.id}` }
+    const siteUrl = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`
+    const vars = { ...values(order), callback_url: `${siteUrl}/v1/callback/${provider.id}` }
     const template = config.checkout_url_template
     const checkoutUrl = template ? template
       .replaceAll('{order_id}', encodeURIComponent(order.id)).replaceAll('{sku}', encodeURIComponent(order.sku))
@@ -39,7 +41,13 @@ export default async function handler(req, res) {
       .replaceAll('{callback_url}', encodeURIComponent(vars.callback_url)) : null
     let resolvedUrl = checkoutUrl
     let providerOrderId = null
-    if (!resolvedUrl && config.create_url) {
+    // A driver (Stripe, PayPal) needs more than one configurable request, so it takes precedence.
+    const driver = driverFor(config)
+    if (driver) {
+      const created = await driver.create({ order, artifact, siteUrl, config })
+      resolvedUrl = created.checkoutUrl
+      providerOrderId = created.providerOrderId
+    } else if (!resolvedUrl && config.create_url) {
       const endpoint = new URL(render(config.create_url,vars))
       if (endpoint.protocol !== 'https:') throw new Error('Payment create_url must use HTTPS')
       const response = await fetch(endpoint, {

@@ -1,6 +1,14 @@
 import handler from '../api/github-progress.mjs'
 import usersHandler, { isBanned } from '../api/admin-users.mjs'
 import {
+  DRIVERS,
+  approvalLink,
+  decimalAmount,
+  driverFor,
+  paypalOrderBody,
+  stripeSessionForm
+} from '../api/_lib/payments.mjs'
+import {
   SCHEMA,
   defaultRecord,
   fieldHint,
@@ -156,3 +164,49 @@ for (const table of Object.keys(SCHEMA)) {
 }
 
 console.log('Record form conversions: OK')
+
+// The two built-in drivers post shapes the generic create_url path cannot express, so the request
+// bodies are asserted directly: a wrong key name here is a payment that silently never happens.
+const order = {
+  id: 'a1b2c3d4-0000-4000-8000-000000000001',
+  sku: 'AETHER-STARTER',
+  quantity: 1,
+  amount_minor: 1999,
+  currency: 'USD'
+}
+const artifact = { name: '入门版', description: '单机授权' }
+const site = 'https://aetherac.abnt.it'
+
+const stripeForm = stripeSessionForm(order, artifact, site)
+assert(stripeForm instanceof URLSearchParams, 'Stripe only accepts application/x-www-form-urlencoded')
+assert(stripeForm.get('line_items[0][price_data][unit_amount]') === '1999', 'unit_amount must stay the minor unit the artifacts table stores')
+assert(stripeForm.get('line_items[0][price_data][currency]') === 'usd', 'Stripe rejects an upper-case currency')
+assert(stripeForm.get('line_items[0][price_data][product_data][name]') === '入门版', 'the buyer must see the artifact name, not the SKU')
+assert(stripeForm.get('client_reference_id') === order.id && stripeForm.get('metadata[order_id]') === order.id, 'the callback finds our order through client_reference_id / metadata')
+assert(stripeForm.get('success_url') === `${site}/order/${order.id}?paid=1`, 'success_url must return to the order page')
+assert(!stripeSessionForm(order, { name: 'x', description: '' }, site).has('line_items[0][price_data][product_data][description]'), 'Stripe rejects an empty description, so a blank one must be omitted')
+assert(stripeSessionForm(order, null, site).get('line_items[0][price_data][product_data][name]') === order.sku, 'a missing artifact must fall back to the SKU rather than sending "undefined"')
+
+const paypalBody = paypalOrderBody(order, artifact, site)
+assert(paypalBody.intent === 'CAPTURE', 'the order must be capturable, otherwise the money never moves')
+assert(paypalBody.purchase_units[0].amount.value === '19.99', 'PayPal wants a decimal string, not the minor unit')
+assert(paypalBody.purchase_units[0].amount.currency_code === 'USD', 'PayPal rejects a lower-case currency code')
+assert(paypalBody.purchase_units[0].custom_id === order.id, 'custom_id is how the webhook maps a PayPal order back to ours')
+assert(paypalBody.payment_source.paypal.experience_context.return_url === `${site}/order/${order.id}?paid=1`, 'the buyer must land back on the order page')
+
+assert(decimalAmount(1999, 'USD') === '19.99', 'two-decimal currencies divide by 100')
+assert(decimalAmount(1999, 'JPY') === '1999', 'JPY is already whole; dividing it would undercharge by 100x')
+assert(decimalAmount(1999, 'jpy') === '1999', 'the zero-decimal check must not depend on letter case')
+assert(decimalAmount(0, 'USD') === '0.00', 'a free artifact must still form a valid amount')
+
+assert(approvalLink([{ rel: 'self', href: 'a' }, { rel: 'payer-action', href: 'b' }]) === 'b', 'the buyer is sent to the payer-action link')
+assert(approvalLink([{ rel: 'approve', href: 'c' }]) === 'c', 'older PayPal responses name that link approve')
+assert(approvalLink([{ rel: 'self', href: 'a' }]) === null && approvalLink(undefined) === null, 'a missing approval link must be detectable, not returned as undefined')
+
+assert(driverFor({ driver: 'stripe' }) === DRIVERS.stripe && driverFor({ driver: 'PayPal' }) === DRIVERS.paypal, 'the driver name in public_config must resolve case-insensitively')
+assert(driverFor({}) === null && driverFor(null) === null && driverFor({ driver: 'alipay' }) === null, 'the other nine providers must keep using the generic create_url path')
+for (const [name, driver] of Object.entries(DRIVERS)) {
+  assert(typeof driver.create === 'function' && typeof driver.verify === 'function', `${name} driver must be able to create a checkout and verify a callback`)
+}
+
+console.log('Payment drivers: OK')

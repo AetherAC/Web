@@ -7,12 +7,28 @@ import { supabase, useAuth } from './auth'
 const auth=useAuth(); const order=ref<any>(null); const refund=ref<any>(null); const denied=ref(false)
 const reason=ref('duplicate'); const detail=ref(''); const files=ref<File[]>([]); const message=ref(''); const sending=ref(false)
 const orderId=()=>location.pathname.split('/').filter(Boolean)[1]||new URLSearchParams(location.search).get('order_id')
+const justPaid=()=>typeof window!=='undefined'&&new URLSearchParams(location.search).get('paid')==='1'
+async function fetchOrder(strict=false){
+  const {data,error}=await supabase!.from('orders').select('*').eq('id',orderId()).maybeSingle()
+  if(error||!data){if(strict)denied.value=true;return null}
+  order.value=data
+  return data
+}
 watch(()=>auth.ready.value,async ready=>{
   if(!ready)return
   if(!auth.user.value){auth.requireUser(typeof window==='undefined'?'/order':location.pathname);return}
-  const {data,error}=await supabase!.from('orders').select('*').eq('id',orderId()).maybeSingle()
-  if(error||!data){denied.value=true;return}
-  order.value=data
+  const data=await fetchOrder(true)
+  if(!data)return
+  // Stripe and PayPal send the buyer back here before their callback has necessarily landed, so an
+  // order that was just paid can still read `pending` for a few seconds. Poll instead of showing
+  // this buyer a "继续付款" button for money they have already handed over.
+  if(justPaid()&&data.status==='pending'){
+    for(let attempt=0;attempt<6;attempt++){
+      await new Promise(resolve=>setTimeout(resolve,2000))
+      const next=await fetchOrder()
+      if(next&&next.status!=='pending')break
+    }
+  }
   const {data:r}=await supabase!.from('refund_requests').select('*').eq('order_id',data.id).maybeSingle()
   refund.value=r
 },{immediate:true})

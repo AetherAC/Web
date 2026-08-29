@@ -193,5 +193,15 @@ insert into public.payment_providers(id,display_name,secret_env_names,instructio
 ('payless','Payless',array['PAYLESS_API_KEY','PAYLESS_WEBHOOK_SECRET'],'1. Obtain merchant API documentation and credentials from Payless. 2. Configure create_url, create_headers, create_body and response paths. 3. Register /v1/callback/payless. 4. Configure HMAC signature header/secret. 5. Test success, failure, duplicate callback and refund flows.',90)
 on conflict(id) do update set secret_env_names=excluded.secret_env_names,instructions=excluded.instructions,sort_order=excluded.sort_order;
 
+-- Stripe and PayPal are driven by api/_lib/payments.mjs instead of the configurable create_url path,
+-- so public_config.driver is what makes them work. The jsonb concat below keeps any key already in
+-- the row (notably paypal.environment='sandbox') from being reset to the seeded value on a re-run.
+insert into public.payment_providers(id,display_name,public_config,secret_env_names,instructions,sort_order) values
+('stripe','Stripe','{"driver":"stripe"}'::jsonb,array['STRIPE_SECRET_KEY'],'1. 在 Stripe 控制台 Developers → API keys 取 Secret key（正式环境是 sk_live_ 开头，测试环境 sk_test_ 开头）。2. 在“环境变量”页添加 STRIPE_SECRET_KEY，勾选敏感值。3. 在 Stripe 控制台 Developers → Webhooks 添加端点 https://aetherac.abnt.it/v1/callback/stripe，事件勾选 checkout.session.completed 和 checkout.session.expired；这里不需要 webhook 密钥，回调收到后会反查 Stripe 的会话状态来确认收款。4. 重新部署后回到本页勾选“对外启用”。5. 用 sk_test_ 密钥下一单验证，Stripe 会跳转回 /order/<订单号>。',1),
+('paypal','PayPal','{"driver":"paypal","environment":"live"}'::jsonb,array['PAYPAL_CLIENT_ID','PAYPAL_SECRET'],'1. 在 PayPal Developer Dashboard 创建 App，取 Client ID 与 Secret（沙盒和正式是两套）。2. 在“环境变量”页添加 PAYPAL_CLIENT_ID 和 PAYPAL_SECRET，勾选敏感值。3. 要先用沙盒测试就把本行“公开配置”里的 environment 改成 sandbox，正式收款时改回 live。4. 在 App 的 Webhooks 里添加 https://aetherac.abnt.it/v1/callback/paypal，事件勾选 CHECKOUT.ORDER.APPROVED 和 PAYMENT.CAPTURE.COMPLETED；买家批准后由服务端调用 capture 真正扣款，capture 成功才算已付款。5. 重新部署后回到本页勾选“对外启用”。',2)
+on conflict(id) do update set
+  public_config=excluded.public_config||payment_providers.public_config,
+  secret_env_names=excluded.secret_env_names,instructions=excluded.instructions,sort_order=excluded.sort_order;
+
 -- Bootstrap the first administrator after registration:
 -- update public.user_profiles set group_name='admin' where email='contact@abnt.it';
