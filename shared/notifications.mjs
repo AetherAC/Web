@@ -10,12 +10,15 @@
  * 但这里还多一层——按钮的 action 值决定点下去调哪个接口，而那份映射天然属于代码而不是表结构。
  */
 
-/** §9.2 的站内信类型。 */
-export const NOTIFICATION_KINDS = ['system', 'admin', 'order', 'refund', 'refund_approval', 'session']
+/**
+ * §9.2 的站内信类型。这份列表和 schema.sql 里 notifications.kind 那条 check 必须逐字一致——
+ * tests/api-smoke.mjs 对着断言，少一个值的后果是插入时被数据库拒掉，而调用方只看到一句约束名。
+ */
+export const NOTIFICATION_KINDS = ['system', 'admin', 'order', 'refund', 'refund_approval', 'session', 'ticket']
 
 export const KIND_LABEL = {
   system: '系统通知', admin: '管理员通知', order: '订单通知',
-  refund: '退款通知', refund_approval: '退款审批', session: '客服会话'
+  refund: '退款通知', refund_approval: '退款审批', session: '客服会话', ticket: '工单通知'
 }
 
 /**

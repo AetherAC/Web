@@ -392,7 +392,10 @@ create index if not exists cs_session_events_session_idx on public.cs_session_ev
 -- 就把这条对所有人标成了已读；给每个管理员各复制一行，审批状态又会出现多份互相矛盾的副本。
 create table if not exists public.notifications (
   id uuid primary key default gen_random_uuid(),
-  kind text not null default 'system' check (kind in ('system','admin','ticket','refund','order')),
+  -- kind 的取值必须和 shared/notifications.mjs 的 NOTIFICATION_KINDS 完全一致，tests/api-smoke.mjs 对着断言。
+  -- refund 和 refund_approval 是两回事：前者是「你的退款到哪一步了」这种告知，后者带审批按钮，
+  -- §9.6 要求强制置顶高亮，presentationFor() 就靠这个区分。合成一个值等于让普通告知也占住置顶位。
+  kind text not null default 'system' check (kind in ('system','admin','order','refund','refund_approval','session','ticket')),
   title text not null, body text not null default '',
   format text not null default 'markdown' check (format in ('plain','markdown')),
   -- §9.5 的可见范围。user 是发给某一个人，其余三种按角色广播。

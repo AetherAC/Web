@@ -67,6 +67,8 @@ import {
   ACTION_ENDPOINT,
   ADMIN_ONLY_ACTIONS,
   ACTION_TYPES as NOTIF_ACTION_TYPES,
+  KIND_LABEL,
+  NOTIFICATION_KINDS,
   canUseAction,
   needsConfirm,
   needsReason,
@@ -933,6 +935,23 @@ assert(validateNotification({ ...baseNotif, title: '' }).ok === false, '空标�
 assert(validateNotification({ ...baseNotif, body: '  ' }).ok === false, '空白正文应拒')
 assert(validateNotification({ ...baseNotif, state: null }).ok === true, 'state 可以是 null（不是待办）')
 assert(validateNotification({ ...baseNotif, state: 'nope' }).ok === false, '未知 state 应拒')
+
+// kind 的两份声明必须一致：JS 这份决定能不能提交，schema.sql 那条 check 决定能不能落库。
+// 只有 JS 多一个值的时候，validateNotification 会放行、数据库会拒——而调用方只看到一句约束名，
+// 于是「通知一条都发不出去」被当成偶发故障。所以两边逐值双向对齐。
+const kindCheck = schemaSql.match(/kind text not null default 'system' check \(kind in \(([^)]*)\)\)/)
+assert(kindCheck, 'schema.sql 里必须有 notifications.kind 的 check 约束，否则任何字符串都能落库')
+const sqlKinds = kindCheck[1].split(',').map(s => s.trim().replace(/^'|'$/g, ''))
+for (const kind of NOTIFICATION_KINDS) {
+  assert(sqlKinds.includes(kind), `notifications.kind 的 check 缺 '${kind}'——这种类型的站内信会被数据库拒掉`)
+  assert(KIND_LABEL[kind], `${kind} 需要中文标签，否则收件箱里显示成裸 slug`)
+}
+for (const kind of sqlKinds) {
+  assert(NOTIFICATION_KINDS.includes(kind), `schema.sql 允许 '${kind}' 但 NOTIFICATION_KINDS 没有——库里会出现前端认不出的行`)
+}
+// §9.6 的强制置顶靠 kind 区分，所以 refund 和 refund_approval 不能合成一个值。
+assert(NOTIFICATION_KINDS.includes('refund') && NOTIFICATION_KINDS.includes('refund_approval'),
+  '退款告知和退款审批必须是两种类型，否则普通告知也会占住置顶位')
 
 // 外链必须拒。一条管理员发的站内信如果能挂外链，就是个带站点信誉的钓鱼入口，而站内信恰好是
 // 用户最容易信任的位置。
