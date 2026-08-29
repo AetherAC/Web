@@ -134,3 +134,31 @@ button { color: inherit; }
 @media(max-width:600px){.auth-layout,.commerce-main,.account-main,.order-main{width:min(100% - 28px,1120px);padding-top:105px}.auth-brand h1{font-size:39px}.auth-card{padding:24px}.commerce-hero h1{font-size:42px}.account-head{align-items:flex-start;flex-wrap:wrap}.account-head>button{margin-left:0}.order-summary{align-items:flex-start;flex-direction:column;gap:25px}}
 .progress-layout>.roadmap-panel{grid-column:1;grid-row:1/span 999}.progress-layout>.github-panel{grid-column:2}
 @media(max-width:980px){.progress-layout>.roadmap-panel,.progress-layout>.github-panel{grid-column:1;grid-row:auto}}
+
+/* Structured record editor: one real input per column, JSON only for genuinely free-form jsonb */
+.field-form{display:grid;grid-template-columns:1fr 1fr;gap:17px}
+.field-form>label{min-width:0}
+.field-form .wide{grid-column:1/-1}
+.field-form textarea{width:100%;padding:12px;border:1px solid var(--fluent-stroke);outline:0;background:#090f0d;color:#dce9e3;font-family:inherit;font-size:13px;line-height:1.65;resize:vertical}
+.field-form textarea.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+.field-form textarea:focus,.field-form select:focus{border-color:var(--fluent)}
+.field-form input[type=datetime-local]{color-scheme:dark}
+.field-form span b{color:var(--fluent)}
+.field-form small{color:#71857b;font-size:11px;line-height:1.5}
+.field-form input[readonly],.field-form textarea[readonly]{color:#8ea099;cursor:not-allowed}
+.field-form .check-field{justify-content:flex-start}
+.field-form .check-row{display:flex;align-items:center;gap:10px;color:#dbe8e2;font-size:13px}
+.field-form .check-row input{width:auto;flex:none;margin:0;padding:0;accent-color:var(--fluent)}
+.form-actions{grid-column:1/-1;display:flex;gap:11px;margin-top:3px}
+.raw-json{grid-column:1/-1;margin-top:6px;padding-top:16px;border-top:1px solid var(--fluent-stroke)}
+.raw-json summary{color:#6e8279;font-size:11px;font-weight:750;letter-spacing:1.2px;cursor:pointer}
+.raw-json textarea{margin-top:13px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+.raw-json button{margin-top:11px}
+@media(max-width:900px){.field-form{grid-template-columns:1fr}}
+.env-form textarea{width:100%;padding:12px;border:1px solid var(--fluent-stroke);outline:0;background:#090f0d;color:#dce9e3;font-family:inherit;font-size:13px;line-height:1.6;resize:vertical}
+.env-form textarea:focus{border-color:var(--fluent)}
+.env-form small,.field-form small{color:#71857b;font-size:11px;line-height:1.5}
+.env-form .env-note{display:block;margin:-6px 0 4px}
+.fluent-notice.compact{font-size:12px}
+.fluent-notice.compact p{margin:6px 0 0;line-height:1.75}
+.fluent-notice code{color:#83e7ca}

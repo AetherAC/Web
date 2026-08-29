@@ -8,8 +8,8 @@ export function send(res, status, body) {
 }
 export function serviceClient() {
   const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
-  if (!url || !key) throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required')
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY
+  if (!url || !key) throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY) are required')
   return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } })
 }
 export async function requireUser(req, res, admin = false) {
