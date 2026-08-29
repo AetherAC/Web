@@ -69,6 +69,10 @@ import {
   ACTION_TYPES as NOTIF_ACTION_TYPES,
   KIND_LABEL,
   NOTIFICATION_KINDS,
+  NOTIFICATION_SCOPES,
+  NOTIFICATION_SCOPE_RANK,
+  broadcastScopesFor,
+  canSeeNotification,
   canUseAction,
   needsConfirm,
   needsReason,
@@ -114,6 +118,9 @@ import { approveRefund } from '../api/refund-approve.mjs'
 import { rejectRefund } from '../api/refund-reject.mjs'
 import { transferRefund } from '../api/refund-transfer.mjs'
 import { executeRefund } from '../api/refund-execute.mjs'
+import {
+  archiveNotifications, inboxSettings, listNotifications, markRead, unreadCount
+} from '../api/notifications.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
@@ -1220,8 +1227,15 @@ const recorder = (results = {}) => {
     const link = {
       eq(col, val) { entry.filters[col] = val; return link },
       select(cols) { entry.selected = cols ?? '*'; return link },
-      order(col, opts) { entry.order = { col, ...opts }; return link },
+      // order 可以链两次（收件箱是「置顶优先、再按时间倒序」），所以记成数组而不是覆盖一个字段。
+      order(col, opts) { (entry.orders ??= []).push({ col, ...opts }); entry.order = { col, ...opts }; return link },
       limit(n) { entry.limit = n; return link },
+      // or 的参数是一整条拼出来的字符串，原样留着——收件箱的可见性就靠它收窄，测试要能看出
+      // 里面到底放进了哪些 scope。
+      or(expr) { entry.or = expr; return link },
+      in(col, vals) { (entry.in ??= {})[col] = vals; return link },
+      lt(col, val) { (entry.lt ??= {})[col] = val; return link },
+      not(col, op, val) { (entry.not ??= []).push({ col, op, val }); return link },
       // 求值放在这里而不是上面：函数式给法要读 entry.filters，而那是 .eq() 之后才填好的。
       single: async () => resolveResult(),
       maybeSingle: async () => resolveResult(),
@@ -1230,6 +1244,9 @@ const recorder = (results = {}) => {
     return {
       insert(payload) { entry.op = 'insert'; entry.payload = payload; return link },
       update(payload) { entry.op = 'update'; entry.payload = payload; return link },
+      // upsert 的第二个参数要记下来：收件箱靠 onConflict 走主键冲突更新，漏掉它会变成重复插入
+      // 然后撞主键，而那是只有在「第二次读同一条通知」时才出现的错。
+      upsert(payload, opts) { entry.op = 'upsert'; entry.payload = payload; entry.upsertOpts = opts; return link },
       select(cols) { entry.op = 'select'; entry.selected = cols; return link }
     }
   }
@@ -2065,3 +2082,236 @@ assert(execNotifyBroken.status === 200 && execNotifyBroken.body.notified === fal
   '通知失败不能让一笔已经登记的退款报失败——那会让人再退一次')
 
 console.log('Refund execution: OK')
+
+// ---------------------------------------------------------------------------
+// §9 的收件箱。
+//
+// 这一段里最重要的不是列表格式，是可见性。requireUser 交出来的是 service client，它绕过 RLS，
+// 所以 schema.sql 里那个 private.can_see_notification() 在这条路径上一点作用都没有——判定必须由
+// canSeeNotification() 在 JS 里做完。判错的后果不是报错，是有人读到了别人的收件箱，而那不会有
+// 任何症状。所以下面先把 JS 的阈值和 SQL 函数的 case 分支对着钉死。
+const scopeCase = schemaSql.match(
+  /create or replace function private\.can_see_notification\(scope text, recipient uuid\)[\s\S]*?\$\$([\s\S]*?)\$\$/
+)
+assert(scopeCase, '找不到 private.can_see_notification 的定义——它是可见性的另一半')
+assert(/when 'user' then recipient = \(select auth\.uid\(\)\)/.test(scopeCase[1]),
+  'user 范围按收件人判，JS 那边也是比 recipient_id')
+assert(/when 'admin' then \(select private\.is_admin\(\)\)/.test(scopeCase[1]), 'admin 范围走 is_admin')
+assert(/when 'cs' then \(select private\.is_staff\(\)\)/.test(scopeCase[1]),
+  'cs 范围走 is_staff——所以售前售后也算客服，JS 的阈值必须是 777 而不是 888')
+assert(/when 'all' then true/.test(scopeCase[1]), 'all 范围人人可见')
+// 两个 rank 阈值从 SQL 函数体里读出来，而不是照抄一份。
+const staffSql = schemaSql.match(/function private\.is_staff\(\)[\s\S]*?my_rank\(\) >= (\d+)/)
+const adminSql = schemaSql.match(/function private\.is_admin\(\)[\s\S]*?my_rank\(\) >= (\d+)/)
+assert(Number(staffSql[1]) === NOTIFICATION_SCOPE_RANK.cs,
+  `cs 范围的阈值两边要一致：SQL ${staffSql[1]}，JS ${NOTIFICATION_SCOPE_RANK.cs}`)
+assert(Number(adminSql[1]) === NOTIFICATION_SCOPE_RANK.admin,
+  `admin 范围的阈值两边要一致：SQL ${adminSql[1]}，JS ${NOTIFICATION_SCOPE_RANK.admin}`)
+// SQL 里出现的每个 scope 都要在 JS 的列表里，反之亦然——多一个的方向是泄露。
+const sqlScopes = [...scopeCase[1].matchAll(/when '(\w+)' then/g)].map(m => m[1])
+for (const s of sqlScopes) assert(NOTIFICATION_SCOPES.includes(s), `SQL 有 scope ${s}，JS 没有`)
+for (const s of NOTIFICATION_SCOPES) assert(sqlScopes.includes(s), `JS 有 scope ${s}，SQL 没有`)
+
+// 逐个组核对能看到哪些广播范围。
+assert(broadcastScopesFor(999).sort().join() === 'admin,all,cs', '管理员能看到全部三种广播')
+assert(broadcastScopesFor(888).sort().join() === 'all,cs', 'cs 组看得到客服广播，看不到管理员广播')
+assert(broadcastScopesFor(777).sort().join() === 'all,cs', '售前售后同样算客服')
+assert(broadcastScopesFor(555).join() === 'all', '文案只看得到全站广播')
+assert(broadcastScopesFor(111).join() === 'all', 'read 组同上')
+assert(broadcastScopesFor(0).join() === 'all', '普通用户只看得到全站广播')
+assert(!broadcastScopesFor(999).includes('user'), 'user 不是广播范围，不能靠 rank 拿到')
+
+const OTHER = '99999999-9999-4999-8999-999999999999'
+const mineRow = { id: '10000000-0000-4000-8000-000000000001', scope: 'user', recipient_id: BUYER, kind: 'order', title: 'a', body: 'b', state: null, actions: [], created_at: '2026-08-20T00:00:00Z' }
+const theirRow = { id: '10000000-0000-4000-8000-000000000002', scope: 'user', recipient_id: OTHER, kind: 'order', title: 'a', body: 'b', state: null, actions: [], created_at: '2026-08-21T00:00:00Z' }
+const adminRow = { id: '10000000-0000-4000-8000-000000000003', scope: 'admin', recipient_id: null, kind: 'refund_approval', title: 'a', body: 'b', state: 'pending', actions: [{ type: 'approve_refund', label: '批准', target: REFUND }], created_at: '2026-08-22T00:00:00Z' }
+const csRow = { id: '10000000-0000-4000-8000-000000000004', scope: 'cs', recipient_id: null, kind: 'session', title: 'a', body: 'b', state: null, actions: [], created_at: '2026-08-23T00:00:00Z' }
+const allRow = { id: '10000000-0000-4000-8000-000000000005', scope: 'all', recipient_id: null, kind: 'system', title: 'a', body: 'b', state: null, actions: [], created_at: '2026-08-24T00:00:00Z' }
+
+// 逐条问 canSeeNotification，这是接口的最后一道防线。
+assert(canSeeNotification(mineRow, BUYER, 0) === true, '自己的通知自己看得见')
+assert(canSeeNotification(mineRow, OTHER, 999) === false,
+  '别人的私信管理员也看不见——rank 再高也不该越过 user 范围')
+assert(canSeeNotification(theirRow, BUYER, 777) === false, '不是发给我的就看不见')
+assert(canSeeNotification(adminRow, BUYER, 999) === true, '管理员看得见管理员广播')
+assert(canSeeNotification(adminRow, BUYER, 888) === false, 'cs 组看不见管理员广播')
+assert(canSeeNotification(csRow, BUYER, 777) === true, '售后看得见客服广播')
+assert(canSeeNotification(csRow, BUYER, 555) === false, '文案看不见客服广播')
+assert(canSeeNotification(allRow, BUYER, 0) === true, '全站广播人人可见')
+assert(canSeeNotification({ scope: 'user', recipient_id: null }, null, 999) === false,
+  'recipient_id 和 userId 都为空时不能算匹配——一个 == 就会让所有匿名比较都通过')
+assert(canSeeNotification({ scope: 'user', recipient_id: undefined }, undefined, 999) === false, '同上')
+assert(canSeeNotification({ scope: 'nonsense', recipient_id: null }, BUYER, 999) === false,
+  '未知范围默认看不见，而不是默认可见')
+assert(canSeeNotification(null, BUYER, 999) === false, '空行看不见')
+
+const receiptsFor = rows => ({ data: rows, error: null })
+const inboxDb = (notifRows, receiptRows = []) => recorder({
+  notifications: { data: notifRows, error: null },
+  notification_receipts: receiptsFor(receiptRows),
+  site_settings: settings()
+})
+
+// 列表：库里混着别人的私信时也不能漏出去。
+const listDb = inboxDb([mineRow, theirRow, adminRow, csRow, allRow])
+const listed = await listNotifications(listDb, { userId: BUYER, group: 'default', rank: 0 }, {})
+const listedIds = listed.body.items.map(n => n.id)
+assert(listed.status === 200, '列表可读')
+assert(listedIds.includes(mineRow.id) && listedIds.includes(allRow.id), '自己的和全站的都在')
+assert(!listedIds.includes(theirRow.id), '别人的私信不能出现在我的列表里')
+assert(!listedIds.includes(adminRow.id) && !listedIds.includes(csRow.id),
+  '普通用户拿不到管理员和客服广播——就算 or 条件写漏了，最后那次 filter 也要挡住')
+// or 条件里放进去的 scope 必须来自 broadcastScopesFor，不能是手写的。
+const listQuery = listDb.calls.find(c => c.table === 'notifications')
+assert(listQuery.or.includes(`recipient_id.eq.${BUYER}`), '查询里带上自己的收件人条件')
+assert(listQuery.or.includes('scope.in.(all)'), '普通用户的 or 里只有 all')
+assert(!listQuery.or.includes('admin'), '普通用户的查询条件里不该出现 admin')
+const adminList = inboxDb([mineRow, adminRow, csRow, allRow])
+const adminListed = await listNotifications(adminList, { userId: BUYER, group: 'admin', rank: 999 }, {})
+assert(adminListed.body.items.length === 4, '管理员看得到自己的和三种广播')
+assert(adminList.calls.find(c => c.table === 'notifications').or.includes('cs'),
+  '管理员的 or 里要包含 cs——否则客服广播对管理员不可见，而 is_staff 说它可见')
+
+// 排序：置顶优先，再按时间倒序。§9.6 要求待审批的一直挡在眼前，读过了也不许沉下去。
+assert(adminList.calls.find(c => c.table === 'notifications').orders.length === 2, '两级排序')
+assert(adminList.calls.find(c => c.table === 'notifications').orders[0].col === 'pinned',
+  '第一级按置顶——§9.6')
+assert(adminList.calls.find(c => c.table === 'notifications').orders[0].ascending === false, '置顶的在前')
+// pinned 是重算的，不是读库里的列：库里那两列在 settleApproval 之后会被收掉。
+const pinnedItem = adminListed.body.items.find(n => n.id === adminRow.id)
+assert(pinnedItem.pinned === true && pinnedItem.highlighted === true,
+  '带审批按钮且待处理的要置顶高亮')
+const plainItem = adminListed.body.items.find(n => n.id === allRow.id)
+assert(plainItem.pinned === false, '普通通知不占置顶位')
+
+// 已读状态来自 receipts；没有 receipt 行的一律算未读。
+const readMix = inboxDb([mineRow, allRow], [
+  { notification_id: mineRow.id, read_at: '2026-08-25T00:00:00Z', archived_at: null, dwell_ms: 2100 }
+])
+const mixed = await listNotifications(readMix, { userId: BUYER, group: 'default', rank: 0 }, {})
+assert(mixed.body.items.find(n => n.id === mineRow.id).read === true, '有 read_at 就是已读')
+assert(mixed.body.items.find(n => n.id === allRow.id).read === false,
+  '没有 receipt 行的广播算未读——广播在没人碰过之前根本没有那一行')
+assert(mixed.body.unread === 1, '未读数不能只查 receipts，否则恒为 0')
+// receipts 查询必须按自己的 user_id 收窄。
+const receiptQuery = readMix.calls.find(c => c.table === 'notification_receipts')
+assert(receiptQuery.filters.user_id === BUYER, '只读自己的已读记录')
+assert(Array.isArray(receiptQuery.in.notification_id), '按这一页的 id 收窄，不是全表拉回来')
+
+// 归档过的默认不出现，带 archived=true 时单独看。
+const archivedMix = inboxDb([mineRow, allRow], [
+  { notification_id: mineRow.id, read_at: null, archived_at: '2026-08-25T00:00:00Z', dwell_ms: 0 }
+])
+const openOnly = await listNotifications(archivedMix, { userId: BUYER, group: 'default', rank: 0 }, {})
+assert(openOnly.body.items.length === 1 && openOnly.body.items[0].id === allRow.id,
+  '归档过的默认不出现，否则手动归档等于没用')
+const archivedOnly = await listNotifications(
+  inboxDb([mineRow, allRow], [{ notification_id: mineRow.id, read_at: null, archived_at: 'x', dwell_ms: 0 }]),
+  { userId: BUYER, group: 'default', rank: 0 }, { archived: 'true' })
+assert(archivedOnly.body.items.length === 1 && archivedOnly.body.items[0].id === mineRow.id,
+  'archived=true 时只看归档的')
+
+// 分页上限：limit 要被夹住，否则一个请求能把整张表拉走。
+const bigLimit = inboxDb([allRow])
+await listNotifications(bigLimit, { userId: BUYER, group: 'default', rank: 0 }, { limit: 9999 })
+assert(bigLimit.calls.find(c => c.table === 'notifications').limit === 100, 'limit 上限 100')
+const zeroLimit = inboxDb([allRow])
+await listNotifications(zeroLimit, { userId: BUYER, group: 'default', rank: 0 }, { limit: 0 })
+assert(zeroLimit.calls.find(c => c.table === 'notifications').limit === 20, 'limit=0 退回默认值')
+const beforeDb = inboxDb([allRow])
+await listNotifications(beforeDb, { userId: BUYER, group: 'default', rank: 0 }, { before: '2026-08-24T00:00:00Z' })
+assert(beforeDb.calls.find(c => c.table === 'notifications').lt.created_at === '2026-08-24T00:00:00Z',
+  'before 走 created_at 的 lt')
+
+// 未读数：待处理要单独给一个数，否则全读过之后那三条等着批的退款不再提醒任何人。
+const countDb = inboxDb([mineRow, adminRow, allRow], [
+  { notification_id: adminRow.id, read_at: '2026-08-25T00:00:00Z', archived_at: null }
+])
+const counted = await unreadCount(countDb, { userId: BUYER, group: 'admin', rank: 999 })
+assert(counted.body.unread === 2, '两条没读')
+assert(counted.body.pending === 1, '读过但没处理的仍然算待处理')
+const countArchived = await unreadCount(
+  inboxDb([adminRow], [{ notification_id: adminRow.id, read_at: null, archived_at: 'x' }]),
+  { userId: BUYER, group: 'admin', rank: 999 })
+assert(countArchived.body.unread === 0 && countArchived.body.pending === 0, '归档过的不再计数')
+
+// 标记已读：只能标自己看得见的。
+const readDb = inboxDb([mineRow])
+const readAnswer = await markRead(readDb, { userId: BUYER, group: 'default', rank: 0 },
+  { ids: [mineRow.id], dwell_ms: 2100 })
+assert(readAnswer.status === 200 && readAnswer.body.marked === 1, '标记成功')
+const upsertCall = readDb.calls.find(c => c.table === 'notification_receipts' && c.op === 'upsert')
+assert(upsertCall.upsertOpts.onConflict === 'notification_id,user_id',
+  'upsert 要走主键冲突更新——广播在第一次被读之前没有那一行，先查后插会有并发缝')
+assert(upsertCall.payload[0].user_id === BUYER && upsertCall.payload[0].read_at, '记下是谁什么时候读的')
+assert(upsertCall.payload[0].dwell_ms === 2100, '§9.7 的停留时长要留下痕迹，两条触发路径要能分辨')
+const dwellBad = inboxDb([mineRow])
+await markRead(dwellBad, { userId: BUYER, group: 'default', rank: 0 }, { ids: [mineRow.id], dwell_ms: -5 })
+assert(dwellBad.calls.find(c => c.op === 'upsert').payload[0].dwell_ms === 0, '负的停留时长归零')
+
+// 标别人的通知：不能生效，而且不能靠答复差异问出那条通知存在。
+const stealRead = inboxDb([theirRow])
+const stolen = await markRead(stealRead, { userId: BUYER, group: 'default', rank: 0 }, { ids: [theirRow.id] })
+assert(stolen.status === 404, '标不了别人的通知')
+assert(!stealRead.calls.some(c => c.op === 'upsert'),
+  '看不见就不能写 receipt——那不只是越权，还会让对方永远收不到那条提醒')
+const mixedRead = inboxDb([mineRow, theirRow])
+const partialAnswer = await markRead(mixedRead, { userId: BUYER, group: 'default', rank: 0 },
+  { ids: [mineRow.id, theirRow.id] })
+assert(partialAnswer.body.marked === 1 && partialAnswer.body.skipped === 1, '混着给时只标看得见的')
+assert(mixedRead.calls.find(c => c.op === 'upsert').payload.length === 1, '写进去的只有一条')
+for (const badIds of [undefined, null, [], ['x'], [123], {}]) {
+  const answer = await markRead(inboxDb([mineRow]), { userId: BUYER, group: 'default', rank: 0 },
+    { ids: badIds })
+  assert(answer.status === 400, `ids=${JSON.stringify(badIds)} 应拒`)
+}
+const singleId = await markRead(inboxDb([mineRow]), { userId: BUYER, group: 'default', rank: 0 },
+  { id: mineRow.id })
+assert(singleId.status === 200, '单条也能标，不必包成数组')
+const tooManyIds = await markRead(inboxDb([mineRow]), { userId: BUYER, group: 'default', rank: 0 },
+  { ids: Array.from({ length: 101 }, () => mineRow.id) })
+assert(tooManyIds.status === 400, '一次最多 100 条')
+
+// 归档：待处理的不许归档，否则等于绕过 §9.6 的强制置顶。
+const archDb = inboxDb([mineRow])
+const archAnswer = await archiveNotifications(archDb, { userId: BUYER, group: 'default', rank: 0 },
+  { ids: [mineRow.id] })
+assert(archAnswer.status === 200 && archAnswer.body.archived === 1, '普通通知可以归档')
+assert(archDb.calls.find(c => c.op === 'upsert').payload[0].archived_at, '记下归档时间')
+const archPending = inboxDb([adminRow])
+const blockedArch = await archiveNotifications(archPending, { userId: BUYER, group: 'admin', rank: 999 },
+  { ids: [adminRow.id] })
+assert(blockedArch.status === 409, '待处理的不许归档')
+assert(!archPending.calls.some(c => c.op === 'upsert'), '被拦下时不写 receipt')
+const stealArch = await archiveNotifications(inboxDb([theirRow]),
+  { userId: BUYER, group: 'default', rank: 0 }, { ids: [theirRow.id] })
+assert(stealArch.status === 404, '归档不了别人的通知')
+const undoArch = inboxDb([mineRow])
+const restored = await archiveNotifications(undoArch, { userId: BUYER, group: 'default', rank: 0 },
+  { ids: [mineRow.id], undo: true })
+assert(restored.body.restored === 1, '可以取消归档')
+assert(undoArch.calls.find(c => c.op === 'upsert').payload[0].archived_at === null, '取消归档是把时间清空')
+
+// or 条件是拼串，所以拼进去的 userId 必须先过形状校验。带逗号或右括号的值能改写整条过滤器，
+// 而那条过滤器就是可见性判定。
+for (const badUser of ['1,scope.eq.admin', 'x) or (true', '', null, undefined, 'not-a-uuid']) {
+  const db = inboxDb([allRow])
+  const answer = await listNotifications(db, { userId: badUser, group: 'default', rank: 0 }, {})
+  assert(answer.status === 400, `userId=${JSON.stringify(badUser)} 不该被拼进 or 条件`)
+  assert(db.calls.length === 0, '形状不对时一次库都不查')
+  const counted2 = await unreadCount(inboxDb([allRow]), { userId: badUser, group: 'default', rank: 0 })
+  assert(counted2.status === 400, '未读数那条路径同样要挡')
+}
+
+// §14：停留阈值必须由服务端给，前端写死 2000 的话管理员改了配置也不生效。
+const inboxSet = await inboxSettings(recorder({
+  site_settings: settings({
+    notification_auto_archive_days: 45, notification_read_dwell_ms: 3500,
+    notification_notify_browser: true, notification_notify_email: false
+  })
+}))
+assert(inboxSet.body.auto_archive_days === 45 && inboxSet.body.read_dwell_ms === 3500, '配置如实返回')
+assert(inboxSet.body.notify_browser === true && inboxSet.body.notify_email === false,
+  '两个开关是独立的，可以同时开')
+
+console.log('Notification inbox: OK')

@@ -30,6 +30,39 @@ export const KIND_LABEL = {
  */
 export const NOTIFICATION_SCOPES = ['user', 'admin', 'cs', 'all']
 
+/**
+ * §9.5 的可见范围判定，和 schema.sql 里 private.can_see_notification() 逐字对应。
+ *
+ * 为什么要有第二份实现：RLS 那份只在用户自己的 token 下生效，而 api/_lib/server.mjs 的
+ * requireUser 交出来的是 service client（它要能读 user_profiles 判组），service client 绕过 RLS。
+ * 所以收件箱接口必须自己再判一遍——不判的话，任何登录用户都能读到全体管理员的审批通知。
+ *
+ * 两份实现对不上是这个仓库里反复出现的那类 bug，但这一次的后果不是插入被拒（那会立刻报错），
+ * 而是有人看到了不该看的收件箱——不报错，也没人会发现。所以 tests/api-smoke.mjs 直接读
+ * schema.sql 的文本，把这里的阈值和那个函数里的 case 分支对着断言。
+ *
+ * 注意 cs 这一档用的是 is_staff()（rank ≥ 777），所以售前和售后都算在内，不只是 cs 组本身。
+ * 这是有意的：§9.5 的「仅客服可见」说的是客服这类人，而 §6 里 presale/postsale/cs 都是客服。
+ */
+export const NOTIFICATION_SCOPE_RANK = { all: 0, cs: 777, admin: 999 }
+
+/** 某个 rank 能看到的广播范围。user 范围不在内——那一档按收件人判，不按 rank。 */
+export const broadcastScopesFor = rank =>
+  NOTIFICATION_SCOPES.filter(s => s !== 'user' && Number(rank) >= NOTIFICATION_SCOPE_RANK[s])
+
+/** 这条通知这个人看不看得见。和 private.can_see_notification() 同一套规则。 */
+export function canSeeNotification(notification, userId, rank) {
+  if (!notification) return false
+  // 不借用下面的 isStr：那个 const 定义在本文件后面，靠的是「调用发生在模块求值之后」这个时序。
+  // 在一个决定谁能看到什么的判定里，不值得依赖这种顺序——尤其是 recipient_id 为空时两边都是
+  // undefined，一个 == 就会让所有匿名比较都通过。
+  if (notification.scope === 'user') {
+    return typeof notification.recipient_id === 'string' && notification.recipient_id.length > 0
+      && typeof userId === 'string' && notification.recipient_id === userId
+  }
+  return broadcastScopesFor(rank).includes(notification.scope)
+}
+
 export const SCOPE_LABEL = { user: '指定用户', admin: '全体管理员', cs: '全体客服', all: '所有人' }
 
 /**
