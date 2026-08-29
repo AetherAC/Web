@@ -1,11 +1,16 @@
-// Stripe and PayPal cannot ride the generic public_config path in checkout.mjs: Stripe's REST API
-// only accepts application/x-www-form-urlencoded bodies (the generic path posts JSON), and PayPal
-// needs an OAuth2 token exchange before it will create an order, which a single fetch cannot do.
+// Stripe, PayPal and PayerURL cannot ride the generic public_config path in checkout.mjs: Stripe's
+// REST API only accepts application/x-www-form-urlencoded bodies (the generic path posts JSON),
+// PayPal needs an OAuth2 token exchange before it will create an order, and PayerURL needs an HMAC
+// taken over the request body it is attached to. None of the three is one configurable JSON POST.
 //
-// Their callbacks are verified by re-reading the authoritative state from the provider rather than
-// by HMAC. Vercel parses the request body before the handler runs, so a re-serialized body can
-// never match a signature taken over the original bytes. A forged callback therefore costs one
-// extra API read and cannot mark an unpaid order as paid — the provider's own answer decides.
+// Stripe's and PayPal's callbacks are verified by re-reading the authoritative state from the
+// provider rather than by HMAC. Vercel parses the request body before the handler runs, so a
+// re-serialized body can never match a signature taken over the original bytes. A forged callback
+// therefore costs one extra API read and cannot mark an unpaid order as paid — the provider's own
+// answer decides. PayerURL is the exception that can still be checked by signature, because it signs
+// a canonical sorted form of the parameters instead of the raw bytes; see payerurlQuery below.
+
+import crypto from 'node:crypto'
 
 const env = (name) => {
   const value = process.env[name]
@@ -174,5 +179,160 @@ const paypal = {
   }
 }
 
-export const DRIVERS = { stripe, paypal }
+// PayerURL's own Node SDK is the reference for everything below. It is published on npm under
+// `binance-crypto-instant-payout-nodejs` (its README calls itself `@payerurl/crypto-checkout`, a name
+// that is not actually on the registry), and this reimplements it rather than depending on it: that
+// package declares ~40 build tools — esbuild, rollup, sucrase, chokidar — as *runtime* dependencies,
+// all of which would be pulled into the function bundle. tests/api-smoke.mjs pins the exact query
+// strings and digests the SDK produces, so drifting from it fails the build instead of a payment.
+//
+// Nothing about the callback is configured in the PayerURL dashboard — there is no setting for it.
+// `notify_url` travels with each order, and the merchant's secret key is the HMAC key in both
+// directions, which is why PayerURL never issues a separate webhook secret.
+
+// The SDK's encoder: encodeURIComponent with %20 folded back to +. Deliberately *not* PHP's
+// urlencode(), which also escapes ! ' ( ) * ~ — matching the SDK is what matches the server that
+// recomputes these digests.
+const payerurlEncode = (text) => encodeURIComponent(String(text)).replace(/%20/g, '+')
+
+// Only the top level is sorted; nested items keep their own order, and null/undefined are dropped.
+export function payerurlQuery(args) {
+  const pairs = []
+  const walk = (value, prefix) => {
+    if (value === undefined || value === null) return
+    if (Array.isArray(value)) return value.forEach((item, index) => walk(item, `${prefix}[${index}]`))
+    if (typeof value === 'object') return Object.entries(value).forEach(([key, item]) => walk(item, `${prefix}[${key}]`))
+    pairs.push(`${payerurlEncode(prefix)}=${payerurlEncode(value)}`)
+  }
+  for (const key of Object.keys(args || {}).sort()) walk(args[key], key)
+  return pairs.join('&')
+}
+
+export const payerurlSign = (args, secretKey) =>
+  crypto.createHmac('sha256', secretKey).update(payerurlQuery(args)).digest('hex')
+
+export const payerurlAuth = (args, publicKey, secretKey) =>
+  Buffer.from(`${publicKey}:${payerurlSign(args, secretKey)}`).toString('base64')
+
+const sameDigest = (a, b) => {
+  const x = Buffer.from(String(a || ''), 'utf8')
+  const y = Buffer.from(String(b || ''), 'utf8')
+  return x.length === y.length && crypto.timingSafeEqual(x, y)
+}
+
+const payerurlKeys = (config) => ({
+  publicKey: env(config.public_key_env || 'PAYERURL_PUBLIC_KEY'),
+  secretKey: env(config.secret_key_env || 'PAYERURL_SECRET_KEY')
+})
+
+// PayerURL insists on a billing identity; Supabase only guarantees an email, so a name is derived.
+const payerurlBuyer = (user) => {
+  const email = user?.email || ''
+  const full = String(user?.user_metadata?.full_name || user?.user_metadata?.name || '').trim()
+  const parts = full ? full.split(/\s+/) : [email.split('@')[0] || 'buyer']
+  return { billing_fname: parts[0], billing_lname: parts.slice(1).join(' ') || parts[0], billing_email: email }
+}
+
+export const PAYERURL_BASE = 'https://api-v2.payerurl.com'
+
+// The SDK's own argument order, and its two different money formats: `amount` is the smallest unit
+// (its README says so, and its example pairs `amount: 1000` with `price: '10.00'`), while an item's
+// price is a decimal string. Sending a decimal `amount` would have charged 19.99 cents for a
+// 19.99 USD artifact.
+export const payerurlPaymentArgs = ({ order, artifact, siteUrl, user, config = {} }) => ({
+  order_id: order.id,
+  amount: order.amount_minor,
+  currency: String(order.currency).toLowerCase(),
+  // The SDK rewrites spaces in an item name to underscores, so PayerURL evidently rejects them.
+  items: [{
+    name: String(artifact?.name || order.sku).replace(/ /g, '_'),
+    qty: order.quantity || 1,
+    price: (order.amount_minor / (order.quantity || 1) / 100).toFixed(2)
+  }],
+  ...payerurlBuyer(user),
+  redirect_to: `${siteUrl}/order/${order.id}?paid=1`,
+  notify_url: `${siteUrl}/v1/callback/payerurl`,
+  cancel_url: `${siteUrl}/order/${order.id}`,
+  // The SDK sends `nodejs`; kept configurable because it reads like a platform selector.
+  type: config.type || 'nodejs'
+})
+
+// The callback signature covers exactly these ten fields, not the whole body — so a field outside the
+// list (or one PayerURL adds later) must not be fed to the digest, or every callback would fail.
+export const PAYERURL_SIGNED_FIELDS = [
+  'order_id', 'ext_transaction_id', 'transaction_id', 'status_code', 'note',
+  'confirm_rcv_amnt', 'confirm_rcv_amnt_curr', 'coin_rcv_amnt', 'coin_rcv_amnt_curr', 'txn_time'
+]
+
+export const payerurlSignedFields = (body) =>
+  Object.fromEntries(PAYERURL_SIGNED_FIELDS.filter((key) => body?.[key] !== undefined).map((key) => [key, body[key]]))
+
+const payerurl = {
+  async create(args) {
+    const config = args.config || {}
+    const { publicKey, secretKey } = payerurlKeys(config)
+    const body = payerurlPaymentArgs(args)
+    const created = await json(`${config.api_base || PAYERURL_BASE}/api/payment`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${payerurlAuth(body, publicKey, secretKey)}`,
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
+      },
+      // The signed string and the posted body must be byte-identical, so both come from payerurlQuery.
+      body: payerurlQuery(body)
+    })
+    // The SDK treats only `redirectTO` as success; anything else is a failure however cheerful it looks.
+    const checkoutUrl = created.redirectTO || null
+    if (!checkoutUrl) throw new Error(created.message || 'PayerURL returned no redirect URL')
+    return { checkoutUrl, providerOrderId: created.transaction_id || created.id || null }
+  },
+  // `authStr` is the documented fallback transport for the very token being checked, so it is never
+  // part of what was signed. The signature is checked before the status is read: status_code is one of
+  // the signed fields, so trusting it first would be trusting an unauthenticated number.
+  async verify({ payload, headers, config }) {
+    const { publicKey, secretKey } = payerurlKeys(config || {})
+    const body = payload || {}
+    const presented = String(headers?.authorization || '').replace(/^Bearer\s+/i, '').trim() || String(body.authStr || '').trim()
+    // 2030 / 2050 / 20000 are PayerURL's own codes for these three cases, echoed back so its dashboard
+    // reads the same reason we did.
+    if (!presented) return { reject: { status: 401, error: 'Authorization not found', response: { status: 2030 } } }
+    const decoded = Buffer.from(presented, 'base64').toString('utf8')
+    const colon = decoded.indexOf(':')
+    const claimedKey = colon === -1 ? '' : decoded.slice(0, colon)
+    const signature = colon === -1 ? '' : decoded.slice(colon + 1)
+    if (claimedKey !== publicKey)
+      return { reject: { status: 401, error: "Public key doesn't match", response: { status: 2030 } } }
+    if (!sameDigest(signature, payerurlSign(payerurlSignedFields(body), secretKey)))
+      return { reject: { status: 401, error: 'Signature not matched', response: { status: 2030 } } }
+    const orderId = body.order_id ? String(body.order_id) : null
+    const transactionId = body.transaction_id ? String(body.transaction_id) : null
+    if (!transactionId) return { reject: { status: 400, error: 'Transaction ID not found', response: { status: 2050 } } }
+    if (!orderId) return { reject: { status: 400, error: 'Order ID not found', response: { status: 2050 } } }
+    const statusCode = Number(body.status_code)
+    // Only 200 releases the goods. The SDK calls everything else an error, but a crypto payment waiting
+    // on blockchain confirmation is not a failure — it stays `pending` so a later callback can settle it.
+    const paid = statusCode === 200
+    const cancelled = statusCode === 20000
+    const received = Number(body.confirm_rcv_amnt)
+    return {
+      orderId,
+      paid,
+      failed: cancelled,
+      providerOrderId: transactionId,
+      // PayerURL settles in crypto and reports what actually arrived, so an underpayment must not
+      // release the order: the handler compares this against the order row before writing `paid`.
+      // Read as a decimal — if PayerURL ever sends the minor unit instead this over-counts by 100x,
+      // which can only ever accept a full payment, never reject one.
+      //
+      // No currency is reported: the only currency in the signed set is `confirm_rcv_amnt_curr`, and
+      // whether that carries the invoice's fiat code or the coin's ticker is not documented anywhere.
+      // Guessing wrong would 409 a real payment, and the amount alone already blocks underpayment.
+      expect: Number.isFinite(received) && received > 0 ? { amountMinor: Math.round(received * 100), currency: null } : null,
+      payload: body,
+      response: { status: paid ? 2040 : cancelled ? 20000 : 2050 }
+    }
+  }
+}
+
+export const DRIVERS = { stripe, paypal, payerurl }
 export const driverFor = (config) => DRIVERS[String(config?.driver || '').toLowerCase()] || null

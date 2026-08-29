@@ -5,6 +5,11 @@ import {
   approvalLink,
   decimalAmount,
   driverFor,
+  payerurlAuth,
+  payerurlPaymentArgs,
+  payerurlQuery,
+  payerurlSign,
+  payerurlSignedFields,
   paypalOrderBody,
   stripeSessionForm
 } from '../api/_lib/payments.mjs'
@@ -165,7 +170,7 @@ for (const table of Object.keys(SCHEMA)) {
 
 console.log('Record form conversions: OK')
 
-// The two built-in drivers post shapes the generic create_url path cannot express, so the request
+// The three built-in drivers post shapes the generic create_url path cannot express, so the request
 // bodies are asserted directly: a wrong key name here is a payment that silently never happens.
 const order = {
   id: 'a1b2c3d4-0000-4000-8000-000000000001',
@@ -203,8 +208,93 @@ assert(approvalLink([{ rel: 'self', href: 'a' }, { rel: 'payer-action', href: 'b
 assert(approvalLink([{ rel: 'approve', href: 'c' }]) === 'c', 'older PayPal responses name that link approve')
 assert(approvalLink([{ rel: 'self', href: 'a' }]) === null && approvalLink(undefined) === null, 'a missing approval link must be detectable, not returned as undefined')
 
+// PayerURL signs a canonical copy of the parameters rather than the bytes on the wire. Every string
+// below was produced by running the official SDK's own buildQueryString over the same input
+// (binance-crypto-instant-payout-nodejs@1.0.0, dist/index.js) and pasting what it returned. They are
+// pinned rather than derived so that drifting from the SDK fails the build instead of a live payment.
+assert(payerurlQuery({ b: '1', a: '2' }) === 'a=2&b=1', 'only the top-level keys are sorted before signing')
+assert(payerurlQuery({ items: [{ name: 'x', qty: 1 }] }) === 'items%5B0%5D%5Bname%5D=x&items%5B0%5D%5Bqty%5D=1', 'nested items become bracketed keys and keep their own order')
+assert(payerurlQuery({ a: 'x y' }) === 'a=x+y', 'a space is folded to + rather than left as %20')
+assert(payerurlQuery({ a: "~!*'()" }) === "a=~!*'()", 'encodeURIComponent leaves these alone — escaping them like PHP urlencode() would break the digest')
+assert(payerurlQuery({ a: '1', b: null, c: undefined }) === 'a=1', 'null and undefined are dropped instead of sent empty')
+assert(payerurlQuery({ a: '入门版' }) === 'a=%E5%85%A5%E9%97%A8%E7%89%88', 'a non-ASCII value is UTF-8 percent-encoded')
+
+const payerurlArgs = payerurlPaymentArgs({ order, artifact: { name: '入门版 Starter' }, siteUrl: site, user: { email: 'buyer@example.com' } })
+assert(payerurlArgs.order_id === order.id, 'the callback maps back to our order through order_id')
+assert(payerurlArgs.amount === 1999, "amount is the smallest unit — a decimal here would charge 19.99 cents for a 19.99 USD artifact")
+assert(payerurlArgs.currency === 'usd', 'PayerURL lower-cases the currency')
+assert(payerurlArgs.items[0].price === '19.99', "an item's price is a decimal string even though the order amount is not")
+assert(payerurlArgs.items[0].name === '入门版_Starter', 'a space in an item name becomes an underscore')
+assert(payerurlArgs.type === 'nodejs', 'the SDK identifies itself as nodejs')
+// The whole request, byte for byte as the SDK builds it.
+assert(
+  payerurlQuery(payerurlArgs) === 'amount=1999&billing_email=buyer%40example.com&billing_fname=buyer&billing_lname=buyer'
+    + '&cancel_url=https%3A%2F%2Faetherac.abnt.it%2Forder%2Fa1b2c3d4-0000-4000-8000-000000000001&currency=usd'
+    + '&items%5B0%5D%5Bname%5D=%E5%85%A5%E9%97%A8%E7%89%88_Starter&items%5B0%5D%5Bqty%5D=1&items%5B0%5D%5Bprice%5D=19.99'
+    + '&notify_url=https%3A%2F%2Faetherac.abnt.it%2Fv1%2Fcallback%2Fpayerurl&order_id=a1b2c3d4-0000-4000-8000-000000000001'
+    + '&redirect_to=https%3A%2F%2Faetherac.abnt.it%2Forder%2Fa1b2c3d4-0000-4000-8000-000000000001%3Fpaid%3D1&type=nodejs',
+  'the signed payment request must match the SDK byte for byte'
+)
+assert(payerurlArgs.notify_url === `${site}/v1/callback/payerurl`, 'the callback must reach our own endpoint')
+assert(payerurlArgs.billing_email === 'buyer@example.com' && payerurlArgs.billing_fname && payerurlArgs.billing_lname, 'PayerURL refuses an order without a complete billing identity')
+
+process.env.PAYERURL_PUBLIC_KEY = 'pk_smoke_public'
+process.env.PAYERURL_SECRET_KEY = 'sk_smoke_secret'
+// A callback is signed over the ten-field whitelist only, so the test signs the same way the merchant
+// server does rather than over the whole body.
+const sign = (data) => payerurlAuth(payerurlSignedFields(data), process.env.PAYERURL_PUBLIC_KEY, process.env.PAYERURL_SECRET_KEY)
+const callback = {
+  order_id: order.id,
+  transaction_id: 'tx_smoke_1',
+  status_code: '200',
+  note: 'ok note',
+  confirm_rcv_amnt: '19.99',
+  confirm_rcv_amnt_curr: 'USD',
+  coin_rcv_amnt: '19.99',
+  coin_rcv_amnt_curr: 'USDT',
+  txn_time: '2026-08-29 10:00:00',
+  // Not in the whitelist: present to prove it is excluded from the digest.
+  status: 'paid'
+}
+const signed = sign(callback)
+
+// Pinned from the SDK's own signPayload over the same whitelist with the same key.
+assert(
+  payerurlSign(payerurlSignedFields(callback), 'sk_smoke_secret') === '20357731ad2f22022486f0a66d6ba9dbd774ec87b305601a90a64fbbe3e11a3a',
+  'the callback digest must match the one the SDK computes'
+)
+
+const viaBody = await DRIVERS.payerurl.verify({ payload: { ...callback, authStr: signed }, headers: {}, config: {} })
+assert(viaBody.paid === true && viaBody.orderId === order.id, 'a correctly signed callback in the authStr field must be accepted')
+assert(viaBody.expect.amountMinor === 1999, 'the received amount is compared against the order in minor units')
+assert(viaBody.expect.currency === null, 'no currency is claimed: confirm_rcv_amnt_curr may be a coin ticker, and guessing would 409 a real payment')
+assert(viaBody.response.status === 2040, "a settled callback is answered with PayerURL's own success code")
+const viaHeader = await DRIVERS.payerurl.verify({ payload: callback, headers: { authorization: `Bearer ${signed}` }, config: {} })
+assert(viaHeader.paid === true, 'the same token in the Authorization header must verify identically')
+// authStr transports the token being checked, so it cannot be part of what was signed.
+assert((await DRIVERS.payerurl.verify({ payload: { ...callback, authStr: signed }, headers: { authorization: `Bearer ${signed}` }, config: {} })).paid === true, 'the token must verify whether it arrives in the header, the body, or both')
+const unlisted = await DRIVERS.payerurl.verify({ payload: { ...callback, status: 'anything', extra_field: 'added later', authStr: signed }, headers: {}, config: {} })
+assert(unlisted.paid === true, 'a field outside the ten signed ones must not enter the digest, or a new PayerURL field would break every callback')
+const tampered = await DRIVERS.payerurl.verify({ payload: { ...callback, confirm_rcv_amnt: '0.01', authStr: signed }, headers: {}, config: {} })
+assert(tampered.reject?.status === 401 && tampered.reject.response.status === 2030, 'editing any signed field must fail the digest, not lower the price')
+const unsigned = await DRIVERS.payerurl.verify({ payload: callback, headers: {}, config: {} })
+assert(unsigned.reject?.status === 401 && unsigned.reject.response.status === 2030, 'a callback carrying no token at all must be refused')
+const foreignKey = await DRIVERS.payerurl.verify({ payload: { ...callback, authStr: payerurlAuth(payerurlSignedFields(callback), 'pk_someone_else', 'sk_smoke_secret') }, headers: {}, config: {} })
+assert(foreignKey.reject?.status === 401, "another merchant's public key must be refused even when the digest itself is well formed")
+// status_code is one of the signed fields, so it can only be read after the signature has been checked.
+const settling = { ...callback, status_code: '100' }
+const unsettled = await DRIVERS.payerurl.verify({ payload: { ...settling, authStr: sign(settling) }, headers: {}, config: {} })
+assert(unsettled.paid === false && unsettled.failed === false, 'a crypto payment still confirming must stay pending, not be guessed as failed')
+assert(unsettled.response.status === 2050, 'an unsettled callback is answered with 2050, the code the SDK uses for "Order not complete"')
+const cancelled = { ...callback, status_code: '20000' }
+const abandoned = await DRIVERS.payerurl.verify({ payload: { ...cancelled, authStr: sign(cancelled) }, headers: {}, config: {} })
+assert(abandoned.failed === true && abandoned.paid === false && abandoned.response.status === 20000, 'a cancelled order must be marked failed rather than left pending forever')
+const noTxn = { ...callback, transaction_id: '' }
+const missingTxn = await DRIVERS.payerurl.verify({ payload: { ...noTxn, authStr: sign(noTxn) }, headers: {}, config: {} })
+assert(missingTxn.reject?.response.status === 2050, 'a callback without a transaction id cannot be reconciled and must be refused')
+
 assert(driverFor({ driver: 'stripe' }) === DRIVERS.stripe && driverFor({ driver: 'PayPal' }) === DRIVERS.paypal, 'the driver name in public_config must resolve case-insensitively')
-assert(driverFor({}) === null && driverFor(null) === null && driverFor({ driver: 'alipay' }) === null, 'the other nine providers must keep using the generic create_url path')
+assert(driverFor({}) === null && driverFor(null) === null && driverFor({ driver: 'alipay' }) === null, 'the remaining eight providers must keep using the generic create_url path')
 for (const [name, driver] of Object.entries(DRIVERS)) {
   assert(typeof driver.create === 'function' && typeof driver.verify === 'function', `${name} driver must be able to create a checkout and verify a callback`)
 }

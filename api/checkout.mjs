@@ -41,10 +41,11 @@ export default async function handler(req, res) {
       .replaceAll('{callback_url}', encodeURIComponent(vars.callback_url)) : null
     let resolvedUrl = checkoutUrl
     let providerOrderId = null
-    // A driver (Stripe, PayPal) needs more than one configurable request, so it takes precedence.
+    // A driver (Stripe, PayPal, PayerURL) needs more than one configurable request, so it takes
+    // precedence. `user` is passed because PayerURL refuses an order without a billing identity.
     const driver = driverFor(config)
     if (driver) {
-      const created = await driver.create({ order, artifact, siteUrl, config })
+      const created = await driver.create({ order, artifact, siteUrl, config, user: auth.user })
       resolvedUrl = created.checkoutUrl
       providerOrderId = created.providerOrderId
     } else if (!resolvedUrl && config.create_url) {

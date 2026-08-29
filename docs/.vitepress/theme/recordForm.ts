@@ -44,7 +44,7 @@ export const SCHEMA:Record<string,Field[]>={
     {key:'sort_order',label:'排序权重',type:'number',hint:'数字小的排在结账页前面'},
     {key:'enabled',label:'启用该支付平台',type:'boolean',hint:'取消勾选后结账页不再显示这个支付方式，回调地址仍然保留'},
     {key:'secret_env_names',label:'需要的密钥变量名',type:'tags',wide:true,hint:'逗号分隔的变量名，例如 ALIPAY_APP_ID, ALIPAY_PRIVATE_KEY；这里只登记名字，真实值到“环境变量”页填写，不会存进数据库'},
-    {key:'public_config',label:'公开配置',type:'json',rows:8,wide:true,hint:'可以公开的参数（jsonb）。"driver":"stripe" 或 "paypal" 会改用站内内置的对接代码，其余键都被忽略；PayPal 另有 "environment":"sandbox"|"live"。不填 driver 时走通用模式：checkout_url_template 支持变量 {order_id} {sku} {amount_minor} {currency} {callback_url}'},
+    {key:'public_config',label:'公开配置',type:'json',rows:8,wide:true,hint:'可以公开的参数（jsonb）。"driver":"stripe" / "paypal" / "payerurl" 会改用站内内置的对接代码，其余键都被忽略；PayPal 另有 "environment":"sandbox"|"live"。不填 driver 时走通用模式：checkout_url_template 支持变量 {order_id} {sku} {amount_minor} {currency} {callback_url}'},
     {key:'instructions',label:'接入说明',type:'textarea',rows:6,wide:true,hint:'只给后台看的操作步骤备注，访客看不到'}
   ],
   site_settings:[

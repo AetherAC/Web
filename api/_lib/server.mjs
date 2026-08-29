@@ -29,5 +29,9 @@ export async function bodyOf(req) {
   const chunks = []
   for await (const chunk of req) chunks.push(chunk)
   const raw = Buffer.concat(chunks).toString('utf8')
-  return raw ? JSON.parse(raw) : {}
+  if (!raw) return {}
+  // PayerURL posts its callback form-encoded. Left to JSON.parse that would throw and answer 500,
+  // which the provider would read as an outage and keep retrying.
+  const form = /application\/x-www-form-urlencoded/i.test(String(req.headers?.['content-type'] || ''))
+  return form ? Object.fromEntries(new URLSearchParams(raw)) : JSON.parse(raw)
 }
