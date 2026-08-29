@@ -28,6 +28,9 @@ import cancelHandler, { cancelPendingOrder } from '../api/cancel-order.mjs'
 import { orderPath } from '../docs/.vitepress/theme/routes.ts'
 import telemetryHandler from '../api/telemetry.mjs'
 import {
+  exportOrders, listOrders, maskEmail, orderDetail, toCsv, updateOrderStatus
+} from '../api/admin-orders.mjs'
+import {
   LICENSE_STATUS,
   RUNNING_WINDOW_MS,
   mergeSample,
@@ -1236,6 +1239,13 @@ const recorder = (results = {}) => {
       in(col, vals) { (entry.in ??= {})[col] = vals; return link },
       lt(col, val) { (entry.lt ??= {})[col] = val; return link },
       not(col, op, val) { (entry.not ??= []).push({ col, op, val }); return link },
+      // §12.3 的两段时间筛选：四个边界各自独立，测试要能分别看到订单管理接口把哪个列夹在了
+      // 哪两个值之间。记成 map 而不是数组，因为同一列不会有两个同向边界。
+      gte(col, val) { (entry.gte ??= {})[col] = val; return link },
+      lte(col, val) { (entry.lte ??= {})[col] = val; return link },
+      // range 是分页的落点。offset 算错在界面上表现为「第二页少一条」，是那种要有人数一遍才会
+      // 发现的错，所以两个端点都记下来。
+      range(from, to) { entry.range = { from, to }; return link },
       // 求值放在这里而不是上面：函数式给法要读 entry.filters，而那是 .eq() 之后才填好的。
       single: async () => resolveResult(),
       maybeSingle: async () => resolveResult(),
@@ -1247,7 +1257,9 @@ const recorder = (results = {}) => {
       // upsert 的第二个参数要记下来：收件箱靠 onConflict 走主键冲突更新，漏掉它会变成重复插入
       // 然后撞主键，而那是只有在「第二次读同一条通知」时才出现的错。
       upsert(payload, opts) { entry.op = 'upsert'; entry.payload = payload; entry.upsertOpts = opts; return link },
-      select(cols) { entry.op = 'select'; entry.selected = cols; return link }
+      // 第二个参数要记：订单列表靠 { count: 'exact' } 拿总数，漏掉它 total 会退化成「本页条数」，
+      // 于是分页控件只画出一页，而后面还有几千条订单。
+      select(cols, opts) { entry.op = 'select'; entry.selected = cols; entry.selectOpts = opts; return link }
     }
   }
   return rec
@@ -2315,3 +2327,234 @@ assert(inboxSet.body.notify_browser === true && inboxSet.body.notify_email === f
   '两个开关是独立的，可以同时开')
 
 console.log('Notification inbox: OK')
+
+// --- api/admin-orders.mjs (§12) ---------------------------------------------------------------------
+// 这个接口的门槛是 rank ≥ 111，比其他所有订单接口都低（§12.2 确认过是有意的）。于是「返回了什么列」
+// 变成一个安全问题而不只是功能问题：脱敏是这里唯一的保护，RLS 表达不了「这一列要打码」。
+
+// 邮箱脱敏：首尾留字符、域名不遮。留中间几位等于没打，全打成星号则客服没法在电话里核对身份。
+assert(maskEmail('zhangsan@example.com') === 'z******n@example.com', '中间遮掉，首尾和域名留着')
+assert(maskEmail('ab@x.io') === 'a*@x.io', '两个字符的用户名也要遮掉一个')
+assert(maskEmail('') === '', '空值不要变成一串星号')
+assert(maskEmail('nobody-at-all') === 'n******l', '没有 @ 的字符串按普通文本遮')
+assert(!maskEmail('zhangsan@example.com').includes('zhangsan'), '脱敏后不能还能读出原用户名')
+
+// CSV：Excel 会把 = + - @ 开头的单元格当公式执行，而 sku_name / display_name 都是别处写入的可控字段。
+{
+  const csv = toCsv([{ a: '=cmd|calc', b: '含"引号"', c: '逗号,在里面' }], [
+    { title: '列A', pick: r => r.a }, { title: '列B', pick: r => r.b }, { title: '列C', pick: r => r.c }
+  ])
+  assert(csv.startsWith('﻿'), '要有 BOM，否则 Excel 用本地代码页读 UTF-8，中文全是乱码')
+  assert(csv.includes('"\'=cmd|calc"'), '以 = 开头的值要前置单引号，否则 Excel 当公式执行')
+  assert(csv.includes('"含""引号"""'), '内部引号翻倍')
+  assert(csv.includes('"逗号,在里面"'), '带逗号的值靠引号包住，不能把一格拆成两格')
+  assert(csv.includes('\r\n'), 'CRLF 换行——Excel 对 LF-only 的 CSV 有时把整表读成一行')
+}
+
+const ORDER_AT = '2026-08-20T09:00:00Z'
+const ORDER_ROW = {
+  id: '11111111-2222-3333-4444-555555555555', user_id: BUYER, sku: 'aetherac-pro', sku_name: 'AetherAC 专业版',
+  quantity: 1, status: 'paid', provider: 'payerurl', provider_order_id: 'PU-9', payment_reference: 'PAY-77',
+  amount_minor: 9500, list_amount_minor: 12000, discount_minor: 2500, paid_amount_minor: 9500,
+  currency: 'USD', paid_currency: 'USD', coupon_code: 'WELCOME', created_at: ORDER_AT, paid_at: ORDER_AT, updated_at: ORDER_AT
+}
+const ordersDb = (opts = {}) => recorder({
+  orders: opts.orders ?? { data: [ORDER_ROW], error: null, count: 137 },
+  payment_providers: { data: [{ id: 'payerurl' }, { id: 'stripe' }], error: null },
+  user_profiles: { data: [{ user_id: BUYER, email: 'zhangsan@example.com', display_name: '张三' }], error: null },
+  order_status_log: { data: opts.logs ?? [], error: null },
+  refund_requests: { data: opts.refunds ?? [], error: null },
+  artifacts: { data: null, error: null },
+  site_settings: settings(opts.config ?? {})
+})
+
+// 列表：筛选、分页、总数。
+{
+  const db = ordersDb()
+  const out = await listOrders(db, {
+    status: 'paid', provider: 'payerurl', created_from: '2026-08-01', created_to: '2026-08-31',
+    paid_from: '2026-08-05', limit: '25', offset: '50'
+  }, { pageSize: 20 })
+  assert(out.status === 200, '合法筛选要通过')
+  const q = db.calls.find(c => c.table === 'orders')
+  assert(q.selectOpts?.count === 'exact', "总数靠 { count: 'exact' }，漏掉它分页控件只会画出一页")
+  assert(q.filters.status === 'paid' && q.filters.provider === 'payerurl', '状态和渠道各自成为等值条件')
+  assert(q.gte.created_at.startsWith('2026-08-01') && q.lte.created_at.startsWith('2026-08-31'),
+    '下单时间两端都夹上')
+  assert(q.gte.paid_at.startsWith('2026-08-05') && !(q.lte && 'paid_at' in q.lte),
+    '只填了支付时间的下界，就只加下界——另一端不该被补成 now')
+  assert(q.range.from === 50 && q.range.to === 74, 'offset 50 取 25 条是 [50,74]，不是 [50,75]')
+  assert(out.body.total === 137, '总数来自 count，不是本页条数')
+  assert(!q.selected.includes('provider_payload'),
+    '列表不查回调原文：那里面有渠道塞进来的买家邮箱和 IP，而这个接口 rank 111 就能调')
+}
+
+// 分页上限：前端传一个大数不能变成整表导出。
+{
+  const db = ordersDb()
+  const out = await listOrders(db, { limit: '99999' }, { pageSize: 20, cap: 200 })
+  assert(out.body.limit === 200, 'limit 被 cap 夹住')
+  assert(db.calls[0].range.to === 199, 'range 跟着 cap，而不是跟着请求里的数字')
+  const dflt = ordersDb()
+  await listOrders(dflt, {}, { pageSize: 20 })
+  assert(dflt.calls[0].range.to === 19, '不传 limit 时用 §14 的 order_list_page_size')
+}
+
+// §12.3 精确搜索：三个搜索项，形状不对就在查库之前拒掉。
+{
+  const byOrder = ordersDb()
+  await listOrders(byOrder, { search: ORDER_ROW.id, search_field: 'order_no' }, { pageSize: 20 })
+  assert(byOrder.calls[0].filters.id === ORDER_ROW.id, '订单号搜的是 id 等值')
+
+  const byPay = ordersDb()
+  await listOrders(byPay, { search: 'PAY-77', search_field: 'payment_id' }, { pageSize: 20 })
+  assert(byPay.calls[0].or === 'payment_reference.eq.PAY-77,provider_order_id.eq.PAY-77',
+    '支付 ID 要同时查两列：老订单的流水号在 provider_order_id 里，只查一列就永远搜不到')
+
+  // 模糊搜索会让任何组织成员用一个字母把全表捞出来，那是枚举。所以 like 一律不许出现。
+  const shapes = [
+    ['order_no', 'not-a-uuid'], ['user_id', '1'], ['payment_id', 'PAY,scope.eq.admin'],
+    ['payment_id', 'x) or (true'], ['payment_id', 'a'.repeat(129)], ['nope', ORDER_ROW.id]
+  ]
+  for (const [field, value] of shapes) {
+    const db = ordersDb()
+    const bad = await listOrders(db, { search: value, search_field: field }, { pageSize: 20 })
+    assert(bad.status === 400, `${field}=${String(value).slice(0, 20)} 要被拒`)
+    assert(db.calls.length === 0, '拒掉的搜索不该已经查过库——拼进 or 的东西必须先确认形状')
+  }
+}
+
+// 状态和渠道也要按名单校验：渠道 id 是 text 主键，形状不受控。
+{
+  const badStatus = await listOrders(ordersDb(), { status: 'refunded_maybe' }, { pageSize: 20 })
+  assert(badStatus.status === 400, '未知状态被拒')
+  const badProvider = await listOrders(ordersDb(), { provider: 'wechat' }, { pageSize: 20 })
+  assert(badProvider.status === 400 && badProvider.body.error.includes('wechat'), '未知渠道被拒且指名')
+}
+
+// 详情（§12.5）：商品快照、变更记录、下一步。
+{
+  const db = ordersDb({
+    orders: { data: ORDER_ROW, error: null },
+    logs: [{ id: 1, from_status: 'pending', to_status: 'paid', source: 'callback', note: '', created_at: ORDER_AT }],
+    refunds: [{ id: 'r1', status: 'pending', amount_minor: 9500, currency: 'USD' }]
+  })
+  const out = await orderDetail(db, ORDER_ROW.id, { canModify: true })
+  assert(out.status === 200, '详情要能读出来')
+  assert(out.body.order.user_email === 'z******n@example.com', '详情里的联系方式同样脱敏')
+  assert(out.body.order.user_email !== 'zhangsan@example.com', '不能因为是管理员就返回原文')
+  assert(out.body.line.name === 'AetherAC 专业版', '商品名取订单上的快照')
+  assert(out.body.line.coupon_code === 'WELCOME', '§5：用了券就显示券码')
+  assert(out.body.logs.length === 1 && out.body.refunds.length === 1, '变更记录和退款记录都带上')
+  assert(out.body.open_refund?.id === 'r1', 'pending 的申请算在途——操作区要据此把退款按钮画灰')
+  const next = out.body.next_statuses
+  assert(next.length === 1 && next[0].status === 'refund_pending', 'paid 的下一步只有一个')
+  assert(next[0].via_refund === true, '这一步得走退款流程，前端要据此不画成普通状态按钮')
+
+  const missing = await orderDetail(ordersDb({ orders: { data: null, error: null } }), ORDER_ROW.id, { canModify: true })
+  assert(missing.status === 404, '不存在的订单是 404')
+  const malformed = await orderDetail(ordersDb(), 'not-a-uuid', { canModify: true })
+  assert(malformed.status === 400, '格式不对在查库前拒掉')
+}
+
+// 商品快照为空时（早于快照列的历史订单）才回落到 artifacts。
+{
+  const legacy = { ...ORDER_ROW, sku_name: '', sku_description: '' }
+  const db = recorder({
+    orders: { data: legacy, error: null },
+    user_profiles: { data: [], error: null },
+    order_status_log: { data: [], error: null },
+    refund_requests: { data: [], error: null },
+    artifacts: { data: { name: '旧商品名', description: '旧描述' }, error: null }
+  })
+  const out = await orderDetail(db, ORDER_ROW.id, { canModify: false })
+  assert(out.body.line.name === '旧商品名', '空快照回落到 artifacts')
+  assert(out.body.can_modify === false, 'can_modify 如实传下去，前端据此画灰按钮而不是隐藏按钮')
+
+  // 有快照时不许去查 artifacts：商品改名后回头看这笔订单必须还是当时那份。
+  const fresh = ordersDb({ orders: { data: ORDER_ROW, error: null } })
+  await orderDetail(fresh, ORDER_ROW.id, { canModify: true })
+  assert(!fresh.tables.includes('artifacts'), '有快照就不查商品表，否则订单记录会跟着商品定义一起变')
+}
+
+// §12.5 状态变更：必填说明、非法迁移被拒、并发保护。
+{
+  const okDb = ordersDb({ orders: [{ data: { id: ORDER_ROW.id, status: 'pending' }, error: null }, { data: [{ id: ORDER_ROW.id, status: 'cancelled' }], error: null }] })
+  const done = await updateOrderStatus(okDb, { userId: ADMIN1, group: 'admin' }, {
+    order_id: ORDER_ROW.id, status: 'cancelled', note: '渠道超时，买家已确认放弃'
+  })
+  assert(done.status === 200 && done.body.from === 'pending', '合法迁移通过并回报原状态')
+  const upd = okDb.calls.find(c => c.table === 'orders' && c.op === 'update')
+  assert(upd.filters.status === 'pending',
+    "update 上要带 .eq('status', 原状态)——支付回调也在改这张表，不是只有两个人同时点才会撞")
+  const logged = okDb.calls.find(c => c.table === 'order_status_log')
+  assert(logged?.payload.source === 'admin' && logged.payload.note.includes('渠道超时'),
+    '§12.4：来源记成 admin，说明原样入库')
+  assert(logged.payload.actor_group === 'admin', '记下操作人所在的组，否则事后分不清是谁改的')
+
+  const noNote = await updateOrderStatus(ordersDb(), { userId: ADMIN1, group: 'admin' }, { order_id: ORDER_ROW.id, status: 'cancelled' })
+  assert(noNote.status === 400 && noNote.body.error.includes('变更说明'), '§12.5：说明必填')
+
+  const illegal = await updateOrderStatus(
+    ordersDb({ orders: { data: { id: ORDER_ROW.id, status: 'refunded' }, error: null } }),
+    { userId: ADMIN1, group: 'admin' }, { order_id: ORDER_ROW.id, status: 'paid', note: '改回来' })
+  assert(illegal.status === 409 && illegal.body.error.includes('终态'), '§12.5：非法迁移被拒且说明原因')
+
+  // 抢不到行 = 别人先改了。这里必须是 409 而不是 200：返回 200 会让管理员以为改成功了。
+  const raced = ordersDb({ orders: [{ data: { id: ORDER_ROW.id, status: 'pending' }, error: null }, { data: [], error: null }] })
+  const lost = await updateOrderStatus(raced, { userId: ADMIN1, group: 'admin' }, {
+    order_id: ORDER_ROW.id, status: 'failed', note: '渠道回报失败'
+  })
+  assert(lost.status === 409, '0 行受影响是 409')
+  assert(!raced.tables.includes('order_status_log'), '没改动就不该留下一条说改了的审计')
+}
+
+// 退款相关的两个状态不能从订单详情直接点。放开等于给出一个「标成已退款但查不到申请」的入口。
+for (const target of ['refund_pending', 'refunded']) {
+  const db = ordersDb({ orders: { data: { id: ORDER_ROW.id, status: target === 'refunded' ? 'refund_pending' : 'paid' }, error: null } })
+  const blocked = await updateOrderStatus(db, { userId: ADMIN1, group: 'admin' }, {
+    order_id: ORDER_ROW.id, status: target, note: '手工改一下'
+  })
+  assert(blocked.status === 409 && blocked.body.error.includes('退款'),
+    `${target} 必须走退款流程——直接改会绕过审批、二次确认和给用户的站内信`)
+  assert(!db.tables.includes('order_status_log'), '被拒的操作不留审计')
+}
+
+// §12.4 导出：受 §14 的开关管，且有上限。
+{
+  const db = ordersDb({ orders: { data: [ORDER_ROW], error: null, count: 1 } })
+  const out = await exportOrders(db, {}, { pageSize: 20 })
+  assert(out.status === 200 && out.filename === `orders-${new Date().toISOString().slice(0, 10)}.csv`, '文件名带日期')
+  assert(!/[0-9a-f]{8}-/.test(out.filename), '文件名里不放订单号或用户 ID：导出文件常常被直接转发')
+  assert(out.csv.includes('z******n@example.com'), '导出的联系方式同样脱敏')
+  assert(!out.csv.includes('zhangsan@example.com'), '导出是最容易外流的一份，绝不能带原始邮箱')
+  assert(out.csv.includes('PAY-77') && out.csv.includes('WELCOME'), '§5 的支付 ID 和券码都在表里')
+  assert(out.truncated === false, '没截断')
+
+  const capped = await exportOrders(ordersDb({ orders: { data: [ORDER_ROW], error: null, count: 90000 } }), {}, { pageSize: 20 })
+  assert(capped.truncated === true && capped.total === 90000,
+    '被上限截断要如实说——否则拿着一份不完整的表去对账')
+
+  const off = await exportOrders(ordersDb({ config: { order_export_enabled: false } }), {}, { pageSize: 20 })
+  assert(off.status === 403, '开关关掉时是 403，不是一个空文件——空文件会被读成「这个月没订单」')
+}
+
+// 和 schema.sql 对齐：门槛数字和 §14 的键名都不许两边各写一份。
+{
+  const viewSql = schemaSql.match(/function private\.can_view_orders\(\)[\s\S]*?my_rank\(\) >= (\d+)/)
+  assert(Number(viewSql[1]) === RANK.MEMBER,
+    'can_view_orders 的阈值必须等于 RANK.MEMBER——SQL 松一档就是越权读，JS 松一档是界面能点接口报错')
+  const updSql = schemaSql.match(/policy admin_orders_update on public\.orders[\s\S]{0,200}/)
+  assert(/is_admin\(\)/.test(updSql[0]), 'orders 的 UPDATE 策略只给 admin，接口里的 canModify 跟着它')
+  for (const key of ['order_list_page_size', 'order_export_enabled']) {
+    assert(schemaSql.includes(`'${key}'`), `§14 的 ${key} 要在 schema 的 seed 里，否则配置界面改了也读不到`)
+  }
+  const logCols = schemaSql.match(/create table if not exists public\.order_status_log\(?[\s\S]*?\);/)
+  for (const col of ['from_status', 'to_status', 'actor_group', 'source', 'note']) {
+    assert(logCols[0].includes(col), `order_status_log 缺列 ${col}，logOrderStatus 写进去会报约束错`)
+  }
+  assert(/source .*check \(source in \([^)]*'admin'[^)]*\)\)/.test(logCols[0]),
+    "source 的 check 里要有 'admin'，否则 §12.5 每次改状态都写不进审计")
+}
+
+console.log('Admin orders: OK')
