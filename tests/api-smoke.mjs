@@ -44,6 +44,23 @@ import {
   isEditor,
   rankOf
 } from '../shared/groups.mjs'
+import {
+  ACTION_TYPES,
+  AMOUNT_OPERATORS,
+  CONDITION_TYPES,
+  SKU_OPERATORS,
+  applyActions,
+  checkAvailability,
+  describeAction,
+  describeCondition,
+  evaluateCondition,
+  evaluateConditions,
+  formatMinor,
+  quote,
+  validateAction,
+  validateCondition,
+  validateCoupon
+} from '../shared/coupons.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
@@ -716,3 +733,161 @@ for (const need of [true, false, 0, RANK.ADMIN, RANK.STAFF, undefined]) {
 }
 
 console.log('Permission groups and GitHub team sync: OK')
+
+// §1 优惠券。这一段测的几乎全是「不会抛异常、只会算错钱」的情形——那类 bug 在生产上的第一个症状
+// 通常是支付渠道的对账差异，离原因已经很远了，所以在这里钉死。
+
+// 取整方向。折扣额 floor，也就是零头归商家；这一条要是被改成 ceil，每笔多折一分，测试必须失败。
+// 注意单位：这里的 101 是 101 个最小单位（分），不是 101 元。9.5 折的折扣是 amount/20，所以要触发取整，
+// 金额必须不能被 20 整除——写成 10100（101 元）就除得尽，那样这条断言测不到任何取整行为。
+assert(applyActions([{ type: 'percent', value: 9500 }], 101).discountMinor === 5,
+  '101 分打 9.5 折应折 5.05 分，实折必须是 5 分（折扣额向下取整）')
+assert(applyActions([{ type: 'percent', value: 9500 }], 101).amountMinor === 96,
+  '折后金额必须是原价减实际折扣，不能对金额单独取整')
+assert(applyActions([{ type: 'percent', value: 9500 }], 1).discountMinor === 0,
+  '1 分钱打 9.5 折的折扣被抹成 0，是取整方向的已知代价，改动这个行为要同时改注释')
+// discountMinor 和 amountMinor 必须始终互补，否则「原价 - 实付」和记账里的折扣额对不上。
+for (const [amount, pct] of [[1, 9500], [7, 3333], [99, 6667], [10000, 100], [123456, 8889]]) {
+  const r = applyActions([{ type: 'percent', value: pct }], amount)
+  assert(r.amountMinor + r.discountMinor === amount, `折扣与实付必须互补（${amount} @ ${pct}）`)
+  assert(Number.isInteger(r.amountMinor) && r.amountMinor >= 0, '实付必须是非负整数')
+}
+
+// 顺序敏感是有意的：先减后折和先折后减结果不同，配置数组的顺序就是执行顺序。
+const cutThenPct = applyActions([{ type: 'fixed', value: 1000 }, { type: 'percent', value: 9000 }], 10000)
+const pctThenCut = applyActions([{ type: 'percent', value: 9000 }, { type: 'fixed', value: 1000 }], 10000)
+assert(cutThenPct.amountMinor === 8100 && pctThenCut.amountMinor === 8000,
+  '动作顺序必须影响结果，合并同类项或排序都会算错')
+
+// 逐步夹到 0，而不是只夹最后一次。
+assert(applyActions([{ type: 'fixed', value: 20000 }, { type: 'delta', value: 10000 }], 10000).amountMinor === 10000,
+  '中间夹 0 之后的加价从 0 起算')
+assert(applyActions([{ type: 'percent', value: 0 }], 12345).amountMinor === 0, 'value=0 是全免')
+assert(applyActions([{ type: 'percent', value: 10000 }], 12345).amountMinor === 12345, 'value=10000 是原价')
+// 非整数金额必须抛，而不是静默地按浮点算。
+let threw = false
+try { applyActions([], 10.5) } catch { threw = true }
+assert(threw, '浮点金额必须抛异常，钱不能走浮点路径')
+// 形状非法的动作被跳过而不是让整笔结算失败。
+assert(applyActions([{ type: 'percent', value: 20000 }, { type: 'fixed', value: 100 }], 1000).amountMinor === 900,
+  '越界的动作跳过，合法的照常执行')
+
+// 币种不匹配判条件不成立，而不是报错——多币种站点上一张配错币种的券不该让结算 500。
+const amountCond = { type: 'amount', op: 'gte', value: 10000, currency: 'USD' }
+assert(evaluateCondition(amountCond, { amountMinor: 20000, currency: 'USD' }) === true, '同币种且满额应成立')
+assert(evaluateCondition(amountCond, { amountMinor: 20000, currency: 'JPY' }) === false, '异币种必须判不成立')
+assert(evaluateCondition(amountCond, { amountMinor: 20000, currency: 'usd' }) === true, '币种比较不区分大小写')
+assert(evaluateCondition(amountCond, { amountMinor: 10000, currency: 'USD' }) === true, 'gte 含端点')
+assert(evaluateCondition({ ...amountCond, op: 'gt' }, { amountMinor: 10000, currency: 'USD' }) === false, 'gt 不含端点')
+
+// SKU 六种匹配全覆盖。
+const skuCases = [
+  ['is', 'aetherac-pro', true], ['is', 'aetherac', false],
+  ['is_not', 'aetherac', true], ['is_not', 'aetherac-pro', false],
+  ['contains', 'ether', true], ['contains', 'zzz', false],
+  ['not_contains', 'zzz', true], ['not_contains', 'ether', false],
+  ['starts_with', 'aether', true], ['starts_with', 'pro', false],
+  ['ends_with', 'pro', true], ['ends_with', 'aether', false]
+]
+for (const [op, value, expected] of skuCases) {
+  assert(evaluateCondition({ type: 'sku', op, value }, { sku: 'aetherac-pro' }) === expected,
+    `SKU ${op} ${value} 的判定错了`)
+}
+
+// 历史订单条件按状态求和，不是逐个比较。
+const hist = { counts: { paid: 2, refunded: 1, cancelled: 5 } }
+assert(evaluateCondition({ type: 'order_history', statuses: ['paid', 'refunded'], op: 'gte', count: 3 }, { history: hist }) === true,
+  '多状态必须求和（2 + 1 >= 3）')
+assert(evaluateCondition({ type: 'order_history', statuses: ['paid'], op: 'gte', count: 3 }, { history: hist }) === false,
+  '单状态不该借到别的状态的计数')
+assert(evaluateCondition({ type: 'order_history', statuses: ['paid'], op: 'gte', count: 1 }, {}) === false,
+  '缺 history 时计数按 0 算，条件不成立而不是崩')
+
+// 首单按「付过钱」判，不是按「下过单」判：下单未付、过期作废的用户仍算首单。
+assert(evaluateCondition({ type: 'first_order', value: true }, { history: { counts: { pending: 3, expired: 2 } } }) === true,
+  '只下过未付款的单仍算首单')
+assert(evaluateCondition({ type: 'first_order', value: true }, { history: { counts: { paid: 1 } } }) === false,
+  '付过款就不是首单')
+assert(evaluateCondition({ type: 'first_order', value: true }, { history: { counts: { refunded: 1 } } }) === false,
+  '退过款也算付过，不是首单')
+
+// 未知条件类型判不成立，绝不能「忽略后继续」——那会让同一张券在旧版代码上更容易满足。
+assert(evaluateCondition({ type: 'no_such_thing' }, {}) === false, '未知条件类型必须判不成立')
+assert(validateCondition({ type: 'no_such_thing' }).ok === false, '未知条件类型必须校验失败')
+assert(evaluateCondition({ type: 'amount', op: 'gte', value: 1 }, { amountMinor: 100, currency: 'USD' }) === false,
+  '缺币种的金额条件形状非法，判不成立')
+
+// 全部条件 AND，且要能指出是哪几条不成立。
+const conds = [amountCond, { type: 'sku', op: 'contains', value: 'pro' }]
+assert(evaluateConditions(conds, { amountMinor: 20000, currency: 'USD', sku: 'aetherac-pro' }).ok === true, '全部满足')
+const partial = evaluateConditions(conds, { amountMinor: 100, currency: 'USD', sku: 'aetherac-pro' })
+assert(partial.ok === false && partial.failed.length === 1 && partial.failed[0].type === 'amount',
+  '不成立的条件必须能被指认出来')
+assert(evaluateConditions([], {}).ok === true, '无条件的券对任何订单都成立')
+assert(evaluateConditions(null, {}).ok === true, 'conditions 为 null 时不能崩')
+
+// 券形状校验。
+assert(validateCoupon({ code: 'save10', conditions: [], actions: [{ type: 'fixed', value: 100 }] }).code === 'SAVE10',
+  '券码必须归一成大写，因为唯一索引建在 upper(code) 上')
+assert(validateCoupon({ code: 'ab', conditions: [], actions: [{ type: 'fixed', value: 1 }] }).ok === false, '券码太短')
+assert(validateCoupon({ code: 'has space', conditions: [], actions: [{ type: 'fixed', value: 1 }] }).ok === false, '券码不允许空格')
+assert(validateCoupon({ code: 'ok1', conditions: [], actions: [] }).ok === false, '没有动作的券什么都不做，应拒')
+assert(validateCoupon({ code: 'ok1', conditions: [], actions: [{ type: 'fixed', value: 1 }], allowed_user_ids: [] }).ok === false,
+  '空的可用名单等于谁都不能用，是个容易配错的形状，必须拒并说明')
+assert(validateCoupon({ code: 'ok1', conditions: [], actions: [{ type: 'fixed', value: 1 }], allowed_user_ids: null }).ok === true,
+  'null 才是「不限」')
+assert(validateCoupon({ code: 'ok1', conditions: [], actions: [{ type: 'fixed', value: 1 }], per_user_limit: 0 }).ok === true,
+  '0 是合法的 per_user_limit（一次都不能用），不能和 null 混为一谈')
+assert(validateCoupon({
+  code: 'ok1', conditions: [], actions: [{ type: 'fixed', value: 1 }],
+  starts_at: '2026-02-01T00:00:00Z', ends_at: '2026-01-01T00:00:00Z'
+}).ok === false, '生效时间晚于失效时间应拒')
+// 错误信息要指出是第几条，否则管理员配了十条条件后无从下手。
+const badAt = validateCoupon({ code: 'ok1', conditions: [amountCond, { type: 'sku', op: 'nope', value: 'x' }], actions: [{ type: 'fixed', value: 1 }] })
+assert(badAt.ok === false && /第 2 条条件/.test(badAt.error), '校验错误必须定位到第几条条件')
+
+// 可用性里不依赖数据库的那一半。per_user_limit 不在这里判，它必须由 redeem_coupon 原子地判。
+const now = new Date('2026-06-01T00:00:00Z')
+assert(checkAvailability({ enabled: false }, { now }).ok === false, '停用的券不可用')
+assert(checkAvailability({ enabled: true, starts_at: '2026-07-01T00:00:00Z' }, { now }).ok === false, '未开始')
+assert(checkAvailability({ enabled: true, ends_at: '2026-05-01T00:00:00Z' }, { now }).ok === false, '已过期')
+assert(checkAvailability({ enabled: true, total_limit: 5, used_count: 5 }, { now }).ok === false, '总量用尽')
+assert(checkAvailability({ enabled: true, total_limit: null, used_count: 99999 }, { now }).ok === true, 'null 总量 = 不限')
+assert(checkAvailability({ enabled: true, allowed_user_ids: ['u1'] }, { now, userId: 'u2' }).ok === false, '不在名单里')
+assert(checkAvailability({ enabled: true, allowed_user_ids: ['u1'] }, { now, userId: 'u1' }).ok === true, '在名单里')
+
+// quote 把两半合起来，失败时要带上人能读的原因。
+const coupon = { enabled: true, conditions: [amountCond], actions: [{ type: 'percent', value: 9000 }] }
+const good = quote(coupon, { amountMinor: 20000, currency: 'USD', now, userId: 'u1' })
+assert(good.ok === true && good.discountMinor === 2000 && good.amountMinor === 18000, 'quote 的折扣算错了')
+const bad = quote(coupon, { amountMinor: 100, currency: 'USD', now, userId: 'u1' })
+assert(bad.ok === false && bad.discountMinor === 0 && bad.amountMinor === 100 && /不低于/.test(bad.error),
+  '不满足条件时折扣必须是 0，且原因要说得出来')
+
+// 零小数位币种不能除 100。把 1000 日元显示成 10 日元是会被用户当成标错价的。
+assert(formatMinor(1000, 'JPY') === '1000 JPY', '日元没有小数位')
+assert(formatMinor(1000, 'USD') === '10.00 USD', '美元有两位小数')
+assert(formatMinor(1000) === '10.00', '不给币种时只给数字')
+
+// 描述文本：后台和结算页共用，不能两处各写一份中文。
+assert(describeAction({ type: 'percent', value: 9000 }) === '打 9 折（减 10%）', '整折的文案')
+assert(describeAction({ type: 'percent', value: 9500 }) === '打 9.5 折（减 5%）', '半折的文案')
+assert(describeAction({ type: 'percent', value: 10000 }) === '不打折', '原价的文案')
+assert(describeAction({ type: 'percent', value: 0 }) === '全额免除', '全免的文案')
+assert(describeAction({ type: 'delta', value: -500 }) === '减 5.00', '负 delta 读作减价')
+assert(describeAction({ type: 'delta', value: 500 }) === '加 5.00', '正 delta 读作加价')
+assert(/不低于 100.00 USD/.test(describeCondition(amountCond)), '金额条件要带币种')
+assert(describeCondition({ type: 'first_order', value: true }) === '仅限首次购买', '首单条件的文案')
+assert(describeCondition(null) === '（无效条件）', '坏数据要有兜底文案，不能崩在渲染里')
+
+// 枚举本身：这些数组是前端下拉框的数据源，少一项就是一种规则配不出来。
+assert(CONDITION_TYPES.length === 5 && SKU_OPERATORS.length === 6 && AMOUNT_OPERATORS.length === 6 && ACTION_TYPES.length === 3,
+  '条件/动作枚举的数量变了，前端下拉框和这里要一起改')
+for (const op of AMOUNT_OPERATORS) {
+  assert(validateCondition({ type: 'amount', op, value: 1, currency: 'USD' }).ok, `${op} 必须是合法的金额比较`)
+}
+for (const t of ACTION_TYPES) {
+  assert(validateAction({ type: t, value: t === 'percent' ? 9000 : 100 }).ok, `${t} 必须是合法的动作`)
+}
+
+console.log('Coupon conditions and actions: OK')
