@@ -61,6 +61,23 @@ import {
   validateCondition,
   validateCoupon
 } from '../shared/coupons.mjs'
+// 两个模块都有 ACTION_TYPES 和 validateAction，含义完全不同（券的动作是改金额，站内信的动作是按钮），
+// 所以在这里起别名而不是在任一模块里改名——改名会让各自文件里的命名变得别扭。
+import {
+  ACTION_ENDPOINT,
+  ADMIN_ONLY_ACTIONS,
+  ACTION_TYPES as NOTIF_ACTION_TYPES,
+  canUseAction,
+  needsConfirm,
+  needsReason,
+  orderHref,
+  presentationFor,
+  refundApprovalNotification,
+  refundDoneNotification,
+  refundEscalationNotification,
+  validateAction as validateNotifAction,
+  validateNotification
+} from '../shared/notifications.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
@@ -891,3 +908,110 @@ for (const t of ACTION_TYPES) {
 }
 
 console.log('Coupon conditions and actions: OK')
+
+// §9 站内信。
+
+// 两份订单路径实现必须一致。shared/notifications.mjs 里的 orderHref 是 routes.ts 里 orderPath 的第二份
+// 实现（理由写在那边的注释里），这条断言是那份重复的全部安全保障。
+for (const id of ['11111111-2222-3333-4444-555555555555', 'abc', '需要转义的 id']) {
+  assert(orderHref(id) === orderPath(id), `orderHref 与 orderPath 必须给出同一个结果（${id}）`)
+}
+
+// 站内信是单向的，所以不该有任何回复类动作。这条断言是把 §9 那句「不可回复」钉在代码里——
+// 将来有人想加 reply，会先撞到这里，而不是等到用户在一个没人看的地方提了问题。
+assert(!NOTIF_ACTION_TYPES.some(t => /reply|respond|answer/i.test(t)), '站内信是单向的，不能有回复类动作')
+
+// scope 和 recipient_id 必须同生共死，schema.sql 里那条 check 约束是同一件事。
+const baseNotif = { kind: 'system', scope: 'all', title: '标题', body: '正文' }
+assert(validateNotification(baseNotif).ok === true, '最小合法站内信')
+assert(validateNotification({ ...baseNotif, scope: 'user' }).ok === false, 'scope=user 缺 recipient_id 应拒')
+assert(validateNotification({ ...baseNotif, scope: 'user', recipient_id: 'u1' }).ok === true, 'scope=user 带 recipient_id')
+assert(validateNotification({ ...baseNotif, recipient_id: 'u1' }).ok === false, '广播范围带 recipient_id 应拒')
+assert(validateNotification({ ...baseNotif, kind: 'nope' }).ok === false, '未知类型应拒')
+assert(validateNotification({ ...baseNotif, scope: 'nope' }).ok === false, '未知范围应拒')
+assert(validateNotification({ ...baseNotif, title: '' }).ok === false, '空标题应拒')
+assert(validateNotification({ ...baseNotif, body: '  ' }).ok === false, '空白正文应拒')
+assert(validateNotification({ ...baseNotif, state: null }).ok === true, 'state 可以是 null（不是待办）')
+assert(validateNotification({ ...baseNotif, state: 'nope' }).ok === false, '未知 state 应拒')
+
+// 外链必须拒。一条管理员发的站内信如果能挂外链，就是个带站点信誉的钓鱼入口，而站内信恰好是
+// 用户最容易信任的位置。
+const linkCases = [
+  ['/order?order_id=x', true],
+  ['/admin', true],
+  ['https://example.com', false],
+  ['//example.com', false],
+  ['/\\example.com', false],
+  ['javascript:alert(1)', false],
+  ['order', false],
+  ['/ok\nX-Injected: 1', false]
+]
+for (const [href, expected] of linkCases) {
+  assert(validateNotifAction({ type: 'link', label: '去', href }).ok === expected,
+    `link href 的判定错了：${JSON.stringify(href)}`)
+}
+assert(validateNotifAction({ type: 'link', href: '/ok' }).ok === false, '按钮必须有文案')
+
+// 作用在对象上的动作必须带合法 uuid，否则就是个点不动的按钮。
+const rid = '11111111-2222-3333-4444-555555555555'
+assert(validateNotifAction({ type: 'approve_refund', label: '批准', target: rid }).ok === true, '合法的批准按钮')
+assert(validateNotifAction({ type: 'approve_refund', label: '批准' }).ok === false, '缺 target 应拒')
+assert(validateNotifAction({ type: 'approve_refund', label: '批准', target: 'not-a-uuid' }).ok === false, 'target 必须是 uuid')
+assert(validateNotifAction({ type: 'mark_read', label: '知道了' }).ok === true, 'mark_read 不需要 target')
+assert(validateNotifAction({ type: 'nope', label: 'x' }).ok === false, '未知动作类型应拒')
+const tooMany = { ...baseNotif, actions: Array.from({ length: 7 }, () => ({ type: 'mark_read', label: 'x' })) }
+assert(validateNotification(tooMany).ok === false, '按钮太多应拒')
+const badBtn = { ...baseNotif, actions: [{ type: 'mark_read', label: 'ok' }, { type: 'link', label: '去', href: 'http://x' }] }
+assert(validateNotification(badBtn).ok === false && /第 2 个按钮/.test(validateNotification(badBtn).error),
+  '按钮校验错误必须定位到第几个')
+
+// §9.6：待审批的通知强制置顶高亮。漏掉的表现是一条等着人批的退款躺在列表第二十行。
+const approval = refundApprovalNotification({
+  refundId: rid, orderNo: 'AE-2026-0001', amountText: '128.00 USD',
+  reason: '重复支付', initiator: 'cs@example.com'
+})
+assert(validateNotification(approval).ok === true, '构造出来的审批通知本身必须合法')
+assert(approval.state === 'pending' && approval.scope === 'admin' && approval.refund_id === rid, '审批通知的关键字段')
+assert(presentationFor(approval).pinned === true && presentationFor(approval).highlighted === true,
+  '待审批必须置顶高亮')
+assert(presentationFor({ ...baseNotif, state: null }).pinned === false, '普通通知不置顶')
+assert(presentationFor({ state: 'pending', actions: [{ type: 'mark_read', label: 'x' }] }).pinned === false,
+  '只有含管理员动作的待办才置顶，一个「知道了」不算待审批')
+// 三个按钮齐全，且批准按钮的文案带金额——管理员可能同时收到好几条，「批准」两个字在列表里长得一样。
+assert(approval.actions.map(a => a.type).join(',') === 'approve_refund,reject_refund,transfer_refund',
+  '§10.3 要求批准/拒绝/转交三个按钮')
+assert(/128\.00 USD/.test(approval.actions[0].label), '批准按钮的文案要带金额')
+assert(approval.body.includes('重复支付') && approval.body.includes('AE-2026-0001'), '正文要带原因和订单号')
+
+// 超时升级是新的一条，不是改旧的那条。原地改标题的话，已读过原通知的管理员不会再收到任何提示，
+// 而超时提醒的全部意义就是提示那个看过但没处理的人。
+const esc = refundEscalationNotification({ refundId: rid, orderNo: 'AE-2026-0001', amountText: '128.00 USD', hours: 48 })
+assert(validateNotification(esc).ok === true, '升级提醒必须合法')
+assert(/48 小时/.test(esc.title) && esc.state === 'pending', '升级提醒要写明超时时长且仍是待办')
+assert(!esc.actions.some(a => a.type === 'transfer_refund'), '升级提醒不给转交，此时要的是尽快决定')
+
+// 退款结果通知：单向、只带一个跳转，且成功和失败的文案不同。
+const done = refundDoneNotification({ userId: 'u1', orderNo: 'AE-1', orderId: rid, amountText: '10.00 USD', ok: true })
+assert(validateNotification(done).ok === true && done.scope === 'user' && done.state === null, '退款完成通知不是待办')
+assert(done.actions.length === 1 && done.actions[0].type === 'link' && done.actions[0].href === orderPath(rid),
+  '退款完成通知只给一个订单页跳转，且路径必须和 orderPath 一致')
+const failed = refundDoneNotification({ userId: 'u1', orderNo: 'AE-1', orderId: rid, amountText: '10.00 USD', ok: false, note: '渠道拒绝' })
+assert(/未成功/.test(failed.title) && /渠道拒绝/.test(failed.body), '失败通知要说明原因')
+
+// 权限与确认：这三份名单必须和接口侧一致，列在这里只是为了不显示注定 403 的按钮。
+assert(ADMIN_ONLY_ACTIONS.every(t => NOTIF_ACTION_TYPES.includes(t)), '管理员动作必须都是已知动作')
+assert(needsConfirm('approve_refund') === true, '批准退款不可逆，必须二次确认')
+assert(needsConfirm('reject_refund') === false, '拒绝可以重新发起，不需要不可逆确认')
+assert(needsReason('reject_refund') === true && needsReason('transfer_refund') === true, '拒绝和转交都必须填原因')
+assert(needsReason('approve_refund') === false, '批准不强制填原因')
+assert(canUseAction('approve_refund', RANK.STAFF) === false, '客服看不到批准按钮')
+assert(canUseAction('approve_refund', RANK.ADMIN) === true, '管理员看得到批准按钮')
+assert(canUseAction('link', 0) === true, '跳转按钮对谁都可见')
+// 每个需要打接口的动作都要有 endpoint，否则前端拿到一个不知道往哪发的按钮。
+for (const t of NOTIF_ACTION_TYPES) {
+  if (t === 'link' || t === 'mark_read') continue
+  assert(typeof ACTION_ENDPOINT[t] === 'string' && ACTION_ENDPOINT[t].startsWith('/api/'),
+    `${t} 缺少接口映射`)
+}
+
+console.log('Notification shapes and refund approval: OK')
