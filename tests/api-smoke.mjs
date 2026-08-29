@@ -23,6 +23,7 @@ import {
   toLocalInput
 } from '../docs/.vitepress/theme/recordForm.ts'
 import { preloadMarkdown, renderMarkdown, renderMarkdownInline } from '../docs/.vitepress/theme/markdown.ts'
+import cancelHandler, { cancelPendingOrder } from '../api/cancel-order.mjs'
 
 const originalRepository = process.env.GITHUB_REPOSITORY
 const originalToken = process.env.GITHUB_TOKEN
@@ -361,3 +362,69 @@ assert(renderMarkdown('') === '' && renderMarkdown(null) === '' && renderMarkdow
   && renderMarkdownInline(null) === '', 'an empty or absent description must render nothing, not "null"')
 
 console.log('CMS Markdown: OK')
+
+// Order cancellation. This route runs on the service client, which bypasses RLS — so the filters on
+// the update are the entire authorization check. Losing one would let any buyer cancel anyone's order,
+// or cancel an order that has already been paid. A recording fake asserts they are all still there.
+const fakeDb = (updateResult, selectResult) => {
+  const calls = { update: null, updateFilters: {}, selectFilters: {}, selected: null }
+  const chain = (bucket, result) => {
+    const link = {
+      eq(column, value) { bucket[column] = value; return link },
+      select(columns) { calls.selected = columns ?? '*'; return link },
+      maybeSingle: async () => result
+    }
+    return link
+  }
+  return {
+    calls,
+    from(table) {
+      assert(table === 'orders', 'cancellation must only ever touch the orders table')
+      return {
+        update(patch) { calls.update = patch; return chain(calls.updateFilters, updateResult) },
+        select(columns) { calls.selected = columns; return chain(calls.selectFilters, selectResult) }
+      }
+    }
+  }
+}
+const OWNER = '11111111-1111-4111-8111-111111111111'
+const ORDER = '22222222-2222-4222-8222-222222222222'
+
+let db = fakeDb({ data: { id: ORDER, status: 'cancelled' } }, { data: null })
+let result = await cancelPendingOrder(db, OWNER, ORDER)
+assert(result.status === 200 && result.body.order.status === 'cancelled', 'cancelling a pending order succeeds')
+assert(db.calls.updateFilters.id === ORDER, 'the update must target the requested order')
+assert(db.calls.updateFilters.user_id === OWNER, 'the update must be scoped to the caller — this is the ownership check')
+assert(db.calls.updateFilters.status === 'pending', 'the update must require the order to still be pending')
+assert(db.calls.update.status === 'cancelled' && db.calls.update.checkout_url === null,
+  'cancelling clears checkout_url so a stale hosted payment page is no longer offered')
+assert(Object.keys(db.calls.update).length === 2, 'nothing but status and checkout_url may be written')
+
+// Nothing updated because the row belongs to someone else, or does not exist.
+db = fakeDb({ data: null }, { data: null })
+result = await cancelPendingOrder(db, OWNER, ORDER)
+assert(result.status === 404, 'an order that is not the caller\'s answers 404')
+assert(db.calls.selectFilters.user_id === OWNER,
+  'the follow-up lookup stays scoped to the caller — probing must not distinguish a real order from a missing one')
+
+// Nothing updated because the status moved on. Cancelling a paid order would strand the buyer's money.
+for (const status of ['paid', 'cancelled', 'refunded', 'failed', 'refund_pending']) {
+  const guard = fakeDb({ data: null }, { data: { id: ORDER, status } })
+  const answer = await cancelPendingOrder(guard, OWNER, ORDER)
+  assert(answer.status === 409 && answer.body.error.includes(status), `a ${status} order cannot be cancelled`)
+}
+
+for (const bad of ['', null, undefined, 'not-a-uuid', '22222222-2222-4222-8222', "' or 1=1--"]) {
+  const answer = await cancelPendingOrder(fakeDb({ data: null }, { data: null }), OWNER, bad)
+  assert(answer.status === 400, `a malformed order_id (${JSON.stringify(bad)}) answers 400, not 500`)
+}
+
+let cancelStatus = 0
+let cancelBody = null
+const cancelResponse = { status(code) { cancelStatus = code }, setHeader() {}, send(value) { cancelBody = JSON.parse(value) } }
+await cancelHandler({ method: 'GET', headers: {} }, cancelResponse)
+assert(cancelStatus === 405, 'cancellation must be POST-only')
+await cancelHandler({ method: 'POST', headers: {} }, cancelResponse)
+assert(cancelStatus === 401 && cancelBody?.error, 'cancellation must reject an unauthenticated request')
+
+console.log('Order cancellation: OK')

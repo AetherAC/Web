@@ -26,10 +26,26 @@ export default async function handler(req, res) {
       auth.db.from('payment_providers').select('*').eq('id', input.provider).eq('enabled', true).single()
     ])
     if (!artifact || !provider) return send(res, 404, { error: 'Artifact or payment provider unavailable' })
+    // One pending order per account. This check is for the message — the guarantee is the partial
+    // unique index `one_pending_order_per_user`, which is what holds when two clicks race. Without a
+    // cap, an abandoned checkout leaves a row nobody will ever pay, and the buyer accumulates orders
+    // that all look live; with the cap they cancel the stale one and try again deliberately.
+    const { data: blocking } = await auth.db.from('orders')
+      .select('id,sku,provider,created_at').eq('user_id', auth.user.id).eq('status', 'pending')
+      .order('created_at', { ascending: false }).limit(1).maybeSingle()
+    if (blocking) return send(res, 409, { error: '你已有一笔待支付订单，请先完成或取消它再下新单', pending_order: blocking })
     const { data: order, error } = await auth.db.from('orders').insert({
       user_id: auth.user.id, artifact_id: artifact.id, sku: artifact.sku, quantity: 1,
       amount_minor: artifact.price_minor, currency: artifact.currency, provider: provider.id
     }).select().single()
+    // 23505 on insert can only be that index: `orders_provider_reference` needs a provider_order_id,
+    // which no fresh row has. So this is the same conflict as above, lost by a hair — same answer, not
+    // a 500. Re-read the winner so the response can point at it.
+    if (error?.code === '23505') {
+      const { data: winner } = await auth.db.from('orders')
+        .select('id,sku,provider,created_at').eq('user_id', auth.user.id).eq('status', 'pending').maybeSingle()
+      return send(res, 409, { error: '你已有一笔待支付订单，请先完成或取消它再下新单', pending_order: winner ?? null })
+    }
     if (error) throw error
     const config = provider.public_config || {}
     const siteUrl = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`

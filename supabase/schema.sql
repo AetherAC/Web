@@ -67,6 +67,22 @@ create table if not exists public.orders (
 create unique index if not exists orders_provider_reference on public.orders(provider, provider_order_id) where provider_order_id is not null;
 create index if not exists orders_user_id_idx on public.orders(user_id);
 create index if not exists orders_artifact_id_idx on public.orders(artifact_id);
+-- At most one pending order per account. api/checkout.mjs checks first so the buyer gets a sentence
+-- instead of an error code, but only this index holds when two checkout requests race: both would
+-- read zero pending rows and both would insert. The cap is what makes an abandoned checkout the
+-- buyer's problem to clear (api/cancel-order.mjs) rather than a growing pile of rows that all look live.
+--
+-- Pre-existing data has to be reconciled before the index can be created, or a re-run of this file
+-- fails on the first account that already has two. Older pending rows are abandoned checkouts by
+-- definition -- nothing was ever paid, since a payment moves the row to `paid` -- so the newest is
+-- kept and the rest are cancelled. The id tiebreak keeps it deterministic when timestamps collide.
+update public.orders set status='cancelled', checkout_url=null where id in (
+  select id from (
+    select id, row_number() over (partition by user_id order by created_at desc, id desc) as rank
+    from public.orders where status='pending'
+  ) ranked where rank > 1
+);
+create unique index if not exists one_pending_order_per_user on public.orders(user_id) where status='pending';
 create table if not exists public.refund_requests (
   id uuid primary key default gen_random_uuid(), order_id uuid not null references public.orders(id) on delete restrict,
   user_id uuid not null references auth.users(id) on delete restrict, reason_code text not null, reason_detail text not null,
