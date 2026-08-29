@@ -1,4 +1,4 @@
-import { bodyOf, requireUser, send } from './_lib/server.mjs'
+import { bodyOf, RANK, requireUser, send } from './_lib/server.mjs'
 const bootstrap = () => {
   const token = process.env.VERCEL_API_TOKEN
   const project = process.env.VERCEL_PROJECT_ID
@@ -23,7 +23,7 @@ async function redeploy() {
   return true
 }
 export default async function handler(req, res) {
-  if (!await requireUser(req, res, true)) return
+  if (!await requireUser(req, res, RANK.ADMIN)) return
   try {
     const { project, query } = bootstrap()
     if (req.method === 'GET') {

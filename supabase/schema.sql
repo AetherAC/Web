@@ -2,7 +2,17 @@ create extension if not exists pgcrypto;
 create schema if not exists private;
 drop table if exists public.site_admins cascade;
 
-do $$ begin create type public.user_group as enum ('default','read','coworker','admin'); exception when duplicate_object then null; end $$;
+-- Seven groups, mapped from GitHub teams by api/sync-github-groups.mjs. The three customer-service
+-- groups are added with ALTER for databases created before they existed.
+--
+-- Nothing below may write these names as enum literals. `alter type ... add value` is allowed inside a
+-- transaction since PG 12, but *using* the new value in the same transaction is not, and this file is
+-- executed as one implicit transaction. So every permission test goes through private.group_rank(),
+-- which compares `g::text` and therefore never mentions a literal of the type it switches on.
+do $$ begin create type public.user_group as enum ('default','read','coworker','presale','postsale','cs','admin'); exception when duplicate_object then null; end $$;
+alter type public.user_group add value if not exists 'presale';
+alter type public.user_group add value if not exists 'postsale';
+alter type public.user_group add value if not exists 'cs';
 do $$ begin create type public.content_kind as enum ('blog','news'); exception when duplicate_object then null; end $$;
 do $$ begin create type public.content_status as enum ('draft','published'); exception when duplicate_object then null; end $$;
 do $$ begin create type public.progress_status as enum ('planned','active','complete','paused'); exception when duplicate_object then null; end $$;
@@ -19,6 +29,25 @@ create table if not exists public.user_profiles (
 );
 alter table public.user_profiles add column if not exists email text;
 alter table public.user_profiles add column if not exists display_name text not null default '';
+alter table public.user_profiles add column if not exists github_login text;
+alter table public.user_profiles add column if not exists github_synced_at timestamptz;
+create index if not exists user_profiles_github_login_idx on public.user_profiles(lower(github_login));
+
+-- Which GitHub team grants which group. A table rather than a constant in the sync endpoint so the
+-- mapping can be corrected without a deploy — team slugs are the one part of §6 nobody can verify from
+-- here. group_name is text, not public.user_group, for the transaction reason given above the enum:
+-- seeding 'cs' as an enum literal in this file would fail on a database that just gained the value.
+create table if not exists public.github_team_map (
+  team_slug text primary key, group_name text not null check (group_name in ('read','coworker','presale','postsale','cs','admin')),
+  note text not null default '', updated_at timestamptz not null default now()
+);
+insert into public.github_team_map(team_slug,group_name,note) values
+  ('devs','admin','§6 @AetherAC/devs → admin（优先级 999）'),
+  ('testers','admin','§6 @AetherAC/testers → admin（优先级 999，已确认有意：测试人员可批退款）'),
+  ('pre-sales','presale','§6 customer-service/pre-sales → presale（777）。子团队在 GitHub API 里用自己的 slug，不是路径'),
+  ('post-sales','postsale','§6 customer-service/post-sales → postsale（777）'),
+  ('copywriter','coworker','§6 @AetherAC/copywriter → coworker（555）')
+on conflict(team_slug) do update set group_name=excluded.group_name,note=excluded.note;
 create table if not exists public.posts (
   id uuid primary key default gen_random_uuid(), kind public.content_kind not null default 'news',
   slug text not null unique check (slug ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$'), title text not null,
@@ -138,6 +167,54 @@ revoke all on function private.current_user_group() from public;
 grant usage on schema private to authenticated;
 grant execute on function private.current_user_group() to authenticated;
 
+-- §6's priority column, and the only place a group name is ranked. Switching on g::text is what lets
+-- this file add enum values and use them in the same transaction (see the note above the enum).
+-- Unknown names rank 0, so a group added to the enum without a rank here is powerless rather than
+-- accidentally privileged.
+create or replace function private.group_rank(g public.user_group) returns integer
+language sql immutable set search_path = public, pg_temp as $$
+  select case g::text
+    when 'admin' then 999
+    when 'cs' then 888
+    when 'postsale' then 777
+    when 'presale' then 777
+    when 'coworker' then 555
+    when 'read' then 111
+    else 0 end
+$$;
+create or replace function private.my_rank() returns integer
+language sql stable security definer set search_path = public, pg_temp as $$
+  select private.group_rank((select private.current_user_group()))
+$$;
+-- Named thresholds so the intent survives a later change of numbers.
+--   is_staff  = presale/postsale/cs/admin — the groups that answer tickets (777+)
+--   can_view_orders = read and up — §12.2, confirmed intentional: joining the org is how you get it
+create or replace function private.is_staff() returns boolean
+language sql stable security definer set search_path = public, pg_temp as $$ select private.my_rank() >= 777 $$;
+create or replace function private.is_admin() returns boolean
+language sql stable security definer set search_path = public, pg_temp as $$ select private.my_rank() >= 999 $$;
+create or replace function private.can_view_orders() returns boolean
+language sql stable security definer set search_path = public, pg_temp as $$ select private.my_rank() >= 111 $$;
+-- Same threshold as can_view_orders, deliberately a second name: this one answers "is this an insider"
+-- (drafts, disabled repos), the other answers §12.2. They coincide today and may not tomorrow.
+create or replace function private.is_member() returns boolean
+language sql stable security definer set search_path = public, pg_temp as $$ select private.my_rank() >= 111 $$;
+-- Editorial rights are NOT a rank threshold. §6's priority column ranks ticket dispatch, and a 售前客服
+-- outranking 文案 there must not mean they can publish news. Enumerated on text, not the enum type, for
+-- the transaction reason above.
+create or replace function private.is_editor() returns boolean
+language sql stable security definer set search_path = public, pg_temp as $$
+  select (select private.current_user_group())::text in ('coworker','admin')
+$$;
+revoke all on function private.group_rank(public.user_group) from public;
+revoke all on function private.my_rank() from public;
+revoke all on function private.is_staff() from public;
+revoke all on function private.is_admin() from public;
+revoke all on function private.can_view_orders() from public;
+revoke all on function private.is_member() from public;
+revoke all on function private.is_editor() from public;
+grant execute on function private.group_rank(public.user_group),private.my_rank(),private.is_staff(),private.is_admin(),private.can_view_orders(),private.is_member(),private.is_editor() to authenticated;
+
 create or replace function private.handle_new_user() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -150,7 +227,7 @@ revoke all on function private.handle_new_user() from public;
 drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created after insert or update of email on auth.users for each row execute function private.handle_new_user();
 do $$ declare t text; begin
-  foreach t in array array['user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests']
+  foreach t in array array['user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','github_team_map']
   loop
     execute format('drop trigger if exists set_updated_at on public.%I',t);
     execute format('create trigger set_updated_at before update on public.%I for each row execute function public.set_updated_at()',t);
@@ -158,65 +235,71 @@ do $$ declare t text; begin
 end $$;
 
 do $$ declare t text; begin
-  foreach t in array array['user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots','telemetry_installs']
+  foreach t in array array['user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots','telemetry_installs','github_team_map']
   loop execute format('alter table public.%I enable row level security',t); end loop;
 end $$;
 do $$ declare r record; begin
   for r in select policyname,tablename from pg_policies where schemaname='public' and tablename in
-    ('user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots','telemetry_installs')
+    ('user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots','telemetry_installs','github_team_map')
   loop execute format('drop policy if exists %I on public.%I',r.policyname,r.tablename); end loop;
 end $$;
 
 create policy profiles_read on public.user_profiles for select to authenticated
-using ((select auth.uid())=user_id or (select private.current_user_group())='admin');
+using ((select auth.uid())=user_id or (select private.is_admin()));
 create policy profiles_admin_update on public.user_profiles for update to authenticated
-using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+using ((select private.is_admin())) with check ((select private.is_admin()));
 create policy published_posts_read on public.posts for select to anon,authenticated
-using (status='published' or (select private.current_user_group()) in ('read','coworker','admin'));
+using (status='published' or (select private.is_member()));
 create policy editor_posts_insert on public.posts for insert to authenticated
-with check ((select private.current_user_group()) in ('coworker','admin'));
+with check ((select private.is_editor()));
 create policy editor_posts_update on public.posts for update to authenticated
-using ((select private.current_user_group()) in ('coworker','admin')) with check ((select private.current_user_group()) in ('coworker','admin'));
+using ((select private.is_editor())) with check ((select private.is_editor()));
 create policy editor_posts_delete on public.posts for delete to authenticated
-using ((select private.current_user_group()) in ('coworker','admin'));
+using ((select private.is_editor()));
 create policy progress_read on public.progress_entries for select to anon,authenticated using (true);
 create policy editor_progress_insert on public.progress_entries for insert to authenticated
-with check ((select private.current_user_group()) in ('coworker','admin'));
+with check ((select private.is_editor()));
 create policy editor_progress_update on public.progress_entries for update to authenticated
-using ((select private.current_user_group()) in ('coworker','admin')) with check ((select private.current_user_group()) in ('coworker','admin'));
+using ((select private.is_editor())) with check ((select private.is_editor()));
 create policy editor_progress_delete on public.progress_entries for delete to authenticated
-using ((select private.current_user_group()) in ('coworker','admin'));
-create policy repositories_read on public.repositories for select to anon,authenticated using (enabled or (select private.current_user_group()) in ('read','coworker','admin'));
-create policy repositories_admin_insert on public.repositories for insert to authenticated with check ((select private.current_user_group())='admin');
-create policy repositories_admin_update on public.repositories for update to authenticated using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
-create policy repositories_admin_delete on public.repositories for delete to authenticated using ((select private.current_user_group())='admin');
+using ((select private.is_editor()));
+create policy repositories_read on public.repositories for select to anon,authenticated using (enabled or (select private.is_member()));
+create policy repositories_admin_insert on public.repositories for insert to authenticated with check ((select private.is_admin()));
+create policy repositories_admin_update on public.repositories for update to authenticated using ((select private.is_admin())) with check ((select private.is_admin()));
+create policy repositories_admin_delete on public.repositories for delete to authenticated using ((select private.is_admin()));
 create policy settings_admin on public.site_settings for all to authenticated
-using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
-create policy artifacts_read on public.artifacts for select to anon,authenticated using (active or (select private.current_user_group())='admin');
-create policy artifacts_admin_insert on public.artifacts for insert to authenticated with check ((select private.current_user_group())='admin');
-create policy artifacts_admin_update on public.artifacts for update to authenticated using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
-create policy artifacts_admin_delete on public.artifacts for delete to authenticated using ((select private.current_user_group())='admin');
-create policy providers_read on public.payment_providers for select to authenticated using (enabled or (select private.current_user_group())='admin');
-create policy providers_admin_insert on public.payment_providers for insert to authenticated with check ((select private.current_user_group())='admin');
-create policy providers_admin_update on public.payment_providers for update to authenticated using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
-create policy providers_admin_delete on public.payment_providers for delete to authenticated using ((select private.current_user_group())='admin');
+using ((select private.is_admin())) with check ((select private.is_admin()));
+create policy artifacts_read on public.artifacts for select to anon,authenticated using (active or (select private.is_admin()));
+create policy artifacts_admin_insert on public.artifacts for insert to authenticated with check ((select private.is_admin()));
+create policy artifacts_admin_update on public.artifacts for update to authenticated using ((select private.is_admin())) with check ((select private.is_admin()));
+create policy artifacts_admin_delete on public.artifacts for delete to authenticated using ((select private.is_admin()));
+create policy providers_read on public.payment_providers for select to authenticated using (enabled or (select private.is_admin()));
+create policy providers_admin_insert on public.payment_providers for insert to authenticated with check ((select private.is_admin()));
+create policy providers_admin_update on public.payment_providers for update to authenticated using ((select private.is_admin())) with check ((select private.is_admin()));
+create policy providers_admin_delete on public.payment_providers for delete to authenticated using ((select private.is_admin()));
+-- §12.2: read and up see every order, not just their own. Confirmed intentional — being in the
+-- AetherAC org is what grants it. Buyers still see only their own rows.
 create policy own_orders_read on public.orders for select to authenticated
-using ((select auth.uid())=user_id or (select private.current_user_group())='admin');
+using ((select auth.uid())=user_id or (select private.can_view_orders()));
 create policy admin_orders_update on public.orders for update to authenticated
-using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+using ((select private.is_admin())) with check ((select private.is_admin()));
+-- Staff read refunds because §5 has the post-sales agent looking at the order's refund while answering.
 create policy own_refunds_read on public.refund_requests for select to authenticated
-using ((select auth.uid())=user_id or (select private.current_user_group())='admin');
+using ((select auth.uid())=user_id or (select private.is_staff()));
 create policy own_refunds_insert on public.refund_requests for insert to authenticated
 with check ((select auth.uid())=user_id and exists(select 1 from public.orders o where o.id=order_id and o.user_id=(select auth.uid()) and o.status='paid'));
 create policy admin_refunds_update on public.refund_requests for update to authenticated
-using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
+using ((select private.is_admin())) with check ((select private.is_admin()));
+create policy team_map_read on public.github_team_map for select to authenticated using ((select private.is_admin()));
+create policy team_map_admin on public.github_team_map for all to authenticated
+using ((select private.is_admin())) with check ((select private.is_admin()));
 create policy install_stats_read on public.installation_snapshots for select to anon,authenticated using (true);
 -- Only the rollup above is public. A telemetry row names one server's hwid, its licence code and its
 -- exact versions — an unpatched version on a reachable install is an attacker's shopping list — so the
 -- raw table is admin-only, and no policy grants insert: samples arrive through the service client in
 -- api/telemetry.mjs, which is the only writer.
 create policy telemetry_admin_read on public.telemetry_installs for select to authenticated
-using ((select private.current_user_group())='admin');
+using ((select private.is_admin()));
 
 insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
 values('refund-evidence','refund-evidence',false,5242880,array['image/jpeg','image/png','image/webp'])
@@ -225,8 +308,9 @@ drop policy if exists refund_evidence_insert on storage.objects;
 drop policy if exists refund_evidence_read on storage.objects;
 create policy refund_evidence_insert on storage.objects for insert to authenticated
 with check(bucket_id='refund-evidence' and (storage.foldername(name))[1]=(select auth.uid()::text));
+-- Staff, not just admins: §10.3 has the reviewer looking at the evidence the agent attached.
 create policy refund_evidence_read on storage.objects for select to authenticated
-using(bucket_id='refund-evidence' and (owner_id=(select auth.uid()::text) or (select private.current_user_group())='admin'));
+using(bucket_id='refund-evidence' and (owner_id=(select auth.uid()::text) or (select private.is_staff())));
 
 grant select on public.posts,public.progress_entries,public.repositories,public.artifacts,public.installation_snapshots to anon;
 grant select on all tables in schema public to authenticated;
@@ -234,6 +318,9 @@ grant insert on public.refund_requests to authenticated;
 grant update on public.orders to authenticated;
 grant update on public.user_profiles,public.posts,public.progress_entries,public.repositories,public.site_settings,public.artifacts,public.payment_providers,public.refund_requests to authenticated;
 grant insert,delete on public.posts,public.progress_entries,public.repositories,public.site_settings,public.artifacts,public.payment_providers to authenticated;
+-- team_map_admin is a `for all` policy, so it needs the table grants to match or admins get a bare
+-- permission denied instead of an RLS decision. select already comes from the blanket grant above.
+grant insert,update,delete on public.github_team_map to authenticated;
 
 insert into public.payment_providers(id,display_name,secret_env_names,instructions,sort_order) values
 ('moonpay','MoonPay',array['MOONPAY_API_KEY','MOONPAY_SECRET_KEY','MOONPAY_WEBHOOK_SECRET'],'1. Create a MoonPay business account and obtain API/signing keys. 2. Add the listed secrets in Environment. 3. Configure checkout_url_template for the MoonPay widget, including order_id and callback_url. 4. Register /v1/callback/moonpay and set webhook_signature_header/webhook_secret_env. 5. Test in sandbox before enabling.',10),

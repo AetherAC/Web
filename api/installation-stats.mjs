@@ -1,4 +1,4 @@
-import { requireUser, send, serviceClient } from './_lib/server.mjs'
+import { RANK, requireUser, send, serviceClient } from './_lib/server.mjs'
 import { RUNNING_WINDOW_MS, summarise } from './_lib/telemetry.mjs'
 
 /** How stale the newest rollup may be before another is appended. */
@@ -18,7 +18,7 @@ const ROLLUP_INTERVAL_MS = 60 * 60 * 1000
  * not the endpoint that would do it.
  */
 export default async function handler(req, res) {
-  const auth = await requireUser(req, res, true)
+  const auth = await requireUser(req, res, RANK.ADMIN)
   if (!auth) return
   try {
     const db = serviceClient()

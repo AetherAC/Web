@@ -34,6 +34,19 @@ import {
   parseSample,
   summarise
 } from '../api/_lib/telemetry.mjs'
+import { readFileSync } from 'node:fs'
+import {
+  EDITOR_GROUPS,
+  GROUP_LABEL,
+  GROUP_ORDER,
+  GROUP_RANK,
+  RANK,
+  isEditor,
+  rankOf
+} from '../shared/groups.mjs'
+// 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
+import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
+import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
 
 const originalRepository = process.env.GITHUB_REPOSITORY
 const originalToken = process.env.GITHUB_TOKEN
@@ -582,3 +595,124 @@ if (savedKey === undefined) delete process.env.TELEMETRY_INGEST_KEY
 else process.env.TELEMETRY_INGEST_KEY = savedKey
 
 console.log('Telemetry samples: OK')
+
+// --- §6 权限组与 GitHub 团队映射 ------------------------------------------------------------------
+// rank 表有两份：shared/groups.mjs（浏览器和接口共用）和 schema.sql 里的 private.group_rank()（管 RLS，
+// 没法从 JS 引用）。两边不一致的后果是「界面显示能做但接口拒绝」，或者反过来——后者是个安全洞。
+// 所以这里把 JS 那份和那段 SQL 对着断言，而不是各自单测。
+const GROUPS = GROUP_ORDER
+const schemaSql = readFileSync(new URL('../supabase/schema.sql', import.meta.url), 'utf8')
+
+for (const group of GROUPS) {
+  assert(GROUP_RANK[group] !== undefined, `${group} needs a rank in shared/groups.mjs`)
+  assert(API_RANK[group] === GROUP_RANK[group], `${group} must reach the API with the same rank the UI shows`)
+  assert(GROUP_LABEL[group], `${group} needs a Chinese label, or the admin select shows a bare slug`)
+  // schema.sql 的 group_rank() 用 g::text 比较，所以每个组名都该以字符串出现在那个 case 里。
+  assert(new RegExp(`when '${group}' then ${GROUP_RANK[group]}`).test(schemaSql) || group === 'default',
+    `private.group_rank() must rank '${group}' as ${GROUP_RANK[group]} to match shared/groups.mjs`)
+}
+assert(new Set(GROUP_ORDER).size === GROUP_ORDER.length, 'GROUP_ORDER must list every group exactly once')
+assert(Object.keys(GROUP_RANK).length === GROUP_ORDER.length, 'every ranked group must be assignable from the admin select')
+// 未知组必须是 0，不是 undefined：一个将来加进枚举但忘了排名的组要无权，而不是意外获得权限。
+assert(rankOf('nonexistent') === 0 && rankOf(null) === 0 && rankOf(undefined) === 0,
+  'an unranked group must read as 0, never as undefined — undefined >= 777 is false but undefined < 111 is also false')
+assert(/else 0 end/.test(schemaSql), 'private.group_rank() must fall through to 0 for the same reason')
+
+// §6 的优先级：admin 999 > cs 888 > postsale = presale 777 > coworker 555 > read 111 > default 0
+assert(GROUP_RANK.admin > GROUP_RANK.cs && GROUP_RANK.cs > GROUP_RANK.postsale, '§6 ranks admin above cs above the single-team agents')
+assert(GROUP_RANK.presale === GROUP_RANK.postsale, 'presale and postsale share §6 priority 777')
+assert(GROUP_RANK.default === 0, 'an ordinary buyer must rank 0')
+assert(RANK.ADMIN === GROUP_RANK.admin && RANK.STAFF === GROUP_RANK.presale && RANK.MEMBER === GROUP_RANK.read,
+  'the named thresholds must line up with the ranks they are meant to name')
+
+// 编辑权限不是 rank 阈值。售前客服在 §6 里高于文案（777 > 555），但不该因此能发文章——这条如果退化成
+// rank >= 555，客服就能改站点内容，而 §2 从没给过这个权限。
+assert(isEditor('coworker') && isEditor('admin'), '文案 and 管理员 are the two groups that may publish')
+for (const group of ['presale', 'postsale', 'cs']) {
+  assert(!isEditor(group), `${group} outranks 文案 in ticket dispatch but must not be able to publish content`)
+  assert(GROUP_RANK[group] > GROUP_RANK.coworker, `${group} does outrank 文案 — which is exactly why editing cannot be a rank threshold`)
+}
+assert(!isEditor('read') && !isEditor('default'), 'neither read nor default may publish')
+assert(EDITOR_GROUPS.length === 2, 'the editor list is an enumeration, not a threshold')
+assert(/private\.is_editor\(\)/.test(schemaSql), 'schema.sql must gate posts/progress on is_editor(), not on a rank')
+assert(!/my_rank\(\)\) >= 555/.test(schemaSql), 'no policy may use 555 as an editing threshold')
+
+// §12.2：read 及以上能看全部订单，已确认是有意的。
+assert(rankOf('read') >= RANK.MEMBER, 'read must clear the order-visibility floor')
+assert(rankOf('default') < RANK.MEMBER, 'an ordinary buyer must not clear it, or every buyer sees every order')
+assert(/create policy own_orders_read[\s\S]{0,200}can_view_orders\(\)/.test(schemaSql),
+  'the orders read policy must go through can_view_orders(), which is where §12.2 is decided')
+
+// 枚举事务陷阱：alter type ... add value 之后，同一事务里不能把新值当字面量用，而 schema.sql 是整段跑的。
+// 所以三个新组名不能出现在任何 = 'xxx' 或 in ('xxx') 的比较里——只能经过 g::text。
+assert(/add value if not exists 'presale'/.test(schemaSql), 'the three new groups must be added with ALTER for pre-existing databases')
+for (const group of ['presale', 'postsale', 'cs']) {
+  const asEnumLiteral = new RegExp(`current_user_group\\(\\)\\)?\\s*(=|in\\s*\\()\\s*[^)]*'${group}'`)
+  assert(!asEnumLiteral.test(schemaSql),
+    `'${group}' must not be compared as an enum literal — same transaction as its ALTER, so Postgres refuses with "unsafe use of new value"`)
+}
+// github_team_map 是这个文件自己 seed 的，所以它的 group_name 必须是 text：写 'cs' 作为枚举字面量会在
+// 刚 ALTER 过这个类型的库上失败。user_profiles.group_name 用枚举没问题——它不在这个文件里被 seed。
+const teamMapDdl = schemaSql.slice(schemaSql.indexOf('create table if not exists public.github_team_map'))
+assert(/group_name text not null check/.test(teamMapDdl.slice(0, 400)),
+  'github_team_map.group_name must be a text column with a check constraint, not the enum, for the transaction reason')
+// 旧的 ='admin' 比较同样是被 ALTER 过的类型的字面量，必须全部换成 helper。
+assert(!/current_user_group\(\)\)\s*=\s*'admin'/.test(schemaSql), "no policy may still compare current_user_group() = 'admin'")
+
+// resolveGroup：§6 里「同时在售前和售后团队」→ cs，这不是取最高能算出来的（两个都是 777）。
+assert(resolveGroup(['presale', 'postsale']) === 'cs', 'membership of both CS teams maps to cs, per §6')
+assert(resolveGroup(['postsale', 'presale']) === 'cs', 'the order the teams come back in must not matter')
+assert(resolveGroup(['presale']) === 'presale' && resolveGroup(['postsale']) === 'postsale', 'a single CS team maps to itself')
+// cs 是 777 档内部的升级，不是一条盖过 admin 的规则：既在 devs 又在两个客服团队里的人是 admin，不是 cs。
+assert(resolveGroup(['admin', 'presale', 'postsale']) === 'admin', 'devs/testers outrank the cs promotion')
+assert(resolveGroup(['cs', 'presale']) === 'cs', 'an explicit cs team membership stands on its own')
+assert(resolveGroup(['coworker', 'presale']) === 'presale', 'the highest §6 priority wins when the cs rule does not apply')
+assert(resolveGroup(['coworker']) === 'coworker' && resolveGroup(['admin']) === 'admin', 'a lone team maps to its own group')
+assert(resolveGroup([]) === null, 'no team match must be distinguishable from a match, so the caller can fall back to read')
+assert(resolveGroup(['presale', 'presale']) === 'presale', 'a duplicated team must not change the outcome')
+
+// §6 的团队 slug 全部登记在表里，而不是硬编码在端点里——slug 是唯一无法从代码验证的部分。
+for (const [slug, group] of [['devs', 'admin'], ['testers', 'admin'], ['pre-sales', 'presale'], ['post-sales', 'postsale'], ['copywriter', 'coworker']]) {
+  assert(new RegExp(`\\('${slug}','${group}'`).test(schemaSql), `§6 maps @AetherAC/${slug} to ${group}; github_team_map must seed it`)
+}
+assert(/github_team_map/.test(schemaSql), 'the team map must be a table so a wrong slug can be fixed without a deploy')
+
+assert(loginOf({ user_metadata: { user_name: 'octocat' } }) === 'octocat', 'GitHub OAuth stores the login in user_name')
+assert(loginOf({ user_metadata: { preferred_username: 'octocat' } }) === 'octocat', 'the OIDC spelling must also be read')
+assert(loginOf({ user_metadata: {} }) === null && loginOf({}) === null && loginOf(null) === null,
+  'an account with no GitHub identity must report null rather than "undefined" as a login')
+
+let syncStatus = 0
+let syncBody = null
+const syncRes = { status(code) { syncStatus = code }, setHeader() {}, send(value) { syncBody = JSON.parse(value) } }
+const savedOrgToken = process.env.GITHUB_ORG_TOKEN
+
+// 没配 token：必须 200 + configured:false。前端登录后会无条件打这个接口，回 5xx 会在每个买家的控制台刷红。
+delete process.env.GITHUB_ORG_TOKEN
+await syncHandler({ method: 'GET', headers: {} }, syncRes)
+assert(syncStatus === 200 && syncBody?.configured === false, 'an unconfigured sync endpoint must answer 200, not an error')
+assert(/GITHUB_ORG_TOKEN/.test(syncBody.message) && /read:org/.test(syncBody.message), 'the fallback must name the variable and the scope it needs')
+
+// 配了 token 但没登录：401。这一步在构造 Supabase 客户端之前答完，所以不需要数据库凭证。
+process.env.GITHUB_ORG_TOKEN = 'ghp_smoke_not_a_real_token'
+await syncHandler({ method: 'GET', headers: {} }, syncRes)
+assert(syncStatus === 401 && syncBody?.error, 'a configured sync endpoint must still require a session')
+await syncHandler({ method: 'POST', headers: {} }, syncRes)
+assert(syncStatus === 401, 'the admin POST path must reject an unauthenticated request before reading the body')
+await syncHandler({ method: 'DELETE', headers: {} }, syncRes)
+assert(syncStatus === 405, 'only GET and POST are defined')
+
+if (savedOrgToken === undefined) delete process.env.GITHUB_ORG_TOKEN
+else process.env.GITHUB_ORG_TOKEN = savedOrgToken
+
+// requireUser 的第三参从 boolean 改成了最低 rank。旧调用方写 true 表示「只有 admin」，那个含义必须保留，
+// 否则任何漏改的调用点会静默地把接口开放给所有登录用户。
+let guardStatus = 0
+const guardRes = { status(code) { guardStatus = code }, setHeader() {}, send() {} }
+for (const need of [true, false, 0, RANK.ADMIN, RANK.STAFF, undefined]) {
+  guardStatus = 0
+  assert(await requireUser({ headers: {} }, guardRes, need) === null && guardStatus === 401,
+    `requireUser(need=${String(need)}) must reject a request with no token`)
+}
+
+console.log('Permission groups and GitHub team sync: OK')

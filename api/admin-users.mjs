@@ -1,6 +1,7 @@
-import { bodyOf, requireUser, send } from './_lib/server.mjs'
+import { bodyOf, RANK, requireUser, send } from './_lib/server.mjs'
 
-const GROUPS = ['default', 'read', 'coworker', 'admin']
+// Ordered by §6's priority, lowest first, because the admin UI renders this array as-is.
+const GROUPS = ['default', 'read', 'coworker', 'presale', 'postsale', 'cs', 'admin']
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const EVIDENCE_BUCKET = 'refund-evidence'
 const PERMANENT_BAN = '876000h'
@@ -42,7 +43,7 @@ async function purgeEvidence(db, userId) {
 async function overview(db, actorId) {
   const [authUsers, profileResult, orders, refunds] = await Promise.all([
     listAuthUsers(db),
-    db.from('user_profiles').select('user_id,email,display_name,group_name'),
+    db.from('user_profiles').select('user_id,email,display_name,group_name,github_login,github_synced_at'),
     countByUser(db, 'orders'),
     countByUser(db, 'refund_requests')
   ])
@@ -53,7 +54,8 @@ async function overview(db, actorId) {
       user_id: user.id,
       email: user.email ?? profile?.email ?? '',
       display_name: profile?.display_name ?? '',
-      github_login: user.user_metadata?.user_name ?? user.user_metadata?.preferred_username ?? '',
+      github_login: profile?.github_login || user.user_metadata?.user_name || user.user_metadata?.preferred_username || '',
+      github_synced_at: profile?.github_synced_at ?? null,
       group_name: profile?.group_name ?? 'default',
       profile_missing: !profile,
       providers: user.app_metadata?.providers ?? (user.app_metadata?.provider ? [user.app_metadata.provider] : []),
@@ -71,7 +73,7 @@ async function overview(db, actorId) {
 }
 
 export default async function handler(req, res) {
-  const session = await requireUser(req, res, true)
+  const session = await requireUser(req, res, RANK.ADMIN)
   if (!session) return
   const { user: actor, db } = session
   try {
