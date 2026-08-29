@@ -110,6 +110,10 @@ import {
   settleApproval
 } from '../api/_lib/notify.mjs'
 import { orderNoOf, requestRefund } from '../api/refund-request.mjs'
+import { approveRefund } from '../api/refund-approve.mjs'
+import { rejectRefund } from '../api/refund-reject.mjs'
+import { transferRefund } from '../api/refund-transfer.mjs'
+import { executeRefund } from '../api/refund-execute.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
@@ -1202,20 +1206,26 @@ const recorder = (results = {}) => {
     rec.tables.push(table)
     const entry = { table, op: null, payload: null, filters: {}, selected: null }
     calls.push(entry)
-    // 同一张表可以按调用顺序给不同结果（refund-request 会先查在途申请再插入），所以数组按次消费；
-    // 用完之后重复最后一个，免得每个用例都要把不关心的调用也列全。
+    // 同一张表的结果可以有三种给法：
+    //   - 一个对象：这张表的每次调用都给它
+    //   - 一个数组：按调用顺序消费（refund-request 先查在途申请再插入），用完重复最后一个
+    //   - 一个函数：拿到 entry 自己决定，用于 site_settings 这种要按 key 分别作答的
+    // 三种都需要，因为审批那条链路会在同一张表上做完全不同的几次调用。
     const slot = results[table]
-    const result = Array.isArray(slot)
-      ? (slot.length > 1 ? slot.shift() : slot[0]) ?? { data: null, error: null }
-      : slot ?? { data: null, error: null }
+    const resolveResult = () => {
+      if (typeof slot === 'function') return slot(entry) ?? { data: null, error: null }
+      if (Array.isArray(slot)) return (slot.length > 1 ? slot.shift() : slot[0]) ?? { data: null, error: null }
+      return slot ?? { data: null, error: null }
+    }
     const link = {
       eq(col, val) { entry.filters[col] = val; return link },
       select(cols) { entry.selected = cols ?? '*'; return link },
       order(col, opts) { entry.order = { col, ...opts }; return link },
       limit(n) { entry.limit = n; return link },
-      single: async () => result,
-      maybeSingle: async () => result,
-      then: (resolve, reject) => Promise.resolve(result).then(resolve, reject)
+      // 求值放在这里而不是上面：函数式给法要读 entry.filters，而那是 .eq() 之后才填好的。
+      single: async () => resolveResult(),
+      maybeSingle: async () => resolveResult(),
+      then: (resolve, reject) => Promise.resolve(resolveResult()).then(resolve, reject)
     }
     return {
       insert(payload) { entry.op = 'insert'; entry.payload = payload; return link },
@@ -1503,3 +1513,555 @@ assert(orderNoOf(RORDER) === '55555555', '订单号取 id 前 8 位')
 assert(orderNoOf(null) === '', 'id 缺失时不要渲染出 "null"')
 
 console.log('Refund requests: OK')
+
+// --- §10.3 批准退款 + §13.4 PAID → REFUND_PENDING ---------------------------------------------------
+// 这一段的核心是并发：两个管理员同时点不同按钮时，只能有一个人的决定生效。保护全在 update 的
+// .eq('status', …) 上，所以下面逐条钉住那些条件，以及「抢不到时不能继续往下写」。
+const ADMIN1 = '77777777-7777-4777-8777-777777777777'
+const pendingRefund = {
+  id: REFUND, order_id: RORDER, user_id: BUYER, status: 'pending',
+  amount_minor: 9500, currency: 'USD', reason_detail: '装不上', initiated_by: BUYER, initiator_role: 'user'
+}
+// 配置按 key 作答：二次确认默认开，自动执行默认关。
+const settings = overrides => entry => {
+  const key = entry.filters.key
+  const table = { refund_require_second_confirm: true, refund_auto_execute: false, ...overrides }
+  return { data: key in table ? { value: { value: table[key] } } : null, error: null }
+}
+const approveDb = (opts = {}) => recorder({
+  refund_requests: [
+    { data: opts.refund === undefined ? pendingRefund : opts.refund, error: null },
+    { data: opts.moved === 0 ? [] : [{ id: REFUND, status: 'approved' }], error: null }
+  ],
+  orders: [
+    { data: opts.order === undefined ? { ...paidRow, status: 'paid' } : opts.order, error: null },
+    opts.orderMoveError
+      ? { data: null, error: { message: 'boom' } }
+      : { data: opts.orderMoved === 0 ? [] : [{ id: RORDER }], error: null }
+  ],
+  site_settings: settings(opts.settings),
+  notifications: { data: [{ id: 'n1' }], error: null }
+})
+
+let adb = approveDb()
+let ok = await approveRefund(adb, { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+assert(ok.status === 200, '管理员批准应成功')
+assert(ok.body.status === 'approved' && ok.body.order_status === 'refund_pending', '§13.4 的两个状态')
+assert(ok.body.amount_minor === 9500, '没改金额时沿用申请上的金额')
+let refundUpd = adb.calls.find(c => c.table === 'refund_requests' && c.op === 'update')
+assert(refundUpd.filters.status === 'pending', '申请的 update 必须要求它还在待审批——这是并发保护')
+assert(refundUpd.filters.id === REFUND, '只动这一条申请')
+assert(refundUpd.payload.decided_by === ADMIN1 && refundUpd.payload.decided_at, '记下是谁什么时候批的')
+let orderUpd = adb.calls.find(c => c.table === 'orders' && c.op === 'update')
+assert(orderUpd.filters.status === 'paid', '订单的 update 必须要求它还是已支付——§13.1')
+assert(orderUpd.payload.status === 'refund_pending', '订单进退款中')
+assert(!('paid_amount_minor' in orderUpd.payload) && !('amount_minor' in orderUpd.payload),
+  '批准不该动订单金额——那会让实付金额和支付渠道的记录不一致')
+// 状态日志要记成 §13.4 要求的那条边。
+const statusLog = adb.calls.find(c => c.table === 'order_status_log').payload
+assert(statusLog.from_status === 'paid' && statusLog.to_status === 'refund_pending', 'PAID → REFUND_PENDING')
+assert(statusLog.source === 'admin', '来源是管理员，不是 system')
+
+// 只有管理员能批。这里用名单而不是 rank，所以逐个组试一遍。
+for (const group of ['cs', 'postsale', 'presale', 'coworker', 'read', 'default']) {
+  const answer = await approveRefund(approveDb(), { userId: ADMIN1, group }, { refund_id: REFUND, confirm: true })
+  assert(answer.status === 403, `${group} 不能批准退款`)
+}
+// 权限要在读库之前判掉，否则一个无权的人也能靠答复差异问出申请是否存在。
+const early = approveDb()
+await approveRefund(early, { userId: ADMIN1, group: 'cs' }, { refund_id: REFUND, confirm: true })
+assert(early.calls.length === 0, '无权时不该产生任何数据库调用')
+
+// §14 的强制二次确认：开着时缺 confirm 要拒，而且不能已经写过任何东西。
+const unconfirmed = approveDb()
+const needsConfirmAnswer = await approveRefund(unconfirmed, { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND })
+assert(needsConfirmAnswer.status === 428 && needsConfirmAnswer.body.requires_confirm === true, '缺二次确认应拒')
+assert(!unconfirmed.calls.some(c => c.op === 'update'), '被二次确认拦下时不能已经改了状态')
+for (const bad of [false, 'true', 1, null, undefined]) {
+  const answer = await approveRefund(approveDb(), { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, confirm: bad })
+  assert(answer.status === 428, `confirm=${JSON.stringify(bad)} 不算确认——只有布尔真才算`)
+}
+// 关掉开关时不需要 confirm。
+const noConfirmNeeded = await approveRefund(approveDb({ settings: { refund_require_second_confirm: false } }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND })
+assert(noConfirmNeeded.status === 200, '关掉开关后可以直接批准')
+
+// 申请状态不对：只有待审批和已转交能进已批准（§10.4）。
+for (const status of ['approved', 'rejected', 'executing', 'completed', 'failed']) {
+  const answer = await approveRefund(approveDb({ refund: { ...pendingRefund, status } }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+  assert(answer.status === 409, `${status} 的申请不能再批准`)
+}
+const fromTransferred = await approveRefund(
+  recorder({
+    refund_requests: [{ data: { ...pendingRefund, status: 'transferred' }, error: null },
+      { data: [{ id: REFUND }], error: null }],
+    orders: [{ data: { ...paidRow, status: 'paid' }, error: null }, { data: [{ id: RORDER }], error: null }],
+    site_settings: settings(), notifications: { data: [{ id: 'n1' }], error: null }
+  }), { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+assert(fromTransferred.status === 200, '转交后的申请可以被接手的人批准')
+
+// 订单状态不对：§13.1 只允许从 PAID 进退款中。
+for (const status of ['pending', 'failed', 'cancelled', 'refund_pending', 'refunded']) {
+  const answer = await approveRefund(approveDb({ order: { ...paidRow, status } }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+  assert(answer.status === 409, `订单是 ${status} 时不能批准退款`)
+}
+// 订单状态不对时不能已经把申请改成已批准——那会留下一条永远推不动的申请。
+const badOrder = approveDb({ order: { ...paidRow, status: 'refunded' } })
+await approveRefund(badOrder, { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+assert(!badOrder.calls.some(c => c.table === 'refund_requests' && c.op === 'update'),
+  '订单不能迁移时，申请也不该被改动')
+
+// 找不到申请 / 找不到订单 / 申请号格式不对。
+const missingRefund = await approveRefund(approveDb({ refund: null }), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, confirm: true })
+assert(missingRefund.status === 404, '申请不存在答 404')
+const missingOrder = await approveRefund(approveDb({ order: null }), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, confirm: true })
+assert(missingOrder.status === 404, '订单不存在答 404')
+for (const badId of ['', null, 'nope', `${REFUND}x`]) {
+  const answer = await approveRefund(approveDb(), { userId: ADMIN1, group: 'admin' },
+    { refund_id: badId, confirm: true })
+  assert(answer.status === 400, `申请号 ${JSON.stringify(badId)} 答 400`)
+}
+
+// 抢不到申请：另一个管理员先处理了。这时候绝对不能继续往下改订单。
+const lost = approveDb({ moved: 0 })
+const lostAnswer = await approveRefund(lost, { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+assert(lostAnswer.status === 409 && lostAnswer.body.error.includes('其他管理员'), '抢不到时告诉他谁快了一步')
+assert(!lost.calls.some(c => c.table === 'orders' && c.op === 'update'),
+  '抢不到申请就不能动订单——否则订单进了退款中却没有在途申请能推下去')
+assert(!lost.tables.includes('order_status_log'), '也不该留下一条没发生的状态变更')
+
+// 反过来：申请抢到了但订单没动。批准已经生效，所以不能报失败，但要如实说订单没动，并留痕。
+const orderStuck = approveDb({ orderMoved: 0 })
+const stuckAnswer = await approveRefund(orderStuck, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, confirm: true })
+assert(stuckAnswer.status === 200 && stuckAnswer.body.order_moved === false, '订单没动要如实报告')
+assert(stuckAnswer.body.order_status === 'paid', '订单状态如实返回原值，不能假报 refund_pending')
+assert(!orderStuck.tables.includes('order_status_log'), '没发生的迁移不写状态日志')
+// 按 action 断言而不是数条数：数量会随着别处多写一条审计（比如 settleApproval 自己那条）
+// 一起变，改一处要跟着改测试；而这里真正要保证的是「订单没动」这件事本身留下了痕迹。
+const stuckActions = orderStuck.calls
+  .filter(c => c.table === 'refund_audit_log').map(c => c.payload?.action)
+assert(stuckActions.includes('approve'), '批准本身要留痕')
+assert(stuckActions.includes('order_move_failed'),
+  '订单没动要单独留一条审计——否则事后只能看到「批准了」，看不出订单为什么还在 PAID')
+const orderBroken = approveDb({ orderMoveError: true })
+const brokenAnswer = await approveRefund(orderBroken, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, confirm: true })
+assert(brokenAnswer.status === 200 && brokenAnswer.body.order_moved === false, '订单写入报错同样如实报告')
+
+// §10.2：批准时可以改金额，上限仍是实付。
+const reduced = approveDb()
+const reducedAnswer = await approveRefund(reduced, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, confirm: true, amount_minor: 5000 })
+assert(reducedAnswer.body.amount_minor === 5000, '批准时改的金额要生效')
+assert(reduced.calls.find(c => c.table === 'refund_requests' && c.op === 'update').payload.amount_minor === 5000,
+  '改后的金额要落库，否则执行时按旧金额退')
+const overCap = await approveRefund(approveDb(), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, confirm: true, amount_minor: 9501 })
+assert(overCap.status === 400, '批准时也不能超过实付金额')
+
+// §9.6：那条审批通知要被收掉置顶。
+const settled2 = adb.calls.find(c => c.table === 'notifications' && c.op === 'update')
+assert(settled2 && settled2.payload.state === 'approved' && settled2.payload.pinned === false,
+  '审批通知要留下结果并停止置顶')
+// 通知回写失败不能让批准回滚——批准已经生效了。
+const notifBroken = recorder({
+  refund_requests: [{ data: pendingRefund, error: null }, { data: [{ id: REFUND }], error: null }],
+  orders: [{ data: { ...paidRow, status: 'paid' }, error: null }, { data: [{ id: RORDER }], error: null }],
+  site_settings: settings(), notifications: { data: null, error: { message: 'boom' } }
+})
+const stillOk = await approveRefund(notifBroken, { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+assert(stillOk.status === 200, '通知回写失败不影响批准结果')
+
+// §14 的 refund_auto_execute 默认关：§13.4 要求「退款成功」是人手点的。
+assert(ok.body.auto_execute === false, '自动执行默认关闭')
+const autoOn = await approveRefund(approveDb({ settings: { refund_auto_execute: true } }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, confirm: true })
+assert(autoOn.body.auto_execute === true, '开关打开时如实告知调用方')
+
+console.log('Refund approval: OK')
+
+// ---------------------------------------------------------------------------
+// §10.3 的拒绝，以及 §13.5 那条形状特别的日志。
+//
+// 拒绝的要点和批准正好相反：订单一个字都不能改，但订单变更记录里必须多一条 PAID → PAID。
+// 这条日志看着像噪音，实际是用户在订单页上唯一能看到「我提过、被拒了、为什么」的地方。
+const rejectDb = (opts = {}) => recorder({
+  refund_requests: [
+    { data: opts.refund === undefined ? pendingRefund : opts.refund, error: null },
+    { data: opts.moved === 0 ? [] : [{ id: REFUND, status: 'rejected' }], error: null }
+  ],
+  orders: { data: opts.order === undefined ? { ...paidRow, status: 'paid' } : opts.order, error: null },
+  site_settings: settings(opts.settings),
+  notifications: opts.notifyError
+    ? { data: null, error: { message: 'boom' } }
+    : { data: [{ id: 'n2' }], error: null }
+})
+
+const rdb2 = rejectDb()
+const rejected = await rejectRefund(rdb2, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, note: '证据不足，请补一张报错截图' })
+assert(rejected.status === 200 && rejected.body.status === 'rejected', '管理员可以拒绝')
+assert(rejected.body.order_status === 'paid', '拒绝之后订单还是已支付')
+assert(!rdb2.calls.some(c => c.table === 'orders' && c.op === 'update'),
+  '拒绝不能改订单——§13.5 只要求记一条日志，不是一次迁移')
+const rejLog = rdb2.calls.find(c => c.table === 'order_status_log').payload
+assert(rejLog.from_status === 'paid' && rejLog.to_status === 'paid', '§13.5：写成 PAID → PAID')
+assert(rejLog.note.includes('证据不足'), '理由要落到订单变更记录里，否则用户看不到为什么被拒')
+assert(rejLog.source === 'admin', '来源是管理员')
+const rejUpd = rdb2.calls.find(c => c.table === 'refund_requests' && c.op === 'update')
+assert(rejUpd.filters.status === 'pending', '拒绝同样要求申请还在待审批——并发保护')
+assert(rejUpd.payload.decision_note.includes('证据不足') && rejUpd.payload.decided_by === ADMIN1,
+  '决定和决定人一起落库')
+const rejAudit = rdb2.calls.filter(c => c.table === 'refund_audit_log').map(c => c.payload.action)
+assert(rejAudit.includes('reject'), '拒绝要留痕')
+
+// 理由必填，而且空白字符不算填。
+for (const noteMissing of [undefined, null, '', '   ', '\n\t']) {
+  const db = rejectDb()
+  const answer = await rejectRefund(db, { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, note: noteMissing })
+  assert(answer.status === 400, `note=${JSON.stringify(noteMissing)} 应被拒——§10.3 要求必须填理由`)
+  assert(!db.calls.some(c => c.op === 'update'), '理由没填时不能已经改了状态')
+}
+const tooLongNote = await rejectRefund(rejectDb(), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, note: 'x'.repeat(2001) })
+assert(tooLongNote.status === 400, '理由过长应拒')
+
+// 拒绝不设二次确认门：它是可逆的（用户能重提），确认框要留给不可逆的操作。
+const rejectNoConfirm = await rejectRefund(rejectDb(), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, note: '不符合退款条件' })
+assert(rejectNoConfirm.status === 200, '拒绝不需要 confirm')
+
+for (const group of ['cs', 'postsale', 'presale', 'coworker', 'read', 'default']) {
+  const db = rejectDb()
+  const answer = await rejectRefund(db, { userId: ADMIN1, group }, { refund_id: REFUND, note: '不行' })
+  assert(answer.status === 403, `${group} 不能拒绝退款`)
+  assert(db.calls.length === 0, `${group} 被拒时不该产生任何数据库调用`)
+}
+
+// 抢不到就不能继续往下写：拒绝日志和通知都不该发出去。
+const rejectLost = rejectDb({ moved: 0 })
+const rejectLostAnswer = await rejectRefund(rejectLost, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, note: '重复申请' })
+assert(rejectLostAnswer.status === 409, '抢不到时告诉他谁快了一步')
+assert(!rejectLost.tables.includes('order_status_log'), '没拒成就不该留下一条拒绝日志')
+assert(!rejectLost.tables.includes('notifications'), '也不该通知用户一次没发生的拒绝')
+
+for (const status of ['approved', 'rejected', 'executing', 'completed', 'failed']) {
+  const answer = await rejectRefund(rejectDb({ refund: { ...pendingRefund, status } }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, note: '不行' })
+  assert(answer.status === 409, `${status} 的申请不能再拒绝`)
+}
+
+// §14 的 refund_auto_notify：关掉时静默跳过，但拒绝本身照样成立。
+const quietReject = rejectDb({ settings: { refund_auto_notify: false } })
+const quietAnswer = await rejectRefund(quietReject, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, note: '不符合条件' })
+assert(quietAnswer.status === 200 && quietAnswer.body.notified === false, '开关关掉时如实说没通知')
+assert(!quietReject.calls.some(c => c.table === 'notifications' && c.op === 'insert'),
+  '关掉之后确实没给用户写站内信')
+// 开关只管给用户的那条，不该顺手把审批通知的回收也关掉——否则那条带按钮的通知永远置顶在
+// 全体管理员的收件箱里，而它对应的申请已经被拒了。
+assert(quietReject.calls.some(c => c.table === 'notifications' && c.op === 'update'),
+  '审批通知照样要收掉：settleApproval 走 update，和 refund_auto_notify 无关')
+// 通知写不进去也不能让拒绝失败——拒绝已经落库了。
+const rejectNotifyBroken = await rejectRefund(rejectDb({ notifyError: true }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, note: '不符合条件' })
+assert(rejectNotifyBroken.status === 200 && rejectNotifyBroken.body.notified === false,
+  '通知失败时拒绝仍然成立，只是如实报告没通知到')
+
+console.log('Refund rejection: OK')
+
+// ---------------------------------------------------------------------------
+// §10.3 的转交。
+//
+// 这里最要紧的一条是「转交对象必须是管理员」：转给一个没有审批权的人，等于把申请扔进一个没人能
+// 处理的地方，而它同时已经从原管理员的待办里消失了。那种卡死要等 48 小时超时才有人发现。
+const ADMIN2 = '88888888-8888-4888-8888-888888888888'
+const transferDb = (opts = {}) => recorder({
+  refund_requests: [
+    { data: opts.refund === undefined ? pendingRefund : opts.refund, error: null },
+    { data: opts.moved === 0 ? [] : [{ id: REFUND, status: 'pending' }], error: null }
+  ],
+  orders: { data: { ...paidRow, status: 'paid' }, error: null },
+  user_profiles: opts.receiverError
+    ? { data: null, error: { message: 'boom' } }
+    : { data: opts.receiver === undefined
+      ? { user_id: ADMIN2, display_name: '老王', group_name: 'admin' }
+      : opts.receiver, error: null },
+  site_settings: settings(opts.settings),
+  notifications: opts.notifyError
+    ? { data: null, error: { message: 'boom' } }
+    : { data: [{ id: 'n3' }], error: null }
+})
+
+const tdb = transferDb()
+const transferred = await transferRefund(tdb, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, transfer_to: ADMIN2, note: '这单涉及链上退款，交给你判断' })
+assert(transferred.status === 200, '管理员可以转交')
+// 落库状态是 pending 而不是 transferred：接手人要看到一条能直接审批的申请。
+assert(transferred.body.status === 'pending', '转交后回到待审批，否则接手人没有可点的按钮')
+assert(transferred.body.transferred_to === ADMIN2, '如实返回转给了谁')
+const tUpd = tdb.calls.find(c => c.table === 'refund_requests' && c.op === 'update')
+assert(tUpd.payload.status === 'pending', 'update 直接落 pending')
+assert(tUpd.payload.transferred_to === ADMIN2, 'transferred_to 要落库——§10.6 的看板要能回答等谁')
+assert(tUpd.filters.status === 'pending', '并发保护：要求申请还在原状态')
+// 审计里两笔都要有，否则最后一笔和库里的状态不一致，而 §10.8 的导出拿审计当事实来源。
+const tAudit = tdb.calls.filter(c => c.table === 'refund_audit_log').map(c => c.payload.action)
+assert(tAudit.includes('transfer'), '转交本身要留痕')
+assert(tAudit.includes('reopen_after_transfer'),
+  '回到 pending 也要留痕——否则审计的最后一笔是 transferred，和库里的 pending 对不上')
+const tNotif = tdb.calls.find(c => c.table === 'notifications' && c.op === 'insert').payload
+assert(tNotif.recipient_id === ADMIN2 && tNotif.scope === 'user',
+  '转交通知只发给接手人：再广播给全体管理员的话，转交和不转交没有区别')
+assert(tNotif.state === 'pending' && tNotif.actions.length === 2, '接手人拿到批准和拒绝两个按钮')
+assert(!tNotif.actions.some(a => a.type === 'transfer_refund'),
+  '不给「再转交」按钮——48 小时超时是按申请算的，转多少次都不会重置')
+assert(tNotif.body.includes('装不上'), '原始退款原因要带给接手人，否则他要从零判断')
+// §9.6：这条带审批按钮的通知必须置顶高亮，而且这是 insertNotification 算的，不靠调用方传。
+assert(tNotif.pinned === true && tNotif.highlighted === true,
+  '§9.6 强制置顶高亮——之前 presentationFor 只有测试在调，插入路径漏了')
+
+// 转交对象必须存在、必须是管理员。
+const notAdmin = await transferRefund(transferDb({
+  receiver: { user_id: ADMIN2, display_name: '客服小李', group_name: 'cs' }
+}), { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+assert(notAdmin.status === 400 && notAdmin.body.error.includes('管理员'),
+  '不能转给非管理员——那条申请会卡在没人有权处理的地方')
+const noReceiver = await transferRefund(transferDb({ receiver: null }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+assert(noReceiver.status === 404, '转交对象不存在应拒')
+const receiverBroken = await transferRefund(transferDb({ receiverError: true }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+assert(receiverBroken.status === 500, '读不到转交对象时不能当成「不是管理员」也不能放行')
+// 校验没过时申请一个字都不能改。
+const rejectedTransfer = transferDb({ receiver: { user_id: ADMIN2, display_name: 'x', group_name: 'read' } })
+await transferRefund(rejectedTransfer, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+assert(!rejectedTransfer.calls.some(c => c.op === 'update'), '转交对象不合格时不能已经改了申请')
+
+// transfer_to 的形状。
+for (const badTarget of [undefined, null, '', 'not-a-uuid', 123, {}]) {
+  const db = transferDb()
+  const answer = await transferRefund(db, { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, transfer_to: badTarget, note: '交给你' })
+  assert(answer.status === 400, `transfer_to=${JSON.stringify(badTarget)} 应拒`)
+  assert(db.calls.length === 0, '目标不合法时不该查库')
+}
+const selfTransfer = await transferRefund(transferDb(), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, transfer_to: ADMIN1, note: '交给我自己' })
+assert(selfTransfer.status === 400 && selfTransfer.body.error.includes('自己'),
+  '转给自己是空操作，但会把自己的待办清掉再建一个，直接拒掉')
+
+// 说明必填：接手人需要知道为什么轮到他。
+for (const noteMissing of [undefined, null, '', '  ']) {
+  const answer = await transferRefund(transferDb(), { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, transfer_to: ADMIN2, note: noteMissing })
+  assert(answer.status === 400, `转交说明 ${JSON.stringify(noteMissing)} 应拒`)
+}
+
+for (const group of ['cs', 'postsale', 'presale', 'coworker', 'read', 'default']) {
+  const db = transferDb()
+  const answer = await transferRefund(db, { userId: ADMIN1, group },
+    { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+  assert(answer.status === 403, `${group} 不能转交退款`)
+  assert(db.calls.length === 0, `${group} 被拒时不该产生任何数据库调用`)
+}
+
+const transferLost = transferDb({ moved: 0 })
+const transferLostAnswer = await transferRefund(transferLost, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+assert(transferLostAnswer.status === 409, '抢不到时告诉他谁快了一步')
+assert(!transferLost.calls.some(c => c.table === 'notifications' && c.op === 'insert'),
+  '抢不到就不能给接手人发通知——否则他收到一条已经被别人处理掉的申请')
+
+for (const status of ['approved', 'rejected', 'executing', 'completed', 'failed']) {
+  const answer = await transferRefund(transferDb({ refund: { ...pendingRefund, status } }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+  assert(answer.status === 409, `${status} 的申请不能转交`)
+}
+
+// 通知发不出去不回滚：申请已经回到 pending 并记了 transferred_to，看板和超时提醒都还找得到它。
+const transferNotifyBroken = await transferRefund(transferDb({ notifyError: true }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, transfer_to: ADMIN2, note: '交给你' })
+assert(transferNotifyBroken.status === 200 && transferNotifyBroken.body.notified === false,
+  '通知失败时转交仍然成立，只是如实报告没通知到')
+
+console.log('Refund transfer: OK')
+
+// ---------------------------------------------------------------------------
+// §13.4 的「退款成功」和状态图里的「无法退款」。
+//
+// 这一段钉的是钱的账实一致：订单和申请必须一起动，中间任何一步失败都不能留下「订单已退款、申请
+// 却永远不会完结」或者反过来的组合。所以下面既测正常路径，也逐个测每一步失败时留下的状态。
+const approvedRefund = { ...pendingRefund, status: 'approved', amount_minor: 9500 }
+const execDb = (opts = {}) => recorder({
+  refund_requests: [
+    { data: opts.refund === undefined ? approvedRefund : opts.refund, error: null },
+    // 第一次 update 是抢 executing，第二次是落终态。
+    { data: opts.claimed === 0 ? [] : [{ id: REFUND, status: 'executing' }], error: null },
+    { data: opts.settled === 0 ? [] : [{ id: REFUND }], error: null }
+  ],
+  orders: [
+    { data: opts.order === undefined ? { ...paidRow, status: 'refund_pending' } : opts.order, error: null },
+    opts.orderMoveError
+      ? { data: null, error: { message: 'boom' } }
+      : { data: opts.orderMoved === 0 ? [] : [{ id: RORDER }], error: null }
+  ],
+  site_settings: settings(opts.settings),
+  notifications: opts.notifyError
+    ? { data: null, error: { message: 'boom' } }
+    : { data: [{ id: 'n4' }], error: null }
+})
+
+const edb = execDb()
+const executed = await executeRefund(edb, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(executed.status === 200, '管理员可以标记退款成功')
+assert(executed.body.status === 'completed' && executed.body.order_status === 'refunded', '§13.4 的两个终态')
+assert(executed.body.can_execute === false, '登记之后按钮消失')
+const execUpds = edb.calls.filter(c => c.table === 'refund_requests' && c.op === 'update')
+assert(execUpds.length === 2, '先抢 executing 再落终态，两次 update')
+assert(execUpds[0].filters.status === 'approved' && execUpds[0].payload.status === 'executing',
+  '第一步从已批准抢到执行中——这是并发保护')
+assert(execUpds[1].filters.status === 'executing' && execUpds[1].payload.status === 'completed',
+  '第二步从执行中落已完成')
+const execOrderUpd = edb.calls.find(c => c.table === 'orders' && c.op === 'update')
+assert(execOrderUpd.filters.status === 'refund_pending', '订单的 update 要求它还在退款中')
+assert(execOrderUpd.payload.status === 'refunded', '订单进已退款')
+assert(!('paid_amount_minor' in execOrderUpd.payload), '登记退款不改订单金额——账上实付过多少就是多少')
+const execLog = edb.calls.find(c => c.table === 'order_status_log').payload
+assert(execLog.from_status === 'refund_pending' && execLog.to_status === 'refunded', 'REFUND_PENDING → REFUNDED')
+const execAudit = edb.calls.filter(c => c.table === 'refund_audit_log').map(c => c.payload.action)
+assert(execAudit.includes('execute_claim') && execAudit.includes('execute_success'),
+  '抢占和执行结果各留一条痕迹')
+const doneNotif = edb.calls.find(c => c.table === 'notifications' && c.op === 'insert').payload
+assert(doneNotif.recipient_id === BUYER && doneNotif.kind === 'refund', '退款结果通知发给下单的人')
+assert(doneNotif.title.includes('退款已完成'), '成功时的标题')
+assert(doneNotif.pinned === false, '这条只是告知，不该占住置顶位')
+
+// 「无法退款」：订单回到 PAID，申请落 failed，而 §10.7 允许 failed 再回 executing，所以不是死路。
+const failedOut = execDb()
+const failedAnswer = await executeRefund(failedOut, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'failed', note: '渠道不支持退款，已改为人工转账', confirm: true })
+assert(failedAnswer.status === 200 && failedAnswer.body.status === 'failed', '可以标记无法退款')
+assert(failedAnswer.body.order_status === 'paid', '无法退款时订单退回已支付')
+const failedOrderUpd = failedOut.calls.find(c => c.table === 'orders' && c.op === 'update')
+assert(failedOrderUpd.payload.status === 'paid', 'REFUND_PENDING → PAID')
+const failedNotif = failedOut.calls.find(c => c.table === 'notifications' && c.op === 'insert').payload
+assert(failedNotif.title.includes('退款未成功'), '失败时的标题')
+assert(failedNotif.body.includes('渠道不支持'), '失败原因要写给用户，否则他只看到一句「未成功」')
+// 失败原因必填，成功备注不必填。
+for (const noteMissing of [undefined, null, '', '  ']) {
+  const answer = await executeRefund(execDb(), { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, outcome: 'failed', note: noteMissing, confirm: true })
+  assert(answer.status === 400, `无法退款时 note=${JSON.stringify(noteMissing)} 应拒`)
+}
+const noNoteSuccess = await executeRefund(execDb(), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(noNoteSuccess.status === 200, '标记成功不强制写备注')
+
+// outcome 的形状。
+for (const badOutcome of [undefined, null, '', 'ok', 'SUCCESS', 'completed', 1, {}]) {
+  const db = execDb()
+  const answer = await executeRefund(db, { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, outcome: badOutcome, confirm: true })
+  assert(answer.status === 400, `outcome=${JSON.stringify(badOutcome)} 应拒`)
+  assert(db.calls.length === 0, 'outcome 不合法时不该查库')
+}
+
+// §14 的强制二次确认在这里必须过——这是不可逆操作，而浏览器弹框拦不住直接调接口的人。
+const execConfirm = execDb()
+const needsConfirm2 = await executeRefund(execConfirm, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'success' })
+assert(needsConfirm2.status === 428 && needsConfirm2.body.requires_confirm === true, '缺二次确认应拒')
+assert(!execConfirm.calls.some(c => c.op === 'update'), '被确认拦下时一个字都没改')
+for (const badConfirm of [false, 'true', 1, null]) {
+  const answer = await executeRefund(execDb(), { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, outcome: 'success', confirm: badConfirm })
+  assert(answer.status === 428, `confirm=${JSON.stringify(badConfirm)} 不算确认`)
+}
+const noConfirm2 = await executeRefund(execDb({ settings: { refund_require_second_confirm: false } }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, outcome: 'success' })
+assert(noConfirm2.status === 200, '关掉开关后可以直接登记')
+
+// 申请必须已批准。没批准就能登记退款成功，等于跳过整个审批流程。
+for (const status of ['pending', 'transferred', 'rejected', 'completed']) {
+  const answer = await executeRefund(execDb({ refund: { ...approvedRefund, status } }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, outcome: 'success', confirm: true })
+  assert(answer.status === 409, `${status} 的申请不能直接登记退款结果`)
+}
+// 上次失败的可以重试（§10.7 的 failed → executing）。
+const retried = await executeRefund(execDb({ refund: { ...approvedRefund, status: 'failed' } }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(retried.status === 200, '上次失败的退款可以重试，而不是让人另开一条申请丢掉审计链')
+
+// 订单必须在 REFUND_PENDING。这一条不能靠「申请是 approved」推出来：批准时改订单那一步可能失败过，
+// 那时申请已批准而订单还是 PAID，此时登记成功会把一笔没进退款流程的订单直接改成已退款。
+for (const pendingOrder of ['paid', 'pending', 'refunded', 'cancelled', 'failed']) {
+  const db = execDb({ order: { ...paidRow, status: pendingOrder } })
+  const answer = await executeRefund(db, { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, outcome: 'success', confirm: true })
+  assert(answer.status === 409, `订单在 ${pendingOrder} 时不能登记退款结果`)
+  assert(!db.calls.some(c => c.op === 'update'), `订单在 ${pendingOrder} 时不能已经改了申请`)
+}
+
+// 抢不到 executing：别人正在处理，什么都不能动。
+const stuckExec = execDb({ claimed: 0 })
+const stuckExecAnswer = await executeRefund(stuckExec, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(stuckExecAnswer.status === 409, '抢不到时告诉他有人在处理')
+assert(!stuckExec.calls.some(c => c.table === 'orders' && c.op === 'update'),
+  '抢不到就不能动订单——否则订单变成已退款而这条申请从没执行过')
+assert(!stuckExec.tables.includes('order_status_log'), '也不留状态日志')
+
+// 抢到了但订单没改成：申请必须留在 executing，不能推到终态。终态 + 订单还在退款中，等于一笔钱
+// 永久对不上而且没有入口能修。
+for (const opts of [{ orderMoved: 0 }, { orderMoveError: true }]) {
+  const db = execDb(opts)
+  const answer = await executeRefund(db, { userId: ADMIN1, group: 'admin' },
+    { refund_id: REFUND, outcome: 'success', confirm: true })
+  assert(answer.status === 409, '订单没改成要报失败，因为这次登记没有生效')
+  assert(answer.body.status === 'executing', '申请留在执行中，按钮还在，可以再点一次')
+  const upds = db.calls.filter(c => c.table === 'refund_requests' && c.op === 'update')
+  assert(upds.length === 1, '只有抢占那一次 update，不能把申请推到终态')
+  assert(!db.tables.includes('order_status_log'), '订单没动就不写状态日志')
+  assert(!db.calls.some(c => c.table === 'notifications' && c.op === 'insert'),
+    '不能通知用户一次没有生效的退款')
+  assert(db.calls.filter(c => c.table === 'refund_audit_log')
+    .some(c => c.payload.action === 'execute_order_move_failed'), '这次失败要留痕')
+}
+
+// 订单改完了但申请落终态失败：账面是对的（订单已退款），申请停在 executing 由人工推完。
+const halfSettled = await executeRefund(execDb({ settled: 0 }), { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(halfSettled.status === 200 && halfSettled.body.order_status === 'refunded',
+  '订单已经改完，这次登记是生效的')
+assert(halfSettled.body.status === 'executing', '申请没落终态就如实说它还在执行中')
+
+for (const group of ['cs', 'postsale', 'presale', 'coworker', 'read', 'default']) {
+  const db = execDb()
+  const answer = await executeRefund(db, { userId: ADMIN1, group },
+    { refund_id: REFUND, outcome: 'success', confirm: true })
+  assert(answer.status === 403, `${group} 不能标记退款结果`)
+  assert(db.calls.length === 0, `${group} 被拒时不该产生任何数据库调用`)
+}
+
+// §14 的 refund_auto_notify 关掉时静默跳过，但登记本身成立。
+const quietExec = execDb({ settings: { refund_auto_notify: false } })
+const quietExecAnswer = await executeRefund(quietExec, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(quietExecAnswer.status === 200 && quietExecAnswer.body.notified === false, '如实说没通知')
+assert(!quietExec.calls.some(c => c.table === 'notifications' && c.op === 'insert'), '确实没发')
+const execNotifyBroken = await executeRefund(execDb({ notifyError: true }),
+  { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(execNotifyBroken.status === 200 && execNotifyBroken.body.notified === false,
+  '通知失败不能让一笔已经登记的退款报失败——那会让人再退一次')
+
+console.log('Refund execution: OK')

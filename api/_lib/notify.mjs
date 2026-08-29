@@ -13,18 +13,24 @@
  * 只有站内信是例外——§10.3 的审批通知就是审批流程本身的载体，插不进去等于审批请求没发出去。
  */
 
-import { validateNotification } from '../../shared/notifications.mjs'
+import { presentationFor, validateNotification } from '../../shared/notifications.mjs'
 
 /**
  * 插入一条站内信，返回插入后的行。
  *
  * 提交前先过 validateNotification，因为数据库那边的 check 约束只能报出约束名。同一份校验规则在
  * 浏览器里也跑一遍（管理员发通知的表单），所以两边给出的是同一句中文。
+ *
+ * pinned/highlighted 在这里算，不接受调用方传入。§9.6 要求待审批的站内信强制置顶高亮，而
+ * presentationFor 之前只有测试在调用——插入路径一条都没调，于是每条审批通知都带着 schema 的默认
+ * 值 false 落库，「强制置顶」从来没生效过。让调用方自己设两个布尔的失败方式就是这样：不报错，
+ * 只是那条等着人批的退款躺在列表中间。所以放在唯一的插入口算，并覆盖掉传进来的值。
  */
 export async function insertNotification(db, notification) {
   const check = validateNotification(notification)
   if (!check.ok) throw new Error(`站内信不合法：${check.error}`)
-  const { data, error } = await db.from('notifications').insert(notification).select().single()
+  const row = { ...notification, ...presentationFor(notification) }
+  const { data, error } = await db.from('notifications').insert(row).select().single()
   if (error) throw new Error(`站内信写入失败：${error.message}`)
   return data
 }
@@ -121,14 +127,27 @@ export async function settleApproval(db, refundId, state, actorId) {
 /**
  * 给用户发一条订单相关的通知，附一个跳转按钮。
  *
- * §14 有一个 refund_auto_notify 开关，所以这里先读配置。开关关掉时静默跳过而不是报错——那是
- * 管理员有意关的，不是故障。
+ * 这里不读任何开关。§14 的 refund_auto_notify 只管「退款状态变化」，而这个函数也用来发结账、
+ * 支付成功之类的通知——让一个退款开关顺手静默掉支付确认，是那种要等到用户问「为什么没收到收据」
+ * 才会发现的错。开关的判断放在 notifyRefundUser 里，离它管的那件事最近。
  */
 export async function notifyUser(db, userId, { kind = 'order', title, body, orderId = null, refundId = null, actions = [] }) {
   return insertNotification(db, {
     kind, scope: 'user', recipient_id: userId, title, body,
     order_id: orderId, refund_id: refundId, actions, state: null
   })
+}
+
+/**
+ * §14 的 refund_auto_notify：退款状态变化是否自动给用户发站内信。
+ *
+ * 关掉时静默跳过并返回 null，而不是报错——那是管理员有意关的，不是故障。调用方据此决定要不要在
+ * 响应里说「已通知用户」。注意这个开关管不到 §10.3 那条给管理员的审批通知：那条通知就是审批请求
+ * 本身，关掉它等于关掉审批流程，而这个开关的描述说的是「给用户发」。
+ */
+export async function notifyRefundUser(db, userId, payload) {
+  if (!(await setting(db, 'refund_auto_notify', true))) return null
+  return insertNotification(db, payload && payload.kind ? payload : { ...payload, kind: 'refund' })
 }
 
 /** 读一个配置项。缺键返回 fallback，而不是让调用方拿到 undefined 再各自猜默认值。 */
