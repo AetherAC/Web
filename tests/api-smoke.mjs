@@ -26,6 +26,14 @@ import {
 import { preloadMarkdown, renderMarkdown, renderMarkdownInline } from '../docs/.vitepress/theme/markdown.ts'
 import cancelHandler, { cancelPendingOrder } from '../api/cancel-order.mjs'
 import { orderPath } from '../docs/.vitepress/theme/routes.ts'
+import telemetryHandler from '../api/telemetry.mjs'
+import {
+  LICENSE_STATUS,
+  RUNNING_WINDOW_MS,
+  mergeSample,
+  parseSample,
+  summarise
+} from '../api/_lib/telemetry.mjs'
 
 const originalRepository = process.env.GITHUB_REPOSITORY
 const originalToken = process.env.GITHUB_TOKEN
@@ -444,3 +452,133 @@ await cancelHandler({ method: 'POST', headers: {} }, cancelResponse)
 assert(cancelStatus === 401 && cancelBody?.error, 'cancellation must reject an unauthenticated request')
 
 console.log('Order cancellation: OK')
+
+// --- Telemetry samples ---------------------------------------------------------------------------
+// The wire format is the contract between the plugin and the database, and both halves are far away
+// from these tests, so what is checked here is that a sample is either accepted whole or rejected
+// whole, that counters accumulate across restarts, and that the endpoint's guards run before any
+// database work — a sample that got half-stored would be counted in 装机量 while describing nothing.
+const HW = 'a'.repeat(64)
+const goodSample = { hwid: HW, mcver: '1.21.4', loader: 'paper', modver: '2.6.0', licensestatus: 'active' }
+
+assert(parseSample(goodSample).sample?.hwid === HW, 'a minimal valid sample is accepted')
+assert(parseSample({ ...goodSample, hwid: HW.toUpperCase() }).sample?.hwid === HW, 'hwid is normalised to lower case')
+assert(parseSample({ ...goodSample, licensestatus: 'ACTIVE' }).sample?.licensestatus === 'active', 'licensestatus is case-insensitive')
+
+for (const bad of [null, undefined, 'string', 42, []]) {
+  assert(parseSample(bad).error, `a ${JSON.stringify(bad)} body is rejected`)
+}
+for (const bad of ['', 'short', HW.slice(1), HW + 'a', 'z'.repeat(64), `${HW.slice(0, 63)}!`]) {
+  assert(parseSample({ ...goodSample, hwid: bad }).error, `hwid ${JSON.stringify(bad)} is rejected`)
+}
+for (const key of ['mcver', 'loader', 'modver']) {
+  assert(parseSample({ ...goodSample, [key]: '' }).error, `${key} cannot be empty`)
+  assert(parseSample({ ...goodSample, [key]: '   ' }).error, `${key} cannot be whitespace`)
+  assert(parseSample({ ...goodSample, [key]: undefined }).error, `${key} cannot be absent`)
+  assert(parseSample({ ...goodSample, [key]: 'x'.repeat(300) }).error, `an oversized ${key} is rejected`)
+}
+assert(parseSample({ ...goodSample, licensestatus: 'lapsed' }).error, 'an unknown licensestatus is rejected')
+assert(parseSample({ ...goodSample, licensestatus: '' }).error, 'a missing licensestatus is rejected')
+// unknown must stay separate from invalid: conflating them would make a network outage to the licence
+// server read as a customer's licence being revoked.
+assert(LICENSE_STATUS.includes('unknown') && LICENSE_STATUS.includes('invalid'), 'unknown and invalid are distinct statuses')
+
+// Optional fields: absent and empty both mean "this install did not say", and only a present-and-wrong
+// value is an error.
+const bare = parseSample(goodSample).sample
+assert(bare.os === '' && bare.osver === '' && bare.osarch === '', 'absent optional descriptors store as empty')
+assert(bare.licensecode === null, 'an unreported licencecode stores as null, not empty string')
+assert(parseSample({ ...goodSample, licensecode: '' }).sample.licensecode === null, 'a blank licencecode stores as null')
+assert(parseSample({ ...goodSample, licensecode: 'AAA-BBB' }).sample.licensecode === 'AAA-BBB', 'a reported licencecode is kept')
+assert(parseSample({ ...goodSample, licensecode: 42 }).error, 'a non-string licencecode is rejected')
+assert(parseSample({ ...goodSample, licensecode: 'x'.repeat(200) }).error, 'an oversized licencecode is rejected')
+assert(parseSample({ ...goodSample, osarch: 'x'.repeat(40) }).error, 'an oversized osarch is rejected')
+assert(parseSample({ ...goodSample, retry_license_after: 'soon' }).error, 'a non-timestamp retry_license_after is rejected')
+assert(
+  parseSample({ ...goodSample, retry_license_after: '2026-09-01T00:00:00Z' }).sample.retry_license_after === '2026-09-01T00:00:00.000Z',
+  'retry_license_after is normalised to ISO 8601'
+)
+assert(parseSample({ ...goodSample, retry_license_after: '' }).sample.retry_license_after === null, 'a blank retry_license_after stores as null')
+
+// Counters arrive as deltas, so they must be non-negative integers and bounded — an install cannot
+// have crashed a billion times since its last heartbeat, and a figure that large is a bug or an attack.
+for (const key of ['errors', 'crashes', 'warns']) {
+  assert(parseSample(goodSample).sample[key] === 0, `${key} defaults to 0`)
+  assert(parseSample({ ...goodSample, [key]: 3 }).sample[key] === 3, `${key} is carried through`)
+  assert(parseSample({ ...goodSample, [key]: -1 }).error, `a negative ${key} is rejected`)
+  assert(parseSample({ ...goodSample, [key]: 1.5 }).error, `a fractional ${key} is rejected`)
+  assert(parseSample({ ...goodSample, [key]: '3' }).error, `a string ${key} is rejected`)
+  assert(parseSample({ ...goodSample, [key]: 9e9 }).error, `an absurd ${key} is rejected`)
+}
+
+// mergeSample: descriptors overwrite, counters add. A client that restarts has forgotten its own
+// tallies, which is exactly why the total is kept server-side.
+const first = mergeSample(null, parseSample({ ...goodSample, errors: 2 }).sample, new Date('2026-08-01T00:00:00Z'))
+assert(first.samples === 1 && first.errors === 2, 'a first sample starts the tallies')
+assert(first.first_seen === '2026-08-01T00:00:00.000Z' && first.last_seen === first.first_seen, 'a first sample sets both timestamps')
+const second = mergeSample(first, parseSample({ ...goodSample, modver: '2.7.0', errors: 3, crashes: 1 }).sample, new Date('2026-08-02T00:00:00Z'))
+assert(second.errors === 5 && second.crashes === 1, 'counters accumulate across samples')
+assert(second.modver === '2.7.0', 'a descriptor is overwritten by the newest sample')
+assert(second.first_seen === first.first_seen, 'first_seen never moves')
+assert(second.last_seen === '2026-08-02T00:00:00.000Z', 'last_seen follows the newest sample')
+assert(second.samples === 2, 'the sample count increments')
+// A restarted client reports 0 rather than replaying its history; the total must not drop.
+const third = mergeSample(second, parseSample(goodSample).sample, new Date('2026-08-03T00:00:00Z'))
+assert(third.errors === 5 && third.crashes === 1, 'a restarted client reporting zero deltas does not reset the totals')
+
+// summarise: 装机量 is every install, 运行量 only those inside the window, and the breakdowns describe
+// what is running now — a version retired a year ago must not sit in the list forever.
+const NOW = Date.parse('2026-08-29T12:00:00Z')
+const ago = (ms) => new Date(NOW - ms).toISOString()
+const fleet = [
+  { last_seen: ago(60_000), mcver: '1.21.4', loader: 'paper', licensestatus: 'active', osarch: 'amd64', errors: 4, crashes: 1, warns: 7 },
+  { last_seen: ago(120_000), mcver: '1.21.4', loader: 'paper', licensestatus: 'active', osarch: 'aarch64', errors: 0, crashes: 0, warns: 0 },
+  { last_seen: ago(90_000), mcver: '1.20.6', loader: 'fabric', licensestatus: 'expired', osarch: 'amd64', errors: 2, crashes: 0, warns: 1 },
+  { last_seen: ago(30 * 24 * 3600_000), mcver: '1.19.2', loader: 'spigot', licensestatus: 'expired', osarch: 'amd64', errors: 9, crashes: 3, warns: 2 }
+]
+const summary = summarise(fleet, NOW)
+assert(summary.installed_hwid === 4, '装机量 counts every install ever seen')
+assert(summary.running_hwid === 3, '运行量 counts only installs inside the running window')
+assert(summary.errors === 15 && summary.crashes === 4 && summary.warns === 10, 'counters total across the whole fleet, including long-silent installs')
+assert(!('1.19.2' in summary.by_mcver), 'a breakdown excludes installs outside the running window')
+assert(summary.by_mcver['1.21.4'] === 2 && summary.by_mcver['1.20.6'] === 1, 'installs are tallied by version')
+assert(Object.keys(summary.by_mcver)[0] === '1.21.4', 'a breakdown is ordered largest first')
+assert(summary.by_loader.paper === 2 && summary.by_licensestatus.active === 2 && summary.by_osarch.amd64 === 2, 'every required breakdown is produced')
+assert(summarise([], NOW).installed_hwid === 0 && Object.keys(summarise([], NOW).by_mcver).length === 0, 'an empty fleet summarises to zeroes, not a crash')
+assert(summarise(null, NOW).installed_hwid === 0, 'a missing fleet is treated as empty')
+assert(summarise([{ last_seen: ago(1000), errors: 0 }], NOW).by_osarch['未知'] === 1, 'an install that reported no osarch is labelled rather than dropped')
+// The window is deliberately several times the heartbeat interval: at exactly one interval a sample a
+// second late would drop a live server out of the count and make the figure flicker.
+assert(RUNNING_WINDOW_MS >= 3 * 5 * 60 * 1000, 'the running window is several heartbeat intervals wide')
+
+// Endpoint guards. Every one of these answers before the service client is constructed, so they hold
+// with no Supabase credentials in the environment.
+let tStatus = 0
+let tBody = null
+const tRes = { status(code) { tStatus = code }, setHeader() {}, send(value) { tBody = JSON.parse(value) } }
+const savedKey = process.env.TELEMETRY_INGEST_KEY
+
+delete process.env.TELEMETRY_INGEST_KEY
+await telemetryHandler({ method: 'GET', headers: {} }, tRes)
+assert(tStatus === 405, 'telemetry ingest is POST-only')
+await telemetryHandler({ method: 'POST', headers: {}, body: goodSample }, tRes)
+assert(tStatus === 503, 'an unconfigured endpoint refuses rather than accepting anonymously')
+
+process.env.TELEMETRY_INGEST_KEY = 'test-ingest-key'
+await telemetryHandler({ method: 'POST', headers: {}, body: goodSample }, tRes)
+assert(tStatus === 401, 'a sample with no key is rejected')
+await telemetryHandler({ method: 'POST', headers: { 'x-aether-key': 'wrong' }, body: goodSample }, tRes)
+assert(tStatus === 401, 'a sample with the wrong key is rejected')
+// The comparison hashes both sides before comparing, so a key that is merely a prefix of the real one
+// must not pass — that is the failure mode a length-dependent compare would have.
+await telemetryHandler({ method: 'POST', headers: { 'x-aether-key': 'test-ingest' }, body: goodSample }, tRes)
+assert(tStatus === 401, 'a key that is a prefix of the real one is rejected')
+await telemetryHandler({ method: 'POST', headers: { 'x-aether-key': 'test-ingest-key' }, body: { hwid: 'nope' } }, tRes)
+assert(tStatus === 400 && tBody?.error, 'a malformed sample answers 400 before touching the database')
+await telemetryHandler({ method: 'POST', headers: { authorization: 'Bearer test-ingest-key' }, body: { hwid: 'nope' } }, tRes)
+assert(tStatus === 400, 'the key is also accepted as a bearer token')
+
+if (savedKey === undefined) delete process.env.TELEMETRY_INGEST_KEY
+else process.env.TELEMETRY_INGEST_KEY = savedKey
+
+console.log('Telemetry samples: OK')

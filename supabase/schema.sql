@@ -95,6 +95,38 @@ create table if not exists public.installation_snapshots (
   id bigint generated always as identity primary key, captured_at timestamptz not null default now(),
   installed_hwid bigint not null default 0, running_hwid bigint not null default 0, source text not null default 'sentry'
 );
+-- Sentry was the original producer and is no longer one; see the comment on telemetry_installs.
+alter table public.installation_snapshots alter column source set default 'heartbeat';
+
+-- Telemetry from installed copies of the anticheat: one row per install, upserted on hwid. A sample
+-- states an install's current condition rather than recording an event, so this table grows with the
+-- number of installs and not with how long they run. 装机量 is count(*); 运行量 is the rows whose
+-- last_seen falls inside the running window.
+--
+-- Those two counts cannot come from Sentry, which is why they live here. The token issued for this
+-- project carries only project:releases, so the events API answers 403 — but the deeper problem
+-- survives fixing that: count_unique(hwid) over the errors dataset counts only the installs that
+-- failed, so a server running cleanly would be invisible and 装机量 would report the crash rate
+-- instead of the install base. Sending heartbeats as Sentry events to make them visible would cost
+-- ~8,640 events per install per month at five-minute intervals, against a free plan's monthly error
+-- quota (5,000 at the time of writing) — one install would exhaust it. Errors, crashes and logs do go
+-- to Sentry: that is what it is for, and the DSN alone is enough to send them.
+--
+-- hwid is a salted SHA-256 over stable machine facts, never a raw machine identifier. The check
+-- constraint pins that one canonical form so a client that regressed to sending something
+-- identifiable fails loudly here instead of quietly filling the column with it.
+create table if not exists public.telemetry_installs (
+  hwid text primary key check (hwid ~ '^[0-9a-f]{64}$'),
+  first_seen timestamptz not null default now(), last_seen timestamptz not null default now(),
+  samples bigint not null default 0,
+  mcver text not null default '', loader text not null default '', modver text not null default '',
+  licensestatus text not null default 'unknown', licensecode text, retry_license_after timestamptz,
+  os text not null default '', osver text not null default '', osarch text not null default '',
+  -- Accumulated from per-sample deltas. A client that restarts loses its own tallies, so it reports
+  -- what happened since its last sample and the total is kept here, where a restart cannot reset it.
+  errors bigint not null default 0, crashes bigint not null default 0, warns bigint not null default 0
+);
+create index if not exists telemetry_installs_last_seen_idx on public.telemetry_installs(last_seen desc);
 
 create or replace function public.set_updated_at() returns trigger language plpgsql set search_path = public, pg_temp as $$
 begin new.updated_at = now(); return new; end $$;
@@ -126,12 +158,12 @@ do $$ declare t text; begin
 end $$;
 
 do $$ declare t text; begin
-  foreach t in array array['user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots']
+  foreach t in array array['user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots','telemetry_installs']
   loop execute format('alter table public.%I enable row level security',t); end loop;
 end $$;
 do $$ declare r record; begin
   for r in select policyname,tablename from pg_policies where schemaname='public' and tablename in
-    ('user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots')
+    ('user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers','orders','refund_requests','installation_snapshots','telemetry_installs')
   loop execute format('drop policy if exists %I on public.%I',r.policyname,r.tablename); end loop;
 end $$;
 
@@ -179,6 +211,12 @@ with check ((select auth.uid())=user_id and exists(select 1 from public.orders o
 create policy admin_refunds_update on public.refund_requests for update to authenticated
 using ((select private.current_user_group())='admin') with check ((select private.current_user_group())='admin');
 create policy install_stats_read on public.installation_snapshots for select to anon,authenticated using (true);
+-- Only the rollup above is public. A telemetry row names one server's hwid, its licence code and its
+-- exact versions — an unpatched version on a reachable install is an attacker's shopping list — so the
+-- raw table is admin-only, and no policy grants insert: samples arrive through the service client in
+-- api/telemetry.mjs, which is the only writer.
+create policy telemetry_admin_read on public.telemetry_installs for select to authenticated
+using ((select private.current_user_group())='admin');
 
 insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
 values('refund-evidence','refund-evidence',false,5242880,array['image/jpeg','image/png','image/webp'])
