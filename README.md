@@ -62,6 +62,8 @@ Stripe's and PayPal's callbacks ignore the request body's claims and re-read the
 
 PayerURL has no callback setting in its merchant dashboard: `notify_url` travels with each order, which is why the only two credentials it issues are the public and secret keys. The driver is a reimplementation of PayerURL's official Node SDK, published as `binance-crypto-instant-payout-nodejs` (its README calls itself `@payerurl/crypto-checkout`, a name not on the registry). It is not a dependency because that package declares some forty build tools — esbuild, rollup, sucrase, chokidar — as runtime dependencies, all of which would land in the function bundle. Instead `tests/api-smoke.mjs` pins the exact query strings and digests the SDK produces, so drifting from it fails the build rather than a payment.
 
+One thing that SDK is wrong about: its README documents `amount` as "Amount in smallest unit", and its example pairs `amount: 1000` with `price: '10.00'`. The live API reads it as a decimal — a 20.00 USD order sent as `amount: 2000` reaches the checkout page as 2000 USD. Both money fields are decimal strings, and the test asserts that against the measured behaviour rather than the documentation.
+
 | Provider | Secrets | Webhook endpoint | Events |
 | --- | --- | --- | --- |
 | Stripe | `STRIPE_SECRET_KEY` | `/v1/callback/stripe` | `checkout.session.completed`, `checkout.session.expired` |

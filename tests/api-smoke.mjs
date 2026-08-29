@@ -221,14 +221,25 @@ assert(payerurlQuery({ a: '入门版' }) === 'a=%E5%85%A5%E9%97%A8%E7%89%88', 'a
 
 const payerurlArgs = payerurlPaymentArgs({ order, artifact: { name: '入门版 Starter' }, siteUrl: site, user: { email: 'buyer@example.com' } })
 assert(payerurlArgs.order_id === order.id, 'the callback maps back to our order through order_id')
-assert(payerurlArgs.amount === 1999, "amount is the smallest unit — a decimal here would charge 19.99 cents for a 19.99 USD artifact")
+// Measured against the live checkout, not taken from the SDK README: sending the minor unit here
+// billed a 20.00 USD order as 2000 USD. The README says "smallest unit" and is wrong about its own
+// server, so this asserts what the server actually charges.
+assert(payerurlArgs.amount === '19.99', 'amount is a decimal — the minor unit here overcharges by 100x')
 assert(payerurlArgs.currency === 'usd', 'PayerURL lower-cases the currency')
-assert(payerurlArgs.items[0].price === '19.99', "an item's price is a decimal string even though the order amount is not")
+assert(payerurlArgs.items[0].price === '19.99', "an item's price is a decimal too, and must agree with the total")
+assert(
+  payerurlPaymentArgs({ order: { ...order, amount_minor: 1999, currency: 'JPY' }, artifact, siteUrl: site, user: {} }).amount === '1999',
+  'a zero-decimal currency must not be divided by 100'
+)
+assert(
+  payerurlPaymentArgs({ order: { ...order, amount_minor: 2000, quantity: 3 }, artifact, siteUrl: site, user: {} }).items[0].price === '6.67',
+  'a per-unit price that does not divide evenly must still be a valid decimal'
+)
 assert(payerurlArgs.items[0].name === '入门版_Starter', 'a space in an item name becomes an underscore')
 assert(payerurlArgs.type === 'nodejs', 'the SDK identifies itself as nodejs')
 // The whole request, byte for byte as the SDK builds it.
 assert(
-  payerurlQuery(payerurlArgs) === 'amount=1999&billing_email=buyer%40example.com&billing_fname=buyer&billing_lname=buyer'
+  payerurlQuery(payerurlArgs) === 'amount=19.99&billing_email=buyer%40example.com&billing_fname=buyer&billing_lname=buyer'
     + '&cancel_url=https%3A%2F%2Faetherac.abnt.it%2Forder%2Fa1b2c3d4-0000-4000-8000-000000000001&currency=usd'
     + '&items%5B0%5D%5Bname%5D=%E5%85%A5%E9%97%A8%E7%89%88_Starter&items%5B0%5D%5Bqty%5D=1&items%5B0%5D%5Bprice%5D=19.99'
     + '&notify_url=https%3A%2F%2Faetherac.abnt.it%2Fv1%2Fcallback%2Fpayerurl&order_id=a1b2c3d4-0000-4000-8000-000000000001'

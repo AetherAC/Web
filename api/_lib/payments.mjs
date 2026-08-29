@@ -235,19 +235,21 @@ const payerurlBuyer = (user) => {
 
 export const PAYERURL_BASE = 'https://api-v2.payerurl.com'
 
-// The SDK's own argument order, and its two different money formats: `amount` is the smallest unit
-// (its README says so, and its example pairs `amount: 1000` with `price: '10.00'`), while an item's
-// price is a decimal string. Sending a decimal `amount` would have charged 19.99 cents for a
-// 19.99 USD artifact.
+// `amount` is a DECIMAL, despite the SDK README's "Amount in smallest unit" and its example pairing
+// `amount: 1000` with `price: '10.00'`. Measured against the live checkout: a 2000-minor (20.00 USD)
+// order sent as `amount: 2000` was billed as 2000 USD — a 100x overcharge. The README is wrong about
+// its own server, so the server wins. Both money fields are therefore decimal strings, and
+// decimalAmount() keeps the zero-decimal currencies from being divided.
 export const payerurlPaymentArgs = ({ order, artifact, siteUrl, user, config = {} }) => ({
   order_id: order.id,
-  amount: order.amount_minor,
+  amount: decimalAmount(order.amount_minor, order.currency),
   currency: String(order.currency).toLowerCase(),
-  // The SDK rewrites spaces in an item name to underscores, so PayerURL evidently rejects them.
+  // The SDK rewrites spaces in an item name to underscores, so PayerURL evidently rejects them. The
+  // name is trimmed first, or a trailing space becomes a trailing underscore on the checkout page.
   items: [{
-    name: String(artifact?.name || order.sku).replace(/ /g, '_'),
+    name: String(artifact?.name || order.sku).trim().replace(/ /g, '_'),
     qty: order.quantity || 1,
-    price: (order.amount_minor / (order.quantity || 1) / 100).toFixed(2)
+    price: decimalAmount(Math.round(order.amount_minor / (order.quantity || 1)), order.currency)
   }],
   ...payerurlBuyer(user),
   redirect_to: `${siteUrl}/order/${order.id}?paid=1`,
@@ -321,8 +323,8 @@ const payerurl = {
       providerOrderId: transactionId,
       // PayerURL settles in crypto and reports what actually arrived, so an underpayment must not
       // release the order: the handler compares this against the order row before writing `paid`.
-      // Read as a decimal — if PayerURL ever sends the minor unit instead this over-counts by 100x,
-      // which can only ever accept a full payment, never reject one.
+      // Read as a decimal, which is the unit the request side was measured to use. Were it ever the
+      // minor unit this over-counts by 100x, which can only accept a full payment, never reject one.
       //
       // No currency is reported: the only currency in the signed set is `confirm_rcv_amnt_curr`, and
       // whether that carries the invoice's fiat code or the coin's ticker is not documented anywhere.
