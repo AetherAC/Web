@@ -99,6 +99,15 @@ import {
   transitionLabel,
   validateRefundAmount
 } from '../shared/orders.mjs'
+import {
+  insertNotification,
+  logOrderStatus,
+  logRefundAction,
+  logSessionEvent,
+  notifyUser,
+  setting,
+  settleApproval
+} from '../api/_lib/notify.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
 import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
@@ -1170,3 +1179,128 @@ assert(rej.note.includes('证据不足'), '拒绝理由必须进日志——§10
 assert(transitionLabel(rej.from_status, rej.to_status) === 'PAID → PAID', '渲染成 §13.5 要求的形式')
 
 console.log('Order and refund state machine: OK')
+
+// --- api/_lib/notify.mjs ---------------------------------------------------------------------------
+// 这四个写入函数跑在 service client 上，所以 update 上的过滤条件就是全部的并发保护——
+// settleApproval 少一个 .eq('state','pending')，两个管理员同时点批准就会各自以为自己做了决定。
+// 一个会录下所有调用的假 db 把这些条件钉住。
+const recorder = (results = {}) => {
+  const calls = []
+  const rec = { calls, tables: [] }
+  rec.from = table => {
+    rec.tables.push(table)
+    const entry = { table, op: null, payload: null, filters: {}, selected: null }
+    calls.push(entry)
+    const result = results[table] ?? { data: null, error: null }
+    const link = {
+      eq(col, val) { entry.filters[col] = val; return link },
+      select(cols) { entry.selected = cols ?? '*'; return link },
+      single: async () => result,
+      maybeSingle: async () => result,
+      then: (resolve, reject) => Promise.resolve(result).then(resolve, reject)
+    }
+    return {
+      insert(payload) { entry.op = 'insert'; entry.payload = payload; return link },
+      update(payload) { entry.op = 'update'; entry.payload = payload; return link },
+      select(cols) { entry.op = 'select'; entry.selected = cols; return link }
+    }
+  }
+  return rec
+}
+const lastCall = rec => rec.calls[rec.calls.length - 1]
+
+// 站内信要先过校验再落库，因为数据库的 check 只能报出约束名。
+const NOTIF_ROW = { id: 'n1', kind: 'system', scope: 'all', title: '标题', body: '正文' }
+let ndb = recorder({ notifications: { data: NOTIF_ROW, error: null } })
+const inserted = await insertNotification(ndb, { kind: 'system', scope: 'all', title: '标题', body: '正文' })
+assert(inserted.id === 'n1', '插入后返回落库的行')
+assert(lastCall(ndb).table === 'notifications' && lastCall(ndb).op === 'insert', '写 notifications 表')
+let notifyThrew = ''
+try { await insertNotification(recorder(), { kind: 'nope', scope: 'all', title: 't', body: 'b' }) }
+catch (e) { notifyThrew = e.message }
+assert(notifyThrew.includes('站内信不合法'), '不合法的站内信在打库之前就被拒')
+assert(recorder().calls.length === 0, '被拒的站内信不该产生任何数据库调用')
+// 站内信的写入失败必须抛。§10.3 的审批通知就是审批流程本身的载体，静默失败等于审批请求没发出去。
+notifyThrew = ''
+try { await insertNotification(recorder({ notifications: { data: null, error: { message: 'boom' } } }), NOTIF_ROW) }
+catch (e) { notifyThrew = e.message }
+assert(notifyThrew.includes('站内信写入失败'), '站内信写入失败必须抛，不能吞')
+
+// 反过来，三个日志函数的失败必须被吞掉。一次成功的退款因为审计超时而回「失败」，用户会重试，
+// 而重试可能真的退第二次。
+//
+// 下面几条断言会让 notify.mjs 往 stderr 打四行「写入失败」——那是被测行为本身（吞掉错误但留下
+// 痕迹），不是测试出了问题。真正的失败会让整个套件以非零退出，而不是打一行日志。
+const failing = table => recorder({ [table]: { data: null, error: { message: 'boom' } } })
+assert(await logOrderStatus(failing('order_status_log'), { order_id: 'o1', from_status: 'paid', to_status: 'refund_pending' }) === false,
+  '订单日志写失败返回 false 而不抛')
+assert(await logRefundAction(failing('refund_audit_log'), { refund_id: 'r1', action: 'approve' }) === false,
+  '退款审计写失败返回 false 而不抛')
+assert(await logSessionEvent(failing('cs_session_events'), { session_id: 's1', kind: 'open' }) === false,
+  '会话事件写失败返回 false 而不抛')
+
+// 日志行的形状：缺省字段要落成空串/null，不能是 undefined——undefined 会被 PostgREST 丢掉，
+// 于是 not null 的列用上默认值，而 source 的默认值未必是这次操作的真实来源。
+ndb = recorder()
+await logOrderStatus(ndb, { order_id: 'o1', from_status: 'paid', to_status: 'refund_pending', actor_group: 'admin', source: 'cs' })
+let row = lastCall(ndb).payload
+assert(row.actor_id === null && row.note === '', '缺省字段落成 null/空串')
+assert(row.source === 'cs', 'source 必须原样带过去——同一个迁移有三个入口，责任归属不同')
+assert(Object.values(row).every(v => v !== undefined), '任何字段都不能是 undefined')
+ndb = recorder()
+await logOrderStatus(ndb, { order_id: 'o1', from_status: 'paid', to_status: 'paid' })
+assert(lastCall(ndb).payload.source === 'system', '没给 source 时落到 system')
+
+// §10.2：改金额不改状态，但必须留痕，所以 from/to 允许为空而 amount_minor 要带上。
+ndb = recorder()
+await logRefundAction(ndb, { refund_id: 'r1', action: 'edit_amount', amount_minor: 5000, actor_group: 'cs' })
+row = lastCall(ndb).payload
+assert(row.from_status === '' && row.to_status === '', '改金额这类动作不改状态')
+assert(row.amount_minor === 5000, '改后的金额必须进审计')
+ndb = recorder()
+await logRefundAction(ndb, { refund_id: 'r1', action: 'approve' })
+assert(lastCall(ndb).payload.amount_minor === null, '没有金额时落 null 而不是 undefined')
+
+// detail 必须是对象。传字符串进来会让 jsonb 列收到一个 JSON 字符串标量，之后统计查询取不到字段。
+ndb = recorder()
+await logSessionEvent(ndb, { session_id: 's1', kind: 'mode', detail: 'oops' })
+assert(typeof lastCall(ndb).payload.detail === 'object', '非对象的 detail 落成空对象')
+
+// settleApproval：并发保护全在过滤条件上。
+ndb = recorder({ notifications: { data: [{ id: 'n1' }], error: null } })
+const settled = await settleApproval(ndb, 'r1', 'approved', 'admin1')
+assert(settled === 1, '真正做了决定的那次返回 1')
+const upd = ndb.calls.find(c => c.table === 'notifications')
+assert(upd.filters.refund_id === 'r1', '只动这条退款的通知')
+assert(upd.filters.kind === 'refund_approval', '只动审批类通知，普通退款告知不该被改')
+assert(upd.filters.state === 'pending', '只动还没被处理的——少了这条，第二个管理员也会以为自己做了决定')
+assert(upd.payload.pinned === false && upd.payload.highlighted === false,
+  '处理完要收掉置顶高亮，否则置顶位不再有意义')
+assert(upd.payload.state === 'approved', '结果留在通知上')
+assert(!('id' in upd.payload), '不能改通知的 id')
+// 第二个管理员：影响 0 行，且不写审计——他没做决定。
+ndb = recorder({ notifications: { data: [], error: null } })
+assert(await settleApproval(ndb, 'r1', 'rejected', 'admin2') === 0, '慢的那次返回 0')
+assert(!ndb.tables.includes('refund_audit_log'), '没做决定就不该留下一条决定的审计')
+notifyThrew = ''
+try { await settleApproval(recorder({ notifications: { data: null, error: { message: 'boom' } } }), 'r1', 'approved', 'a1') }
+catch (e) { notifyThrew = e.message }
+assert(notifyThrew.includes('审批状态回写失败'), '审批回写失败必须抛——它是审批流程的一部分')
+
+// notifyUser 走 scope='user'，所以必须带 recipient_id，否则 schema 那条 check 会拒。
+ndb = recorder({ notifications: { data: NOTIF_ROW, error: null } })
+await notifyUser(ndb, 'u1', { title: '退款已完成', body: '款项已退回' })
+row = lastCall(ndb).payload
+assert(row.scope === 'user' && row.recipient_id === 'u1', 'scope 和 recipient_id 必须同时在')
+assert(row.state === null, '给用户的告知不是待办事项，state 必须是 null 而不是 pending')
+
+// setting()：缺键要给 fallback，不能让调用方各自猜默认值。
+assert(await setting(recorder({ site_settings: { data: null, error: null } }), 'nope', 48) === 48, '缺键返回 fallback')
+assert(await setting(recorder({ site_settings: { data: { value: { value: 24 } }, error: null } }), 'k', 48) === 24, '取 value.value')
+assert(await setting(recorder({ site_settings: { data: { value: { value: false } }, error: null } }), 'k', true) === false,
+  'false 是有效值，不能被当成缺失而落到 fallback')
+assert(await setting(recorder({ site_settings: { data: { value: { value: 0 } }, error: null } }), 'k', 30) === 0,
+  '0 同理——audit_log_retention_days 的 0 表示永久保留')
+assert(await setting(recorder({ site_settings: { data: null, error: { message: 'boom' } } }), 'k', 48) === 48, '读失败也给 fallback')
+
+console.log('Notification and audit writes: OK')
