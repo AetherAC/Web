@@ -7,7 +7,12 @@ import { supabase, useAuth } from './auth'
 const auth=useAuth(); const order=ref<any>(null); const refund=ref<any>(null); const denied=ref(false)
 const reason=ref('duplicate'); const detail=ref(''); const files=ref<File[]>([]); const message=ref(''); const sending=ref(false)
 const cancelling=ref(false); const cancelMessage=ref('')
-const orderId=()=>location.pathname.split('/').filter(Boolean)[1]||new URLSearchParams(location.search).get('order_id')
+// Only the query form. The old `/order/<uuid>` path never reached this line: VitePress looks routes up
+// in a build-time hash map of its .md files, finds no entry for a uuid segment, and swaps in its 404
+// component — so the pathname branch that used to be here was unreachable code standing where a bug was.
+// vercel.json redirects the old shape here so links already in the wild, and any checkout session
+// created before this fix, still land on a working page.
+const orderId=()=>new URLSearchParams(location.search).get('order_id')
 const justPaid=()=>typeof window!=='undefined'&&new URLSearchParams(location.search).get('paid')==='1'
 async function fetchOrder(strict=false){
   const {data,error}=await supabase!.from('orders').select('*').eq('id',orderId()).maybeSingle()
@@ -17,7 +22,8 @@ async function fetchOrder(strict=false){
 }
 watch(()=>auth.ready.value,async ready=>{
   if(!ready)return
-  if(!auth.user.value){auth.requireUser(typeof window==='undefined'?'/order':location.pathname);return}
+  // The search string has to come along, or signing in sends the buyer back to /order with no id.
+  if(!auth.user.value){auth.requireUser(typeof window==='undefined'?'/order':location.pathname+location.search);return}
   const data=await fetchOrder(true)
   if(!data)return
   // Stripe and PayPal send the buyer back here before their callback has necessarily landed, so an

@@ -5,6 +5,7 @@ import {
   approvalLink,
   decimalAmount,
   driverFor,
+  orderUrl,
   payerurlAuth,
   payerurlPaymentArgs,
   payerurlQuery,
@@ -24,6 +25,7 @@ import {
 } from '../docs/.vitepress/theme/recordForm.ts'
 import { preloadMarkdown, renderMarkdown, renderMarkdownInline } from '../docs/.vitepress/theme/markdown.ts'
 import cancelHandler, { cancelPendingOrder } from '../api/cancel-order.mjs'
+import { orderPath } from '../docs/.vitepress/theme/routes.ts'
 
 const originalRepository = process.env.GITHUB_REPOSITORY
 const originalToken = process.env.GITHUB_TOKEN
@@ -184,13 +186,27 @@ const order = {
 const artifact = { name: '入门版', description: '单机授权' }
 const site = 'https://aetherac.abnt.it'
 
+// The order route. VitePress resolves routes against a build-time hash map of its .md files, so an id in
+// the path — `/order/<uuid>` — has no entry and the client router replaces the page with its own 404 the
+// instant JS boots. That is what buyers hit returning from a completed payment: a 404 over money already
+// paid. A server rewrite cannot fix it, because it only corrects the HTML that the router then throws
+// away. These assertions pin the query form on both halves, and pin them to each other: the browser
+// builds the link, payments.mjs builds the providers' return_url, and a fix applied to one only is the
+// exact way this breaks again.
+assert(orderPath('abc') === '/order?order_id=abc', 'the id must be a query parameter — as a path segment the client router 404s')
+assert(!/\/order\/[^?]/.test(orderUrl(site, 'abc')), 'the id must never appear as a path segment')
+assert(orderUrl(site, 'abc') === site + orderPath('abc'), 'client and server must build the same order URL')
+assert(orderUrl(site, 'abc', true) === `${site}/order?order_id=abc&paid=1`, 'the paid flag is what starts the callback poll, so it must survive')
+assert(orderPath('a b&c=d') === '/order?order_id=a%20b%26c%3Dd' && orderUrl(site, 'a b&c=d') === site + orderPath('a b&c=d'),
+  'an id is encoded, so a stray & cannot inject another parameter')
+
 const stripeForm = stripeSessionForm(order, artifact, site)
 assert(stripeForm instanceof URLSearchParams, 'Stripe only accepts application/x-www-form-urlencoded')
 assert(stripeForm.get('line_items[0][price_data][unit_amount]') === '1999', 'unit_amount must stay the minor unit the artifacts table stores')
 assert(stripeForm.get('line_items[0][price_data][currency]') === 'usd', 'Stripe rejects an upper-case currency')
 assert(stripeForm.get('line_items[0][price_data][product_data][name]') === '入门版', 'the buyer must see the artifact name, not the SKU')
 assert(stripeForm.get('client_reference_id') === order.id && stripeForm.get('metadata[order_id]') === order.id, 'the callback finds our order through client_reference_id / metadata')
-assert(stripeForm.get('success_url') === `${site}/order/${order.id}?paid=1`, 'success_url must return to the order page')
+assert(stripeForm.get('success_url') === `${site}/order?order_id=${order.id}&paid=1`, 'success_url must return to the order page')
 assert(!stripeSessionForm(order, { name: 'x', description: '' }, site).has('line_items[0][price_data][product_data][description]'), 'Stripe rejects an empty description, so a blank one must be omitted')
 assert(stripeSessionForm(order, null, site).get('line_items[0][price_data][product_data][name]') === order.sku, 'a missing artifact must fall back to the SKU rather than sending "undefined"')
 
@@ -199,7 +215,7 @@ assert(paypalBody.intent === 'CAPTURE', 'the order must be capturable, otherwise
 assert(paypalBody.purchase_units[0].amount.value === '19.99', 'PayPal wants a decimal string, not the minor unit')
 assert(paypalBody.purchase_units[0].amount.currency_code === 'USD', 'PayPal rejects a lower-case currency code')
 assert(paypalBody.purchase_units[0].custom_id === order.id, 'custom_id is how the webhook maps a PayPal order back to ours')
-assert(paypalBody.payment_source.paypal.experience_context.return_url === `${site}/order/${order.id}?paid=1`, 'the buyer must land back on the order page')
+assert(paypalBody.payment_source.paypal.experience_context.return_url === `${site}/order?order_id=${order.id}&paid=1`, 'the buyer must land back on the order page')
 
 assert(decimalAmount(1999, 'USD') === '19.99', 'two-decimal currencies divide by 100')
 assert(decimalAmount(1999, 'JPY') === '1999', 'JPY is already whole; dividing it would undercharge by 100x')
@@ -242,10 +258,10 @@ assert(payerurlArgs.type === 'nodejs', 'the SDK identifies itself as nodejs')
 // The whole request, byte for byte as the SDK builds it.
 assert(
   payerurlQuery(payerurlArgs) === 'amount=19.99&billing_email=buyer%40example.com&billing_fname=buyer&billing_lname=buyer'
-    + '&cancel_url=https%3A%2F%2Faetherac.abnt.it%2Forder%2Fa1b2c3d4-0000-4000-8000-000000000001&currency=usd'
+    + '&cancel_url=https%3A%2F%2Faetherac.abnt.it%2Forder%3Forder_id%3Da1b2c3d4-0000-4000-8000-000000000001&currency=usd'
     + '&items%5B0%5D%5Bname%5D=%E5%85%A5%E9%97%A8%E7%89%88_Starter&items%5B0%5D%5Bqty%5D=1&items%5B0%5D%5Bprice%5D=19.99'
     + '&notify_url=https%3A%2F%2Faetherac.abnt.it%2Fv1%2Fcallback%2Fpayerurl&order_id=a1b2c3d4-0000-4000-8000-000000000001'
-    + '&redirect_to=https%3A%2F%2Faetherac.abnt.it%2Forder%2Fa1b2c3d4-0000-4000-8000-000000000001%3Fpaid%3D1&type=nodejs',
+    + '&redirect_to=https%3A%2F%2Faetherac.abnt.it%2Forder%3Forder_id%3Da1b2c3d4-0000-4000-8000-000000000001%26paid%3D1&type=nodejs',
   'the signed payment request must match the SDK byte for byte'
 )
 assert(payerurlArgs.notify_url === `${site}/v1/callback/payerurl`, 'the callback must reach our own endpoint')

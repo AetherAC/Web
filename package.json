@@ -6,7 +6,9 @@
     "dev": "vitepress dev docs",
     "build": "vitepress build docs",
     "preview": "vitepress preview docs",
-    "test:api": "node tests/api-smoke.mjs"
+    "test:api": "node tests/api-smoke.mjs",
+    "test:routes": "node tests/route-resolve.mjs",
+    "test": "npm run test:api && npm run build && npm run test:routes"
   },
   "dependencies": {
     "@fontsource-variable/manrope": "^5.2.6",

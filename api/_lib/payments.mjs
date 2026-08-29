@@ -41,13 +41,22 @@ export function formEncode(value, prefix = '', out = new URLSearchParams()) {
   return out
 }
 
+// Where a provider sends the buyer back. The order id is a query parameter, not a path segment, and
+// that is not cosmetic: VitePress resolves every route through a build-time hash map of its .md files,
+// so `/order/<uuid>` has no entry and the client router replaces the page with its own 404 the moment
+// JS boots. Vercel's rewrite made the server HTML correct and hid the bug from curl, but a real buyer
+// returning from a completed payment saw "404" over money they had already handed over. `/order` is a
+// real page, so the query form survives both a hard load and an in-app click.
+export const orderUrl = (siteUrl, orderId, paid = false) =>
+  `${siteUrl}/order?order_id=${encodeURIComponent(orderId)}${paid ? '&paid=1' : ''}`
+
 // Stripe's unit_amount is already the minor unit, the same integer the artifacts table stores.
 export const stripeSessionForm = (order, artifact, siteUrl) => formEncode({
   mode: 'payment',
   client_reference_id: order.id,
   metadata: { order_id: order.id },
-  success_url: `${siteUrl}/order/${order.id}?paid=1`,
-  cancel_url: `${siteUrl}/order/${order.id}`,
+  success_url: orderUrl(siteUrl, order.id, true),
+  cancel_url: orderUrl(siteUrl, order.id),
   line_items: [{
     quantity: order.quantity || 1,
     price_data: {
@@ -127,8 +136,8 @@ export const paypalOrderBody = (order, artifact, siteUrl) => ({
     paypal: {
       experience_context: {
         user_action: 'PAY_NOW',
-        return_url: `${siteUrl}/order/${order.id}?paid=1`,
-        cancel_url: `${siteUrl}/order/${order.id}`
+        return_url: orderUrl(siteUrl, order.id, true),
+        cancel_url: orderUrl(siteUrl, order.id)
       }
     }
   }
@@ -252,9 +261,9 @@ export const payerurlPaymentArgs = ({ order, artifact, siteUrl, user, config = {
     price: decimalAmount(Math.round(order.amount_minor / (order.quantity || 1)), order.currency)
   }],
   ...payerurlBuyer(user),
-  redirect_to: `${siteUrl}/order/${order.id}?paid=1`,
+  redirect_to: orderUrl(siteUrl, order.id, true),
   notify_url: `${siteUrl}/v1/callback/payerurl`,
-  cancel_url: `${siteUrl}/order/${order.id}`,
+  cancel_url: orderUrl(siteUrl, order.id),
   // The SDK sends `nodejs`; kept configurable because it reads like a platform selector.
   type: config.type || 'nodejs'
 })
