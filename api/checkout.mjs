@@ -1,5 +1,6 @@
 import { bodyOf, requireUser, send } from './_lib/server.mjs'
 import { driverFor } from './_lib/payments.mjs'
+import { couponFieldsFor, redeemOrRollback } from './_lib/coupons.mjs'
 const values = (order) => ({
   order_id: order.id, sku: order.sku, amount_minor: order.amount_minor,
   amount: (order.amount_minor / 100).toFixed(2), currency: order.currency
@@ -34,9 +35,16 @@ export default async function handler(req, res) {
       .select('id,sku,provider,created_at').eq('user_id', auth.user.id).eq('status', 'pending')
       .order('created_at', { ascending: false }).limit(1).maybeSingle()
     if (blocking) return send(res, 409, { error: '你已有一笔待支付订单，请先完成或取消它再下新单', pending_order: blocking })
+    // 券在下单前算，用的是 api/coupon.mjs 预览时的同一份逻辑（api/_lib/coupons.mjs）。两条路径算出
+    // 不同的数字就是「页面显示立减 25，实际收 30」，而那种 bug 没有报错也没有日志，只有工单。
+    const priced = await couponFieldsFor(auth.db, {
+      code: input.coupon_code, artifact, userId: auth.user.id, userGroup: auth.group
+    })
+    if (!priced.ok) return send(res, priced.status, { error: priced.error })
+
     const { data: order, error } = await auth.db.from('orders').insert({
       user_id: auth.user.id, artifact_id: artifact.id, sku: artifact.sku, quantity: 1,
-      amount_minor: artifact.price_minor, currency: artifact.currency, provider: provider.id
+      currency: artifact.currency, provider: provider.id, ...priced.fields
     }).select().single()
     // 23505 on insert can only be that index: `orders_provider_reference` needs a provider_order_id,
     // which no fresh row has. So this is the same conflict as above, lost by a hair — same answer, not
@@ -47,6 +55,13 @@ export default async function handler(req, res) {
       return send(res, 409, { error: '你已有一笔待支付订单，请先完成或取消它再下新单', pending_order: winner ?? null })
     }
     if (error) throw error
+
+    // 核销在 insert 之后，理由和失败时为什么要删单见 redeemOrRollback 的注释。
+    const redeemed = await redeemOrRollback(auth.db, {
+      coupon: priced.coupon, order, userId: auth.user.id, discountMinor: priced.fields.discount_minor
+    })
+    if (!redeemed.ok) return send(res, redeemed.status, { error: redeemed.error })
+
     const config = provider.public_config || {}
     const siteUrl = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`
     const vars = { ...values(order), callback_url: `${siteUrl}/v1/callback/${provider.id}` }

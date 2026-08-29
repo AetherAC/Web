@@ -264,6 +264,25 @@ create table if not exists public.coupon_redemptions (
 create unique index if not exists coupon_redemptions_order_key on public.coupon_redemptions(coupon_id,order_id);
 create index if not exists coupon_redemptions_user_idx on public.coupon_redemptions(coupon_id,user_id);
 
+-- 券码校验的尝试记录，给 api/coupon.mjs 按账号限流用。
+--
+-- 为什么需要它：券码的形状是 [A-Z0-9][A-Z0-9_-]{2,31}，一个 4 位码只有百万量级组合，而一张没有指定
+-- allowed_user_ids 的券对任何猜到码的人都有效——换句话说，码本身就是全部的保护。校验接口不限流的话，
+-- 它就是一个可以按秒穷举的接口，而穷举成功的后果是真金白银。
+--
+-- 成功的尝试也记。管理员要能看出「哪个码被反复试」：那既是穷举的信号，也是「一批用户手上拿着已过期
+-- 的券」的信号，后者是运营问题而不是安全问题，但两者都只能从这张表看出来。
+create table if not exists public.coupon_attempts (
+  id bigint generated always as identity primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  -- 存尝试的原文（大写后），包括不存在的码。这是这张表的用处所在，所以不做外键。
+  code text not null default '', ok boolean not null default false,
+  created_at timestamptz not null default now()
+);
+-- 限流查的是「这个账号最近 N 分钟试了几次」，所以索引就按这个形状建。
+create index if not exists coupon_attempts_user_idx on public.coupon_attempts(user_id,created_at desc);
+create index if not exists coupon_attempts_code_idx on public.coupon_attempts(code,created_at desc);
+
 -- §5 订单信息展示。原价、应付、实付是三个不同的数：应付 = 原价经优惠券调整后要付的钱，实付 = 支付平台
 -- 实际到账的钱。三者通常相等，不相等的时候正是最需要看清的时候（币种换算、少付、超付），所以分开存。
 -- SKU 名称和描述在下单时快照一份：商品改名或改价之后，历史订单要显示当时买的是什么，不是现在的什么。
@@ -608,6 +627,60 @@ begin
 end $$;
 revoke all on function public.redeem_coupon(uuid,uuid,uuid,integer) from public;
 
+-- 退回一次核销。取消待支付订单（api/cancel-order.mjs）和下单失败回滚（api/checkout.mjs）都要调。
+--
+-- 为什么必须有这个函数：核销发生在下单时，而不是付款成功时——限量券要在这一刻就占住名额，否则一张
+-- 限量 1 的券可以被十个人同时下单、十个人都付款成功。代价是「下单但没付」会占着一个名额，而买家取消
+-- 订单后那个名额必须还回去，不然他自己的券再也用不了（per_user_limit 按 coupon_redemptions 的行数
+-- 算），总量也白少一张。
+--
+-- 删行 + 减计数写在一条语句序列里，并且减计数带 `where exists`：删不到行就不减。少了这个条件，
+-- 重复调用（两次取消请求、或取消之后又走一次回滚）会把 used_count 减到比真实核销数还低，于是超发。
+create or replace function public.release_coupon(p_coupon uuid, p_order uuid)
+returns boolean language plpgsql security definer set search_path = public, pg_temp as $$
+declare removed integer;
+begin
+  delete from public.coupon_redemptions where coupon_id = p_coupon and order_id = p_order;
+  get diagnostics removed = row_count;
+  if removed = 0 then return false; end if;
+  -- greatest(...,0)：计数不该为负。真为负说明别处漏了配对调用，那时宁可停在 0，也不要一个会让
+  -- total_limit 永远算不满的负数。
+  update public.coupons set used_count = greatest(used_count - removed, 0) where id = p_coupon;
+  return true;
+end $$;
+revoke all on function public.release_coupon(uuid,uuid) from public;
+
+-- 订单不再可能被支付时，自动退回券的名额。
+--
+-- 为什么做成触发器而不是在每个接口里调一次：能让一笔订单离开 pending 的地方不止一处——买家自己取消
+-- （api/cancel-order.mjs）、管理员在订单详情里改状态（api/admin-orders.mjs）、下单失败时删掉刚建的行
+-- （api/checkout.mjs）、以后还会有超时清理的定时任务。漏掉任何一处的后果是买家的 per_user_limit 被一笔
+-- 早已作废的订单永久占着，而这种账没人会去对。放在数据库里就只有一处要维护。
+--
+-- 删除也覆盖：coupon_redemptions.order_id 是 on delete cascade，订单被删时核销行跟着消失，但 used_count
+-- 不会自己减。BEFORE DELETE 在级联发生前跑，那时核销行还在。
+create or replace function private.release_order_coupon() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if new.coupon_id is not null then perform public.release_coupon(new.coupon_id, new.id); end if;
+  return new;
+end $$;
+create or replace function private.release_deleted_order_coupon() returns trigger
+language plpgsql security definer set search_path = public, pg_temp as $$
+begin
+  if old.coupon_id is not null then perform public.release_coupon(old.coupon_id, old.id); end if;
+  return old;
+end $$;
+drop trigger if exists orders_release_coupon on public.orders;
+-- 只在「进入终态且不是 paid/refund 那条线」时触发。refunded 不在里面是有意的：那笔钱真的收过，券也真的
+-- 用掉了，退款不该把名额还给用户——否则一张限量券可以用一次、退一次、再用一次。
+create trigger orders_release_coupon after update of status on public.orders
+for each row when (old.status = 'pending' and new.status in ('cancelled','failed'))
+execute function private.release_order_coupon();
+drop trigger if exists orders_release_coupon_delete on public.orders;
+create trigger orders_release_coupon_delete before delete on public.orders
+for each row execute function private.release_deleted_order_coupon();
+
 create or replace function private.handle_new_user() returns trigger
 language plpgsql security definer set search_path = public, pg_temp as $$
 begin
@@ -636,7 +709,7 @@ declare
   guarded text[] := array[
     'user_profiles','posts','progress_entries','repositories','site_settings','artifacts','payment_providers',
     'orders','refund_requests','installation_snapshots','telemetry_installs','github_team_map',
-    'order_status_log','refund_audit_log','coupons','coupon_redemptions',
+    'order_status_log','refund_audit_log','coupons','coupon_redemptions','coupon_attempts',
     'cs_agents','cs_sessions','cs_messages','cs_message_revisions','cs_auto_replies','cs_session_events',
     'notifications','notification_receipts'
   ];
@@ -719,6 +792,10 @@ using ((select private.is_staff())) with check ((select private.is_staff()));
 create policy coupons_admin_delete on public.coupons for delete to authenticated using ((select private.is_admin()));
 create policy coupon_redemptions_read on public.coupon_redemptions for select to authenticated
 using (user_id=(select auth.uid()) or (select private.is_staff()));
+-- 尝试记录只有客服和管理员能看，用户连自己那几条也不给：给了就等于给出一个「哪些码我试过」的接口，
+-- 而那正好是穷举者最想要的那份清单。没有任何写策略——只有 service client 写，和审计表同一个理由。
+create policy coupon_attempts_read on public.coupon_attempts for select to authenticated
+using ((select private.is_staff()));
 
 -- 以下 cs_* 表对浏览器只读。每一次写都有服务端后果：分配要原子地挑一个客服（§2.12），撤回要在同一个事务里
 -- 把原文搬进 revisions（§2.11），首次回复要盖上 §2.13 的响应时间，用户发言之后要触发自动回复（§3）。浏览器

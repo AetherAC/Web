@@ -30,6 +30,9 @@ import telemetryHandler from '../api/telemetry.mjs'
 import {
   exportOrders, listOrders, maskEmail, orderDetail, toCsv, updateOrderStatus
 } from '../api/admin-orders.mjs'
+import { couponFieldsFor, redeemOrRollback } from '../api/_lib/coupons.mjs'
+import { quoteCoupon } from '../api/coupon.mjs'
+import { NEVER_WRITABLE, forValidation } from '../api/admin-coupons.mjs'
 import {
   LICENSE_STATUS,
   RUNNING_WINDOW_MS,
@@ -1257,10 +1260,23 @@ const recorder = (results = {}) => {
       // upsert 的第二个参数要记下来：收件箱靠 onConflict 走主键冲突更新，漏掉它会变成重复插入
       // 然后撞主键，而那是只有在「第二次读同一条通知」时才出现的错。
       upsert(payload, opts) { entry.op = 'upsert'; entry.payload = payload; entry.upsertOpts = opts; return link },
+      // delete 要记：下单时券抢不到名额会把刚建的订单删掉，而那次删除必须带 status='pending'
+      // 的条件——漏掉它就是一个能删掉已支付订单的调用。
+      delete() { entry.op = 'delete'; return link },
       // 第二个参数要记：订单列表靠 { count: 'exact' } 拿总数，漏掉它 total 会退化成「本页条数」，
       // 于是分页控件只画出一页，而后面还有几千条订单。
       select(cols, opts) { entry.op = 'select'; entry.selected = cols; entry.selectOpts = opts; return link }
     }
+  }
+  // 券的核销和退回都走存储过程。记下函数名和参数：redeem_coupon 的 p_discount 传错就是收错钱，
+  // 而那笔账在 coupon_redemptions 里看起来完全正常。
+  rec.rpcs = []
+  rec.rpc = async (fn, params) => {
+    rec.rpcs.push({ fn, params })
+    const slot = results[`rpc:${fn}`]
+    if (typeof slot === 'function') return slot(params) ?? { data: null, error: null }
+    if (Array.isArray(slot)) return (slot.length > 1 ? slot.shift() : slot[0]) ?? { data: null, error: null }
+    return slot ?? { data: true, error: null }
   }
   return rec
 }
@@ -2558,3 +2574,220 @@ for (const target of ['refund_pending', 'refunded']) {
 }
 
 console.log('Admin orders: OK')
+
+// ---------------------------------------------------------------------------
+// §1 优惠券
+//
+// 这一段盯的是钱。券的每个失败方式都直接对应一个金额错误：预览和下单算出两个数字、限量券超发、
+// 券码被穷举、已用过的券被改掉定义之后对不上账。
+// ---------------------------------------------------------------------------
+const cpArtifact = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', sku: 'pro', name: '专业版', description: '一年授权', price_minor: 10000, currency: 'USD' }
+const cpUser = '11111111-1111-4111-8111-111111111111'
+const cpCoupon = {
+  id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', code: 'SAVE20', name: '八折券', enabled: true,
+  // percent 的 value 是万分之「实付比例」，不是折扣比例：8000 = 八折，10000 = 原价，0 = 全免。
+  conditions: [], actions: [{ type: 'percent', value: 8000 }],
+  starts_at: null, ends_at: null, total_limit: null, used_count: 0, allowed_user_ids: []
+}
+
+// —— 预览和下单必须算出同一个数字 ——
+//
+// 这是这一段里最重要的一条断言。两条路径各自拼一遍 ctx 的话，差异会以「页面显示立减 20，实际收 100」
+// 的形式出现，而它没有报错也没有日志。
+{
+  const cpPreviewDb = recorder({ artifacts: { data: cpArtifact, error: null }, coupons: { data: cpCoupon, error: null }, orders: { data: [], error: null }, coupon_attempts: { data: null, error: null } })
+  const cpPreview = await quoteCoupon(cpPreviewDb, { userId: cpUser, group: 'default' }, { code: 'save20', artifact_id: cpArtifact.id })
+  assert(cpPreview.status === 200 && cpPreview.body.ok === true, '正常券预览成功')
+  assert(cpPreview.body.discount_minor === 2000, '八折券在 10000 上省 2000')
+  assert(cpPreview.body.amount_minor === 8000, '实付 8000')
+  assert(cpPreview.body.code === 'SAVE20', '小写输入要转成大写——库里的 code 是大写，唯一索引也建在 upper(code) 上')
+
+  const cpOrderDb = recorder({ coupons: { data: cpCoupon, error: null }, orders: { data: [], error: null } })
+  const cpPriced = await couponFieldsFor(cpOrderDb, { code: 'save20', artifact: cpArtifact, userId: cpUser, userGroup: 'default' })
+  assert(cpPriced.ok, '同一张券下单时也可用')
+  assert(cpPriced.fields.discount_minor === cpPreview.body.discount_minor,
+    '预览和下单的折扣必须相等，否则用户看到一个数字、被收另一个数字')
+  assert(cpPriced.fields.amount_minor === cpPreview.body.amount_minor, '预览和下单的实付必须相等')
+  assert(cpPriced.fields.list_amount_minor === 10000, '划线价存原价，订单页才能显示「原价 / 优惠 / 实付」')
+  assert(cpPriced.fields.sku_name === '专业版' && cpPriced.fields.sku_description === '一年授权',
+    '§5 要下单时的 SKU 快照：商品改名之后历史订单显示的还得是买家当时看到的那份')
+  assert(cpPriced.fields.coupon_code === 'SAVE20' && cpPriced.fields.coupon_id === cpCoupon.id, '券的 id 和码都要落库')
+}
+
+// —— 预览返回的东西必须贫瘠 ——
+{
+  const cpLeakDb = recorder({ artifacts: { data: cpArtifact, error: null }, coupons: { data: { ...cpCoupon, total_limit: 5, used_count: 4, allowed_user_ids: [cpUser] }, error: null }, orders: { data: [], error: null }, coupon_attempts: { data: null, error: null } })
+  const cpLeak = await quoteCoupon(cpLeakDb, { userId: cpUser, group: 'default' }, { code: 'SAVE20', artifact_id: cpArtifact.id })
+  const cpKeys = Object.keys(cpLeak.body)
+  for (const cpBad of ['conditions', 'actions', 'limits', 'used_count', 'total_limit', 'allowed_user_ids', 'id']) {
+    assert(!cpKeys.includes(cpBad),
+      `预览不能返回 ${cpBad}：「限哪些 SKU」「还剩几张」「限哪几个账号」合起来就是一份可以被薅的地图`)
+  }
+  assert(!JSON.stringify(cpLeak.body).includes(cpUser), '返回体里不该出现 allowed_user_ids 的内容')
+}
+
+// —— 限流 ——
+{
+  const cpThrottled = recorder({ coupon_attempts: { data: null, error: null, count: 20 } })
+  const cpOver = await quoteCoupon(cpThrottled, { userId: cpUser, group: 'default' }, { code: 'SAVE20', artifact_id: cpArtifact.id })
+  assert(cpOver.status === 429, '窗口内试满 20 次就 429')
+  assert(!cpThrottled.tables.includes('coupons'),
+    '超限之后不该再查券表——那次查询的结果正好是穷举者想要的答案')
+  assert(!cpThrottled.tables.includes('artifacts'), '超限之后连商品都不查')
+
+  const cpCounted = recorder({ coupon_attempts: { data: null, error: null, count: 3 } })
+  await quoteCoupon(cpCounted, { userId: cpUser, group: 'default' }, { code: 'SAVE20', artifact_id: cpArtifact.id })
+  const cpHead = cpCounted.calls.find(c => c.table === 'coupon_attempts' && c.op === 'select')
+  assert(cpHead.selectOpts?.count === 'exact' && cpHead.selectOpts?.head === true,
+    '计数要用 head+count，不然把窗口内的行整个拉回来')
+  assert(cpHead.filters.user_id === cpUser, '按账号算：这个接口要登录，账号是唯一可靠的身份')
+  assert(cpHead.gte?.created_at, '要有窗口下界，否则是「历史总次数」而不是「最近 10 分钟」')
+
+  // 记账失败要放行。反过来（写不进就拒绝校验）意味着 coupon_attempts 一出问题，全站结算页的券功能同时挂掉。
+  const cpFailLog = recorder({ artifacts: { data: cpArtifact, error: null }, coupons: { data: cpCoupon, error: null }, orders: { data: [], error: null }, coupon_attempts: { data: null, error: { message: 'boom' } } })
+  const cpStillOk = await quoteCoupon(cpFailLog, { userId: cpUser, group: 'default' }, { code: 'SAVE20', artifact_id: cpArtifact.id })
+  assert(cpStillOk.status === 200 && cpStillOk.body.ok === true, '限流账本写不进去不该让用户用不了券')
+
+  // 失败的尝试也要记：管理员要能看出「哪个码被反复试」。
+  const cpMissDb = recorder({ artifacts: { data: cpArtifact, error: null }, coupons: { data: null, error: null }, coupon_attempts: { data: null, error: null } })
+  await quoteCoupon(cpMissDb, { userId: cpUser, group: 'default' }, { code: 'NOPE99', artifact_id: cpArtifact.id })
+  const cpMissLog = cpMissDb.calls.find(c => c.table === 'coupon_attempts' && c.op === 'insert')
+  assert(cpMissLog?.payload.ok === false && cpMissLog.payload.code === 'NOPE99',
+    '不存在的码也要记，且记原文——那正是「有人在穷举」的唯一信号')
+}
+
+// —— 券码形状在打库之前就要挡住 ——
+{
+  for (const [cpLabel, cpCode] of [['太短', 'AB'], ['小写会被转大写所以不算', ''], ['非法字符', 'SAVE 20'], ['起头是横线', '-SAVE'], ['太长', 'A'.repeat(33)]]) {
+    const cpShapeDb = recorder()
+    const cpRes = await quoteCoupon(cpShapeDb, { userId: cpUser, group: 'default' }, { code: cpCode, artifact_id: cpArtifact.id })
+    assert(cpRes.status === 400, `${cpLabel} 要 400`)
+    assert(cpShapeDb.calls.length === 0, `${cpLabel} 不该产生任何数据库调用，连限流表都不该碰`)
+  }
+  const cpBadArt = recorder()
+  assert((await quoteCoupon(cpBadArt, { userId: cpUser, group: 'default' }, { code: 'SAVE20', artifact_id: 'nope' })).status === 400,
+    '商品 ID 不是 UUID 要 400，而不是把 22P02 变成 500')
+  assert(cpBadArt.calls.length === 0, '非法商品 ID 也不该打库')
+}
+
+// —— 券填错时下单必须失败，不能静默按原价 ——
+{
+  const cpMissing = await couponFieldsFor(recorder({ coupons: { data: null, error: null } }), { code: 'GHOST1', artifact: cpArtifact, userId: cpUser, userGroup: 'default' })
+  assert(cpMissing.ok === false && cpMissing.status === 404, '下单时券不存在是 404')
+  const cpExpired = await couponFieldsFor(
+    recorder({ coupons: { data: { ...cpCoupon, ends_at: '2020-01-01T00:00:00Z' }, error: null }, orders: { data: [], error: null } }),
+    { code: 'SAVE20', artifact: cpArtifact, userId: cpUser, userGroup: 'default' })
+  assert(cpExpired.ok === false && cpExpired.status === 409,
+    '预览里「条件不满足」是 200，下单时同一件事是 409——用户带着一张他以为能用的券来的')
+  assert(cpExpired.fields === undefined, '失败时不返回 fields，免得调用方顺手按原价下单')
+
+  // 无券是正常路径，形状要和有券一致，调用方不需要分支。
+  const cpNoCode = await couponFieldsFor(recorder(), { code: '', artifact: cpArtifact, userId: cpUser, userGroup: 'default' })
+  assert(cpNoCode.ok && cpNoCode.coupon === null, '空码不是错误')
+  assert(cpNoCode.fields.amount_minor === 10000 && cpNoCode.fields.discount_minor === 0 && cpNoCode.fields.coupon_code === '',
+    '无券也要写 list_amount_minor 和 sku 快照，否则订单页对老订单显示不出原价')
+  assert(cpNoCode.fields.list_amount_minor === 10000 && cpNoCode.fields.sku_name === '专业版', '无券也要有快照')
+}
+
+// —— 核销：抢不到名额就把刚建的订单删掉 ——
+{
+  const cpOrder = { id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', status: 'pending' }
+  const cpWin = recorder({ 'rpc:redeem_coupon': { data: true, error: null } })
+  assert((await redeemOrRollback(cpWin, { coupon: cpCoupon, order: cpOrder, userId: cpUser, discountMinor: 2000 })).ok,
+    '抢到名额就继续')
+  assert(cpWin.rpcs[0].fn === 'redeem_coupon', '核销走存储过程，不是「先 select 再 update」')
+  assert(cpWin.rpcs[0].params.p_discount === 2000,
+    'p_discount 传错就是 coupon_redemptions 里记着一个和订单不一致的折扣，而那笔账看起来完全正常')
+  assert(cpWin.rpcs[0].params.p_order === cpOrder.id && cpWin.rpcs[0].params.p_user === cpUser, '核销要绑订单和人')
+  assert(cpWin.calls.length === 0, '成功时不该动 orders')
+
+  const cpLost = recorder({ 'rpc:redeem_coupon': { data: false, error: null } })
+  const cpLostOut = await redeemOrRollback(cpLost, { coupon: cpCoupon, order: cpOrder, userId: cpUser, discountMinor: 2000 })
+  assert(cpLostOut.ok === false && cpLostOut.status === 409, '限量券被抢完是 409')
+  const cpDel = cpLost.calls.find(c => c.table === 'orders' && c.op === 'delete')
+  assert(cpDel, '抢不到就删掉刚建的订单，否则买家的重试会撞上 one_pending_order_per_user 而他并不知道自己有单')
+  assert(cpDel.filters.id === cpOrder.id, '只删这一笔')
+  assert(cpDel.filters.status === 'pending',
+    "删除必须带 status='pending'：万一回调已经把订单标成 paid，那笔钱是真收到的，绝不能删")
+
+  const cpRpcErr = recorder({ 'rpc:redeem_coupon': { data: null, error: { message: 'boom' } } })
+  const cpErrOut = await redeemOrRollback(cpRpcErr, { coupon: cpCoupon, order: cpOrder, userId: cpUser, discountMinor: 2000 })
+  assert(cpErrOut.ok === false && cpErrOut.status === 409, '存储过程报错也要回滚，不能让订单带着没核销的券留下')
+  assert(cpRpcErr.calls.some(c => c.op === 'delete'), '报错路径同样要删单')
+
+  const cpNoCoupon = recorder()
+  assert((await redeemOrRollback(cpNoCoupon, { coupon: null, order: cpOrder, userId: cpUser, discountMinor: 0 })).ok, '无券直接过')
+  assert(cpNoCoupon.rpcs.length === 0, '无券不调核销')
+}
+
+// —— 「不限用户」在三层里的两种写法必须对得上 ——
+//
+// 数据库：allowed_user_ids 是 `not null default '{}'`，「不限」只能是空数组。
+// 求值层：checkAvailability 和 SQL 的 redeem_coupon 都把空数组当「不限」。
+// 校验层：validateCoupon 明确拒绝空数组，让调用方改用 null。
+// 于是一张不限用户的券，它在库里的形状正好是校验唯一拒绝的形状——不翻译的话，后台每保存一次都会被
+// 自己的校验挡住，而报错让人去填一个存不进去的 null。
+{
+  const cpFree = { code: 'FREE01', conditions: [], actions: [{ type: 'percent', value: 9000 }], allowed_user_ids: [] }
+  assert(validateCoupon(cpFree).ok === false,
+    'validateCoupon 仍然拒绝空数组——这条检查防的是「填了个空名单以为是不限」的真实误配，不该为了后台方便就放开')
+  assert(validateCoupon(forValidation(cpFree)).ok,
+    '经过 forValidation 翻译之后同一张券可以保存')
+  assert(forValidation({ allowed_user_ids: [] }).allowed_user_ids === null, '空数组翻译成 null')
+  assert(forValidation({ allowed_user_ids: [cpUser] }).allowed_user_ids.length === 1, '非空名单原样保留')
+
+  // 求值层那一端：空数组必须是「谁都能用」，否则翻译方向就反了。
+  const cpUnrestricted = await couponFieldsFor(
+    recorder({ coupons: { data: { ...cpCoupon, allowed_user_ids: [] }, error: null }, orders: { data: [], error: null } }),
+    { code: 'SAVE20', artifact: cpArtifact, userId: cpUser, userGroup: 'default' })
+  assert(cpUnrestricted.ok, '空 allowed_user_ids 是「不限用户」，任何人都能用')
+  const cpRestricted = await couponFieldsFor(
+    recorder({ coupons: { data: { ...cpCoupon, allowed_user_ids: ['99999999-9999-4999-8999-999999999999'] }, error: null }, orders: { data: [], error: null } }),
+    { code: 'SAVE20', artifact: cpArtifact, userId: cpUser, userGroup: 'default' })
+  assert(cpRestricted.ok === false, '名单里没有这个人就不能用')
+}
+
+// —— 后台不能改的那几列 ——
+{
+  assert(NEVER_WRITABLE.includes('used_count'),
+    'used_count 是 total_limit 的账本，由 redeem_coupon 在一条带条件的 UPDATE 里加。放开它等于允许把「已发完」改回「还有余量」，而那是超发')
+  for (const cpCol of ['id', 'created_by', 'created_at', 'updated_at']) {
+    assert(NEVER_WRITABLE.includes(cpCol), `${cpCol} 不该由请求体决定`)
+  }
+}
+
+// —— SQL 那一侧：核销和退回的关键条件 ——
+{
+  const cpRedeemSql = schemaSql.match(/create or replace function public\.redeem_coupon[\s\S]*?\$\$;/)[0]
+  assert(/used_count = used_count \+ 1/.test(cpRedeemSql) && /where id = p_coupon/.test(cpRedeemSql),
+    '核销必须是一条带条件的 UPDATE：先 select 再 update 在两笔单同时结账时两边都会读到「还没满」，于是限量 1 的券被用两次')
+  assert(/total_limit is null or used_count < total_limit/.test(cpRedeemSql), '总量上限在 SQL 里判定')
+  assert(/allowed_user_ids = '\{\}' or p_user = any\(allowed_user_ids\)/.test(cpRedeemSql),
+    "SQL 也把 '{}' 当「不限」——三层里的第三层，和 forValidation 的翻译方向必须一致")
+  assert(/revoke all on function public\.redeem_coupon/.test(schemaSql),
+    '核销不能 grant 给 authenticated，否则用户可以自己核销')
+
+  const cpReleaseSql = schemaSql.match(/create or replace function public\.release_coupon[\s\S]*?\$\$;/)[0]
+  assert(/if removed = 0 then return false/.test(cpReleaseSql),
+    '删不到核销行就不减计数——少了这个条件，重复调用会把 used_count 减到比真实核销数还低，于是超发')
+  assert(/greatest\(used_count - removed, 0\)/.test(cpReleaseSql), '计数不该为负')
+  assert(/revoke all on function public\.release_coupon/.test(schemaSql), '退回也只给 service client')
+
+  // 退回做成触发器：能让订单离开 pending 的地方不止一处，在每处各写一遍就意味着漏掉一处而没人发现。
+  const cpTrigger = schemaSql.match(/create trigger orders_release_coupon after update of status[\s\S]*?execute function[^;]*;/)[0]
+  assert(/old\.status = 'pending'/.test(cpTrigger) && /new\.status in \('cancelled','failed'\)/.test(cpTrigger),
+    '只在订单进入 cancelled/failed 时退回')
+  assert(!/refunded/.test(cpTrigger),
+    'refunded 不能触发退回：那笔钱真的收过，券也真的用掉了。否则一张限量券可以用一次、退一次、再用一次')
+  assert(/create trigger orders_release_coupon_delete before delete/.test(schemaSql),
+    '删除也要覆盖：coupon_redemptions 是 on delete cascade，核销行会跟着消失但 used_count 不会自己减，所以要 BEFORE DELETE')
+
+  // 尝试记录的可见性：用户连自己那几条也不给——给了就等于给出一份「哪些码我试过」的清单。
+  const cpAttemptPolicy = schemaSql.match(/create policy coupon_attempts_read[\s\S]*?;/)[0]
+  assert(/is_staff\(\)/.test(cpAttemptPolicy) && !/user_id = /.test(cpAttemptPolicy),
+    'coupon_attempts 只有 staff 能读，没有「读自己的」那一条')
+  assert(!/create policy coupon_attempts_(insert|write|update)/.test(schemaSql),
+    '没有写策略：只有 service client 写，和审计表同一个理由')
+}
+
+console.log('Coupons: OK')

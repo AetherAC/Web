@@ -40,6 +40,10 @@ export async function cancelPendingOrder(db, userId, orderId) {
     return { status: 409, body: { error: `订单当前状态为 ${existing.status}，只有待支付的订单可以取消`, order: existing } }
   }
 
+  // 券的名额不在这里退。orders_release_coupon 那个触发器会在 pending → cancelled 时调 release_coupon，
+  // 因为能让订单离开 pending 的地方不止这一处（管理员改状态、下单失败回滚、以后的超时清理），在每处各写
+  // 一遍就意味着漏掉一处而没人发现。
+  //
   // Deliberately one-way: if the buyer had the hosted checkout open in another tab and pays after this,
   // the provider callback still marks the order paid. Money actually received should hand over the
   // artifact rather than vanish into a cancelled row — so the UI tells them to close that page.
