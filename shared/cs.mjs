@@ -170,13 +170,15 @@ export function sanitizeHtml(input) {
 export const MESSAGE_MAX_CHARS = 8000
 export const MAX_ATTACHMENTS = 10
 
-export function prepareMessage(input, { allowHtml = false, allowBbcode = true } = {}) {
+export function prepareMessage(input, {
+  allowHtml = false, allowBbcode = true, sessionId = null, uploaderId = null
+} = {}) {
   const format = String(input?.format || 'markdown')
   if (!MESSAGE_FORMATS.includes(format)) return { ok: false, error: 'format 不是支持的消息格式' }
   if (format === 'html' && !allowHtml) return { ok: false, error: '站点当前不允许发送 HTML 消息' }
   if (format === 'bbcode' && !allowBbcode) return { ok: false, error: '站点当前不允许发送 BBCode 消息' }
 
-  const attachments = normalizeAttachments(input?.attachments)
+  const attachments = normalizeAttachments(input?.attachments, { sessionId, uploaderId })
   if (!attachments.ok) return attachments
 
   let body = String(input?.body ?? '')
@@ -188,13 +190,52 @@ export function prepareMessage(input, { allowHtml = false, allowBbcode = true } 
   return { ok: true, body, format, attachments: attachments.value }
 }
 
+/** §4.2/§4.5/§4.6 的三类附件，以及每一类的限额配置项。 */
+export const ATTACHMENT_KINDS = ['image', 'file', 'video']
+export const UPLOAD_LIMIT_KEY = {
+  image: 'cs_upload_max_image_mb',
+  file: 'cs_upload_max_file_mb',
+  video: 'cs_upload_max_video_mb'
+}
+export const ATTACHMENT_BUCKET = 'cs-attachments'
+
+/** 路径的形状：{session_id}/{uid}/{文件名}，和 schema.sql 里 cs_attach_insert 的三段约定一致。 */
+export const ATTACHMENT_PATH_RE =
+  /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/([A-Za-z0-9._-]{1,120})$/i
+
+/**
+ * 拼一个上传路径。前端必须用这个函数而不是自己拼字符串：
+ * 段数或顺序错了的表现是上传成功、发消息被拒（或者反过来），而两者都不会告诉你路径写错在哪。
+ */
+export function attachmentPath(sessionId, uploaderId, filename) {
+  const safe = String(filename || 'file')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')   // 中文名、空格、括号一律换成横线：路径里它们是最容易出事的字符
+    .replace(/^-+|-+$/g, '')
+    .slice(-80) || 'file'
+  // 前缀一个随机段：同一个人两次传同名文件不该互相覆盖，而 storage 的 upsert 默认是关的（会报 409）。
+  const stamp = Math.random().toString(36).slice(2, 8)
+  return `${sessionId}/${uploaderId}/${stamp}-${safe}`
+}
+
+/** 按 MIME 归类。归错的后果只是套用了另一档限额，所以按前缀粗判就够。 */
+export function attachmentKindOf(mime) {
+  const m = String(mime || '').toLowerCase()
+  if (m.startsWith('image/')) return 'image'
+  if (m.startsWith('video/')) return 'video'
+  return 'file'
+}
+
 /**
  * 附件只存引用（bucket 里的路径 + 元信息），不存内容。
  *
- * 大小上限在这里不判：真实大小由 storage 的策略决定，请求体里报的那个数字是用户写的。这里只把它当
- * 展示用的元信息收下来，用来在下载前显示「12.4 MB」。信它来做准入判断等于没有上限。
+ * 请求体里报的 size 是用户写的，所以它只当展示用的元信息收下来（下载前显示「12.4 MB」）。真实大小的
+ * 判定在 api/_lib/cs.mjs 的 verifyAttachments 里，那一步去 storage 问对象的 metadata。
+ *
+ * sessionId / uploaderId 传进来时会钉住路径的前两段。不钉的话，一条消息可以把 path 指向另一个会话
+ * 目录下的文件——存储策略只管「谁能上传、谁能下载」，管不了「哪条消息可以引用哪个路径」，于是
+ * 会话 A 的人只要知道路径就能把会话 B 的附件贴进自己的会话里展示出来。
  */
-export function normalizeAttachments(input) {
+export function normalizeAttachments(input, { sessionId = null, uploaderId = null } = {}) {
   if (input === undefined || input === null) return { ok: true, value: [] }
   if (!Array.isArray(input)) return { ok: false, error: 'attachments 必须是数组' }
   if (input.length > MAX_ATTACHMENTS) return { ok: false, error: `一条消息最多 ${MAX_ATTACHMENTS} 个附件` }
@@ -202,13 +243,16 @@ export function normalizeAttachments(input) {
   for (const raw of input) {
     if (!raw || typeof raw !== 'object') return { ok: false, error: '附件必须是对象' }
     const path = String(raw.path || '').trim()
-    // 路径必须落在 cs-attachments 桶的会话目录下。存储策略也会校验一遍，这里挡住的是「把消息里的
-    // 附件路径指向别人会话的文件」——那样一条消息就能把别的会话的附件展示出来。
-    if (!/^[0-9a-f-]{36}\/[A-Za-z0-9._-]{1,120}$/i.test(path)) {
-      return { ok: false, error: '附件路径不合法' }
+    const m = ATTACHMENT_PATH_RE.exec(path)
+    if (!m) return { ok: false, error: '附件路径不合法，应为 会话id/用户id/文件名' }
+    if (sessionId && m[1].toLowerCase() !== String(sessionId).toLowerCase()) {
+      return { ok: false, error: '附件不属于当前会话' }
+    }
+    if (uploaderId && m[2].toLowerCase() !== String(uploaderId).toLowerCase()) {
+      return { ok: false, error: '只能引用自己上传的附件' }
     }
     const kind = String(raw.kind || 'file')
-    if (!['image', 'file', 'video'].includes(kind)) return { ok: false, error: '附件类型只能是 image/file/video' }
+    if (!ATTACHMENT_KINDS.includes(kind)) return { ok: false, error: '附件类型只能是 image/file/video' }
     value.push({
       path, kind,
       name: String(raw.name || '').slice(0, 200),
@@ -218,6 +262,39 @@ export function normalizeAttachments(input) {
   }
   return { ok: true, value }
 }
+
+/**
+ * 三档限额的解析。缺配置时用 §11 里那三个种子值，不是「无上限」——
+ * 取不到配置就放行的写法意味着删掉一行 site_settings 等于关掉上限。
+ */
+export function uploadLimits(settings = {}) {
+  const mb = (key, fallback) => {
+    const n = Number(settings[key])
+    return Number.isFinite(n) && n > 0 ? n : fallback
+  }
+  return {
+    image: mb(UPLOAD_LIMIT_KEY.image, 10),
+    file: mb(UPLOAD_LIMIT_KEY.file, 25),
+    video: mb(UPLOAD_LIMIT_KEY.video, 100)
+  }
+}
+
+/** 单个附件的大小判定。bytes 为 null/undefined 表示问不到——那种情况按拒绝算，理由在 verifyAttachments。 */
+export function checkAttachmentSize(kind, bytes, limits) {
+  const limitMb = limits?.[kind] ?? limits?.file ?? 25
+  const max = limitMb * 1024 * 1024
+  // 不能只判 Number.isFinite：Number(null) 是 0，于是「问不到大小」会被当成一个 0 字节的文件放过去。
+  if (bytes === null || bytes === undefined || bytes === '' || !Number.isFinite(Number(bytes))) {
+    return { ok: false, error: '无法确认附件大小' }
+  }
+  if (Number(bytes) > max) {
+    return { ok: false, error: `${KIND_LABEL_CN[kind] || '文件'}不能超过 ${limitMb} MB`, limitMb }
+  }
+  return { ok: true }
+}
+
+const KIND_LABEL_CN = { image: '图片', file: '文件', video: '视频' }
+export const ATTACHMENT_KIND_LABEL = KIND_LABEL_CN
 
 /** §3.1 的关键词匹配。大小写不敏感——用户不会照着配置里的大小写打字。 */
 export function matchesKeyword(text, keywords, mode = 'contains') {

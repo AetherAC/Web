@@ -11,8 +11,13 @@
  */
 
 import { RANK, bodyOf, rankOf, requireUser, send } from './_lib/server.mjs'
-import { MESSAGE_MAX_CHARS, prepareMessage, presentMessage, sessionCapabilities } from '../shared/cs.mjs'
-import { CS_SETTING_KEYS, deliverAutoReply, insertMessage, logEvent, settingsOf, touchSession } from './_lib/cs.mjs'
+import {
+  MESSAGE_MAX_CHARS, prepareMessage, presentMessage, sessionCapabilities, uploadLimits
+} from '../shared/cs.mjs'
+import {
+  CS_SETTING_KEYS, clientConfig, deliverAutoReply, insertMessage, logEvent,
+  settingsOf, touchSession, verifyAttachments
+} from './_lib/cs.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -93,9 +98,17 @@ export async function sendMessage(db, auth, input) {
   const settings = await settingsOf(db, CS_SETTING_KEYS)
   const prepared = prepareMessage(
     { body: input?.body, format: input?.format, attachments: input?.attachments },
-    { allowHtml: settings.cs_allow_html === true, allowBbcode: settings.cs_allow_bbcode !== false }
+    {
+      allowHtml: settings.cs_allow_html === true, allowBbcode: settings.cs_allow_bbcode !== false,
+      // 路径的前两段钉在「这个会话」和「这个人」上。少了它，知道路径的人可以把别的会话的附件
+      // 引用进自己的会话——storage 的读策略按第一段判可见性，那时第一段是别人的会话 id。
+      sessionId, uploaderId: auth.userId
+    }
   )
   if (!prepared.ok) return { status: 400, body: { error: prepared.error } }
+  // 真实大小：浏览器直传，字节没经过这里，所以要去桶里问一次。
+  const sized = await verifyAttachments(db, prepared.attachments, uploadLimits(settings))
+  if (!sized.ok) return { status: 400, body: { error: sized.error } }
 
   const staff = rankOf(auth.group) >= RANK.STAFF
   const asAdmin = caps.is_admin && !caps.is_owner
@@ -209,7 +222,13 @@ export async function editMessage(db, auth, input) {
   // 编辑走同一套清洗。少了这一步就是一个绕过 §4.4 的洞：先发一句干净的，再编辑成带脚本的。
   const prepared = prepareMessage(
     { body: input?.body, format: input?.format || message.format, attachments: message.attachments },
-    { allowHtml: settings.cs_allow_html === true, allowBbcode: settings.cs_allow_bbcode !== false }
+    {
+      allowHtml: settings.cs_allow_html === true, allowBbcode: settings.cs_allow_bbcode !== false,
+      // 只钉会话，不钉上传者。附件是从行里读回来的、发送时已经校验过的那一份，而当初那次上传
+      // 可能是管理员以客服名义做的（sender_id 是客服，路径上的第二段是管理员）——钉上传者的话，
+      // 客服编辑那条消息会被自己的附件挡住。
+      sessionId: session.id
+    }
   )
   if (!prepared.ok) return { status: 400, body: { error: prepared.error } }
   // 「编辑成全空」已经被 prepareMessage 挡掉了（正文和附件都空才算空）。这里剩下的是另一种情况：
@@ -291,12 +310,25 @@ export async function typingGate(db, auth, input) {
   }
 }
 
+/**
+ * 输入框需要、但浏览器读不到的配置。任何登录用户都能取——里面没有秘密，只有「允许什么格式、
+ * 多大算超限」这类前端必须知道才能给出体面提示的东西。
+ */
+export async function composerConfig(db) {
+  const settings = await settingsOf(db, CS_SETTING_KEYS)
+  return { status: 200, body: clientConfig(settings) }
+}
+
 export default async function handler(req, res) {
   const auth = await requireUser(req, res)
   if (!auth) return
   const caller = { db: auth.db, userId: auth.user.id, group: auth.group }
   try {
     if (req.method === 'GET') {
+      if (String(req.query?.view || '') === 'config') {
+        const { status, body } = await composerConfig(auth.db)
+        return send(res, status, body)
+      }
       const { status, body } = await listMessages(auth.db, caller, {
         session_id: req.query?.session_id, limit: req.query?.limit, after: req.query?.after
       })
@@ -310,7 +342,8 @@ export default async function handler(req, res) {
       recall: () => recallMessage(auth.db, caller, input),
       edit: () => editMessage(auth.db, caller, input),
       read: () => markRead(auth.db, caller, input),
-      typing: () => typingGate(auth.db, caller, input)
+      typing: () => typingGate(auth.db, caller, input),
+      config: () => composerConfig(auth.db)
     }
     const run = actions[String(input?.action || 'send')]
     if (!run) return send(res, 400, { error: `action 必须是 ${Object.keys(actions).join('/')}` })

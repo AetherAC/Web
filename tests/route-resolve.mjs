@@ -51,7 +51,7 @@ assert.ok(queryForm, 'the query form must resolve to a page module, or the order
 assert.match(queryForm, /^order\.md\.[A-Za-z0-9_-]+\.js$/, `expected the built order page module, got ${queryForm}`)
 
 // Every route the site links to, so a future rename cannot quietly 404 the same way.
-for (const route of ['/', '/blog', '/news', '/progress', '/studio', '/login', '/register', '/me', '/buy', '/admin', '/order']) {
+for (const route of ['/', '/blog', '/news', '/progress', '/studio', '/login', '/register', '/me', '/buy', '/admin', '/order', '/cs']) {
   assert.ok(resolve(route), `${route} does not resolve to a page module`)
 }
 

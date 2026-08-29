@@ -134,21 +134,27 @@ import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mj
 // markRead（站内信那个）、csRow、csBlocked，同名会是一句 SyntaxError 而不是一次失败的断言。
 import {
   ADMIN_MODES as sxAdminModes, CHANNELS as sxChannels, MESSAGE_FORMATS as sxFormats,
-  dispatchPriority as sxDispatch, isHeartbeatStale as sxStale, isSessionIdle as sxIdle,
-  matchesKeyword as sxMatch, normalizeAttachments as sxAttach, pickAgent as sxPick,
-  pickAutoReply as sxPickReply, prepareMessage as sxPrepare, presentMessage as sxPresent,
-  sanitizeHtml as sxClean, servesChannel as sxServes, sessionCapabilities as sxCaps,
-  sessionMetrics as sxSessionMetrics, timeoutTextKeys as sxTimeoutKeys
+  attachmentKindOf as sxKindOf, attachmentPath as sxAttachPath,
+  checkAttachmentSize as sxSize, dispatchPriority as sxDispatch, isHeartbeatStale as sxStale,
+  isSessionIdle as sxIdle, matchesKeyword as sxMatch, normalizeAttachments as sxAttach,
+  pickAgent as sxPick, pickAutoReply as sxPickReply, prepareMessage as sxPrepare,
+  presentMessage as sxPresent, sanitizeHtml as sxClean, servesChannel as sxServes,
+  sessionCapabilities as sxCaps, sessionMetrics as sxSessionMetrics,
+  timeoutTextKeys as sxTimeoutKeys, uploadLimits as sxLimits
 } from '../shared/cs.mjs'
-import { sessionTouchFor as sxTouch } from '../api/_lib/cs.mjs'
+import {
+  CS_SETTING_KEYS as SX_SETTING_KEYS, clientConfig as sxClientConfig,
+  sessionTouchFor as sxTouch, verifyAttachments as sxVerify
+} from '../api/_lib/cs.mjs'
 import {
   claimSession as sxClaimSession, closeSession as sxCloseSession, openSession as sxOpenSession,
   reopenSession as sxReopenSession, setAdminMode as sxSetAdminMode, setPresence as sxSetPresence,
   sweepIdleSessions as sxSweep
 } from '../api/cs-session.mjs'
 import {
-  editMessage as sxEditMessage, listMessages as sxListMessages, markRead as sxMarkRead,
-  recallMessage as sxRecallMessage, sendMessage as sxSendMessage, typingGate as sxTypingGate
+  composerConfig as sxComposerConfig, editMessage as sxEditMessage,
+  listMessages as sxListMessages, markRead as sxMarkRead, recallMessage as sxRecallMessage,
+  sendMessage as sxSendMessage, typingGate as sxTypingGate
 } from '../api/cs-message.mjs'
 import {
   chatCouponCode as sxCouponCode, listSessionOrders as sxSessionOrders,
@@ -1315,6 +1321,38 @@ const recorder = (results = {}) => {
     if (typeof slot === 'function') return slot(params) ?? { data: null, error: null }
     if (Array.isArray(slot)) return (slot.length > 1 ? slot.shift() : slot[0]) ?? { data: null, error: null }
     return slot ?? { data: true, error: null }
+  }
+  // §4.5 附件的大小要问真实的对象元信息，不能信客户端报的 size——文件直接从浏览器传进桶里，
+  // 那个数字从来没经过函数。所以 verifyAttachments 会回来问 storage，而这里得能作答。
+  // 结果的给法和上面的表一致（对象 / 数组 / 函数），键是 `storage:<bucket>`。
+  rec.storageCalls = []
+  rec.storage = {
+    from(bucket) {
+      const slot = results[`storage:${bucket}`]
+      const answer = entry => {
+        if (typeof slot === 'function') return slot(entry) ?? { data: [], error: null }
+        if (Array.isArray(slot)) return (slot.length > 1 ? slot.shift() : slot[0]) ?? { data: [], error: null }
+        return slot ?? { data: [], error: null }
+      }
+      return {
+        async list(dir, opts) {
+          const entry = { bucket, op: 'list', dir, opts }
+          rec.storageCalls.push(entry)
+          return answer(entry)
+        },
+        // remove 要记：超限的对象必须被删掉，否则一个 100MB 的视频靠「发一条会被拒的消息」
+        // 就永久留在了桶里，而没有任何一条消息引用它，也就没有人会去清。
+        async remove(paths) {
+          const entry = { bucket, op: 'remove', paths }
+          rec.storageCalls.push(entry)
+          return { data: null, error: results[`storage:${bucket}:remove`]?.error ?? null }
+        },
+        async createSignedUrl(path, ttl) {
+          rec.storageCalls.push({ bucket, op: 'sign', path, ttl })
+          return { data: { signedUrl: `https://example.test/${path}` }, error: null }
+        }
+      }
+    }
   }
   return rec
 }
@@ -2900,27 +2938,67 @@ console.log('Coupons: OK')
   const sxHtmlOn = sxPrepare({ body: '<b>x</b><script>y</script>', format: 'html' }, { allowHtml: true })
   assert(sxHtmlOn.ok && !/script/i.test(sxHtmlOn.body), 'HTML 开启也要清洗——开关管的是格式，不是安全')
   assert(!sxPrepare({ body: '', attachments: [] }).ok, '空消息且无附件要拒绝')
-  assert(sxPrepare({ body: '', attachments: [{ path: '11111111-1111-1111-1111-111111111111/a.png', size: 10 }] }).ok,
+  const SX_A_SID = '11111111-1111-4111-8111-111111111111'
+  const SX_A_UID = '22222222-2222-4222-8222-222222222222'
+  assert(sxPrepare({ body: '', attachments: [{ path: `${SX_A_SID}/${SX_A_UID}/a.png`, size: 10 }] }).ok,
     '只有附件没有正文是合法的——发一张截图不必配文字')
   assert(!sxPrepare({ body: 'x'.repeat(9000) }).ok, '超长正文要拒绝')
 
-  // 附件路径必须是「一段 36 字符的 id / 文件名」。挡的是把附件指向另一个会话目录下的文件——
-  // 那个文件可能是别人的订单截图。归属由 storage 策略最终决定，这里挡住的是形状。
+  // 附件路径是三段：{会话id}/{上传者id}/{文件名}，和 schema.sql 里 cs_attach_insert 的约定一致。
+  // 两边不一致的表现最难查：一条能上传成功的路径会在发消息时被拒，而一条 API 接受的路径根本传不进桶里。
   assert(!sxPrepare({ body: 'x', attachments: [{ path: '../other/secret.png' }] }).ok,
     '带 .. 的路径不能通过')
   assert(!sxPrepare({ body: 'x', attachments: [{ path: 'short/a.png' }] }).ok,
-    '不是 36 字符 id 段的路径不能通过')
-  assert(!sxPrepare({ body: 'x', attachments: [{ path: '11111111-1111-1111-1111-111111111111/a b.png' }] }).ok,
+    '不是 UUID 段的路径不能通过')
+  assert(!sxPrepare({ body: 'x', attachments: [{ path: `${SX_A_SID}/a.png` }] }).ok,
+    '两段的路径要拒——存储策略按第二段判上传者，两段的路径在桶里根本落不下来')
+  assert(!sxPrepare({ body: 'x', attachments: [{ path: `${SX_A_SID}/${SX_A_UID}/a b.png` }] }).ok,
     '文件名里的空格不能通过——它是拼路径时最容易出事的字符')
   const sxAttach = sxPrepare({ body: 'x', attachments: [
-    { path: '11111111-1111-1111-1111-111111111111/a.png', kind: 'image', size: 99, name: 'a.png' }] })
+    { path: `${SX_A_SID}/${SX_A_UID}/a.png`, kind: 'image', size: 99, name: 'a.png' }] })
   assert(sxAttach.ok && sxAttach.attachments[0].size === 99,
-    '声明的大小收下来当展示元信息——但它是用户写的数字，不能用来做准入判断')
+    '声明的大小收下来当展示元信息——但它是用户写的数字，真实判定在 verifyAttachments')
   assert(!sxPrepare({ body: 'x', attachments: [
-    { path: '11111111-1111-1111-1111-111111111111/a.png', kind: 'script' }] }).ok,
+    { path: `${SX_A_SID}/${SX_A_UID}/a.png`, kind: 'script' }] }).ok,
     'kind 只能是 image/file/video')
   assert(!sxPrepare({ body: 'x', attachments: new Array(11).fill(
-    { path: '11111111-1111-1111-1111-111111111111/a.png' }) }).ok, '附件数量有上限')
+    { path: `${SX_A_SID}/${SX_A_UID}/a.png` }) }).ok, '附件数量有上限')
+
+  // 前两段的归属校验。这是「引用别人会话的附件」那个洞：存储的读策略按第一段判可见性，所以一条
+  // 消息只要把 path 的第一段写成另一个会话的 id，那个会话的成员就能在自己这边把它展示出来。
+  const sxOtherSid = '99999999-9999-4999-8999-999999999999'
+  assert(!sxPrepare({ body: 'x', attachments: [{ path: `${sxOtherSid}/${SX_A_UID}/a.png` }] },
+    { sessionId: SX_A_SID }).ok, '附件路径的会话段和当前会话不一致要拒')
+  assert(!sxPrepare({ body: 'x', attachments: [{ path: `${SX_A_SID}/${sxOtherSid}/a.png` }] },
+    { uploaderId: SX_A_UID }).ok, '附件路径的上传者段和发送者不一致要拒')
+  assert(sxPrepare({ body: 'x', attachments: [{ path: `${SX_A_SID}/${SX_A_UID}/a.png` }] },
+    { sessionId: SX_A_SID.toUpperCase(), uploaderId: SX_A_UID.toUpperCase() }).ok,
+    'UUID 的大小写不该影响归属判定')
+
+  // attachmentPath 是前端唯一该用的拼路径方式。它的产物必须能过 normalizeAttachments——
+  // 两者不一致的话，上传成功而发消息被拒，而错误信息里看不出是哪一段写错了。
+  const sxBuilt = sxAttachPath(SX_A_SID, SX_A_UID, '订单截图 (1).png')
+  assert(sxPrepare({ body: 'x', attachments: [{ path: sxBuilt }] },
+    { sessionId: SX_A_SID, uploaderId: SX_A_UID }).ok,
+    'attachmentPath 造出来的路径必须能过校验，中文名和空格都要被换掉')
+  assert(sxAttachPath(SX_A_SID, SX_A_UID, 'a.png') !== sxAttachPath(SX_A_SID, SX_A_UID, 'a.png'),
+    '同名文件两次上传要得到不同路径——否则第二次会撞上 storage 的 409')
+  assert(sxKindOf('image/png') === 'image' && sxKindOf('video/mp4') === 'video' &&
+    sxKindOf('application/pdf') === 'file' && sxKindOf('') === 'file', 'MIME 按前缀归类，认不出的算 file')
+
+  // §4.5/§4.6 三档限额。缺配置时用种子值而不是「无上限」：取不到配置就放行的写法意味着
+  // 删掉一行 site_settings 等于关掉上限。
+  assert(sxLimits({}).image === 10 && sxLimits({}).file === 25 && sxLimits({}).video === 100,
+    '缺配置用 §11 的种子值')
+  assert(sxLimits({ cs_upload_max_image_mb: 3 }).image === 3, '配置值生效')
+  assert(sxLimits({ cs_upload_max_image_mb: 0 }).image === 10 &&
+    sxLimits({ cs_upload_max_image_mb: -5 }).image === 10,
+    '0 和负数当没填——一个手滑填成 0 的上限会让所有图片都发不出去，那不像是有人想要的效果')
+  assert(sxSize('image', 5 * 1024 * 1024, sxLimits({})).ok, '5MB 的图片在 10MB 档内')
+  assert(!sxSize('image', 11 * 1024 * 1024, sxLimits({})).ok, '11MB 的图片超 10MB 档')
+  assert(sxSize('video', 11 * 1024 * 1024, sxLimits({})).ok, '同样 11MB 的视频在 100MB 档内——分档的意义就在这里')
+  assert(!sxSize('image', null, sxLimits({})).ok,
+    '问不到大小要拒。放行意味着「让 storage 报一次错」就能绕过上限')
 
   // §2.13 首响时间。这是 sessionTouchFor 存在的主要理由：自动回复不能计入首响。
   const sxSession = { id: 's1', channel: 'presale', user_id: 'u1', agent_id: 'a1', status: 'open',
@@ -3106,7 +3184,8 @@ console.log('CS logic: OK')
     cs_max_concurrent_default: 5, cs_heartbeat_timeout_seconds: 90, cs_activity_basis: 'message',
     cs_timeout_presale_minutes: 10, cs_timeout_postsale_minutes: 30,
     cs_no_agent_text: '当前无人在线', cs_welcome_text: '请描述您的问题',
-    cs_allow_html: false, cs_allow_bbcode: true, cs_typing_trigger: 'keypress'
+    cs_allow_html: false, cs_allow_bbcode: true, cs_typing_trigger: 'keypress',
+    cs_upload_max_image_mb: 10, cs_upload_max_file_mb: 25, cs_upload_max_video_mb: 100
   }
   // site_settings 一次取多个 key，形状是 { value: ... } 的 jsonb。
   const sxSettings = (over = {}) => entry => {
@@ -3410,6 +3489,123 @@ console.log('CS logic: OK')
   assert(sxHtmlIns.payload.body.includes('<b>') && !/onerror/i.test(sxHtmlIns.payload.body),
     '落库前就清洗掉 onerror：留到渲染时清，库里那行对导出和 Realtime 仍然是可执行的')
 
+  // --- §4.5/§4.6 附件的真实大小 -------------------------------------------------------------------
+  // 文件是浏览器直传进桶的，字节数从来没经过这个函数，所以请求里的 size 是用户写的数字。
+  // 上限只有一个地方能判准：问 storage 要对象的元信息。下面这几条钉的就是「问了」和「问不到时拒」。
+  const sxApath = `${sxSid}/${sxUid}/ab12cd-shot.png`
+  const sxAdir = `${sxSid}/${sxUid}`
+  const sxAname = 'ab12cd-shot.png'
+  const sxObj = (bytes, name = sxAname) => ({ name, metadata: { size: bytes } })
+  const sxSendWith = (extra, size = 1) => ({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'user', auto_reply: false }, error: null },
+    cs_auto_replies: { data: [], error: null },
+    site_settings: sxSettings(),
+    ...extra
+  })
+
+  const sxDbOkSize = recorder(sxSendWith({
+    'storage:cs-attachments': { data: [sxObj(2 * 1024 * 1024)], error: null }
+  }))
+  const sxOkSize = await sxSendMessage(sxDbOkSize, sxAsUser, {
+    session_id: sxSid, body: '这是截图',
+    attachments: [{ path: sxApath, kind: 'image', name: 'shot.png', size: 1 }]
+  })
+  assert(sxOkSize.status === 201, '限额内的图片可以发出去')
+  const sxLs = sxDbOkSize.storageCalls.find(c => c.op === 'list')
+  assert(sxLs && sxLs.bucket === 'cs-attachments' && sxLs.dir === sxAdir && sxLs.opts?.search === sxAname,
+    '按目录加 search 查单个对象，而不是把整个目录列出来——一个活跃会话的目录里可能有上百个文件')
+  assert(!sxDbOkSize.storageCalls.some(c => c.op === 'sign' || c.op === 'download'),
+    '只问元信息，不下载。为了一个整数把 100MB 的视频拉进函数会直接把这次调用撑爆')
+  const sxSizeIns = sxDbOkSize.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxSizeIns.payload.attachments[0].size === 2 * 1024 * 1024,
+    '落库的 size 用 storage 报的真实字节数覆盖掉请求里那个 1——否则界面上永远显示 1 B')
+
+  const sxDbBig = recorder(sxSendWith({
+    'storage:cs-attachments': { data: [sxObj(11 * 1024 * 1024)], error: null }
+  }))
+  const sxBig = await sxSendMessage(sxDbBig, sxAsUser, {
+    session_id: sxSid, body: 'x', attachments: [{ path: sxApath, kind: 'image', size: 1 }]
+  })
+  assert(sxBig.status === 400 && /10 MB/.test(sxBig.body.error),
+    '超限要拒，而且错误里带上限额数字——「文件太大」这句话不告诉用户该压到多少')
+  const sxRm = sxDbBig.storageCalls.find(c => c.op === 'remove')
+  assert(sxRm && sxRm.paths.includes(sxApath),
+    '超限的对象要删掉：没有任何消息引用它，留着就是永远不会有人清的垃圾')
+  assert(!sxDbBig.calls.some(c => c.table === 'cs_messages' && c.op === 'insert'), '超限时不写消息')
+
+  // 同样 11MB 的视频要放过去。分三档配置的全部意义就在这里：图片和视频用一个数字的话，
+  // 要么截图能传 100MB，要么录屏根本传不上来。
+  const sxDbVid = recorder(sxSendWith({
+    'storage:cs-attachments': { data: [sxObj(11 * 1024 * 1024, 'ab12cd-clip.mp4')], error: null }
+  }))
+  const sxVid = await sxSendMessage(sxDbVid, sxAsUser, {
+    session_id: sxSid, body: 'x',
+    attachments: [{ path: `${sxSid}/${sxUid}/ab12cd-clip.mp4`, kind: 'video', size: 1 }]
+  })
+  assert(sxVid.status === 201, '11MB 的视频在 100MB 档内，不能被图片那一档挡下')
+
+  const sxDbMissing = recorder(sxSendWith({ 'storage:cs-attachments': { data: [], error: null } }))
+  const sxMissing = await sxSendMessage(sxDbMissing, sxAsUser, {
+    session_id: sxSid, body: 'x', attachments: [{ path: sxApath, kind: 'image' }]
+  })
+  assert(sxMissing.status === 400 && /上传/.test(sxMissing.body.error),
+    '桶里没这个对象要拒。可能是直传还没完成，也可能是编出来的路径——两种都不该落库')
+
+  // 失败要往关的方向倒。放行的话「让 storage 报一次错」本身就是绕过上限的办法。
+  const sxDbStatErr = recorder(sxSendWith({
+    'storage:cs-attachments': { data: null, error: { message: 'boom' } }
+  }))
+  const sxStatErr = await sxSendMessage(sxDbStatErr, sxAsUser, {
+    session_id: sxSid, body: 'x', attachments: [{ path: sxApath, kind: 'image' }]
+  })
+  assert(sxStatErr.status === 400, 'storage 报错时拒绝，不是放行')
+  assert(!sxDbStatErr.calls.some(c => c.table === 'cs_messages' && c.op === 'insert'),
+    '校验不了大小就不写消息')
+
+  // 没有附件的消息一次 storage 都不该问——绝大多数消息是纯文字，多一次网络往返就是多一份延迟。
+  const sxDbNoAttach = recorder(sxSendWith({}))
+  await sxSendMessage(sxDbNoAttach, sxAsUser, { session_id: sxSid, body: '只有文字' })
+  assert(sxDbNoAttach.storageCalls.length === 0, '纯文字消息不问 storage')
+
+  // 附件的归属在接口层也要挡一次，不能只靠 storage 策略。读策略按路径第一段判可见性，
+  // 所以一条把第一段写成别人会话 id 的消息，会让这个会话的成员看到那边的附件。
+  const sxForeign = await sxSendMessage(recorder(sxSendWith({})), sxAsUser, {
+    session_id: sxSid, body: 'x',
+    attachments: [{ path: `${sxOid}/${sxUid}/a.png`, kind: 'image' }]
+  })
+  assert(sxForeign.status === 400 && /当前会话/.test(sxForeign.body.error), '引用别的会话目录下的附件要拒')
+  const sxNotMine = await sxSendMessage(recorder(sxSendWith({})), sxAsUser, {
+    session_id: sxSid, body: 'x',
+    attachments: [{ path: `${sxSid}/${sxAid}/a.png`, kind: 'image' }]
+  })
+  assert(sxNotMine.status === 400 && /自己上传/.test(sxNotMine.body.error), '引用别人上传的附件要拒')
+
+  // 一个连 storage 都没有的 db（比如客户端配置缺失时构造出来的那种）也要拒，理由同上。
+  const sxNoStorage = await sxVerify({ from: () => {} }, [{ path: sxApath, kind: 'image' }], sxLimits({}))
+  assert(!sxNoStorage.ok, '拿不到 storage 客户端时不能放行')
+  assert((await sxVerify({}, [], sxLimits({}))).ok, '没有附件时直接放过，不去碰 storage')
+
+  // --- §11 发件箱的配置 ---------------------------------------------------------------------------
+  // site_settings 只有管理员读得到（settings_admin 那条策略），所以浏览器自己读回来是空数组。
+  // 输入框的三档限额、格式开关、可撤回窗口都得由接口下发，否则前端只能猜，而猜错的表现是
+  // 用户传了一个必然会被拒的文件。
+  assert(SX_SETTING_KEYS.includes('cs_upload_max_image_mb') &&
+    SX_SETTING_KEYS.includes('cs_upload_max_file_mb') &&
+    SX_SETTING_KEYS.includes('cs_upload_max_video_mb'),
+    '三个上传限额要在 CS_SETTING_KEYS 里——不在里面就永远读不出来，等于配了也没用')
+  const sxCfg = sxClientConfig({ cs_allow_html: true, cs_upload_max_image_mb: 4 })
+  assert(sxCfg.allow_html === true && sxCfg.upload_limit_mb.image === 4, '配置项透传下去')
+  assert(sxClientConfig({}).allow_bbcode === true && sxClientConfig({}).allow_html === false,
+    'BBCode 默认开、HTML 默认关——和 §11 的种子值一致')
+  assert(sxCfg.message_max_chars > 0 && sxCfg.max_attachments > 0 && sxCfg.mutable_window_ms > 0,
+    '正文长度、附件数量、可撤回窗口都要下发：前端硬编码这三个数字就会和后端漂移')
+  assert(!('cs_no_agent_text' in sxCfg) && !('cs_activity_basis' in sxCfg),
+    '只下发输入框用得到的：无人在线的话术和活跃度口径是服务端的事，透出去只是多一份信息')
+  const sxCfgResp = await sxComposerConfig(recorder({ site_settings: sxSettings() }))
+  assert(sxCfgResp.status === 200 && sxCfgResp.body.upload_limit_mb.video === 100,
+    '配置接口答 200 并带上三档限额')
+
   // §2.10：管理员在 normal 模式下以接待客服的身份说话，真作者记在 authored_by。
   const sxDbAdminSpeak = recorder({
     cs_sessions: { data: { ...sxOpen, admin_mode: 'normal' }, error: null },
@@ -3453,7 +3649,7 @@ console.log('CS logic: OK')
   // 而这条需求的全部内容就是「客服仍然看得到原文」。
   const sxMsgRow = {
     id: sxMid, session_id: sxSid, sender_id: sxUid, sender_role: 'user', body: '我说错了',
-    format: 'plain', attachments: [{ path: `${sxSid}/a.png`, kind: 'image' }], auto_reply: false,
+    format: 'plain', attachments: [{ path: `${sxSid}/${sxUid}/a.png`, kind: 'image' }], auto_reply: false,
     recalled: false, edit_count: 0, created_at: new Date().toISOString()
   }
   const sxDbRecall = recorder({

@@ -8,7 +8,10 @@
  */
 
 import { RANK, rankOf } from '../../shared/groups.mjs'
-import { pickAgent, pickAutoReply, servesChannel, timeoutTextKeys } from '../../shared/cs.mjs'
+import {
+  ATTACHMENT_BUCKET, MAX_ATTACHMENTS, MESSAGE_MAX_CHARS, checkAttachmentSize,
+  pickAgent, pickAutoReply, servesChannel, timeoutTextKeys, uploadLimits
+} from '../../shared/cs.mjs'
 
 /** 一次取多个配置项。site_settings 的值是 { value: ... } 形状的 jsonb。 */
 export async function settingsOf(db, keys) {
@@ -22,8 +25,80 @@ export async function settingsOf(db, keys) {
 export const CS_SETTING_KEYS = [
   'cs_max_concurrent_default', 'cs_heartbeat_timeout_seconds', 'cs_activity_basis',
   'cs_typing_trigger', 'cs_timeout_presale_minutes', 'cs_timeout_postsale_minutes',
-  'cs_no_agent_text', 'cs_welcome_text', 'cs_allow_html', 'cs_allow_bbcode'
+  'cs_no_agent_text', 'cs_welcome_text', 'cs_allow_html', 'cs_allow_bbcode',
+  // §4.5/§4.6 的三档限额。发消息那条路径要用它们判真实大小，所以必须和其余键一起取回来——
+  // 漏掉它们的表现是 schema 里写着「分类型的限额由 API 判」而 API 从没读到过那三个值。
+  'cs_upload_max_image_mb', 'cs_upload_max_file_mb', 'cs_upload_max_video_mb'
 ]
+
+/**
+ * §4.5/§4.6 的真实大小判定。
+ *
+ * 为什么要单独走一趟 storage：浏览器直传到桶里，字节从不经过这个函数所在的进程，所以请求体里的
+ * size 是用户自己写的数字。桶上那个 100MB 的 file_size_limit 是唯一被强制执行的东西，而需求要的是
+ * 图片 10 / 文件 25 / 视频 100 三档。唯一能问到真实大小的地方就是对象自己的 metadata。
+ *
+ * 问不到（对象不存在、storage 出错）时拒绝而不是放行：放行意味着「让 storage 报一次错」就能绕过上限。
+ * 代价是 storage 抖动时发不出带附件的消息，那时用户能重试或者先把文字发出去。
+ */
+export async function verifyAttachments(db, attachments, limits) {
+  if (!attachments?.length) return { ok: true }
+  if (!db?.storage?.from) {
+    // 没有 storage 客户端就没有可信来源。这里返回 false 而不是 true：一个拼错的客户端初始化
+    // 不该表现为「上限静默失效」。
+    return { ok: false, error: '无法校验附件大小，请稍后重试' }
+  }
+  const bucket = db.storage.from(ATTACHMENT_BUCKET)
+  for (const item of attachments) {
+    const slash = item.path.lastIndexOf('/')
+    const dir = item.path.slice(0, slash)
+    const name = item.path.slice(slash + 1)
+    // list 而不是 download：download 会把整个文件拉进函数内存，一个 100MB 的视频足够打爆
+    // 一次 serverless 调用，而我们只要一个数字。
+    const { data, error } = await bucket.list(dir, { limit: 100, search: name })
+    if (error) {
+      console.error('附件大小校验失败', { path: item.path, error: error.message })
+      return { ok: false, error: '无法校验附件大小，请稍后重试' }
+    }
+    const found = (data || []).find(o => o.name === name)
+    if (!found) return { ok: false, error: '附件尚未上传完成，请稍后重试' }
+    const bytes = found.metadata?.size
+    const verdict = checkAttachmentSize(item.kind, bytes, limits)
+    if (!verdict.ok) {
+      // 超限的对象留在桶里是垃圾，而且它已经占了空间。删掉再报错——删失败只记日志，
+      // 因为「消息没发出去」这个结果已经正确了。
+      const { error: rmErr } = await bucket.remove([item.path])
+      if (rmErr) console.error('超限附件清理失败', { path: item.path, error: rmErr.message })
+      return verdict
+    }
+    // 回写真实大小：界面上那个「12.4 MB」应该来自对象本身，而不是上传时前端报的数字。
+    item.size = Number(bytes)
+  }
+  return { ok: true }
+}
+
+/**
+ * 浏览器要用到、但读不到的那部分配置。
+ *
+ * site_settings 上只有一条 admin 全权策略，普通用户 select 回来是空数组——所以输入框该不该允许
+ * HTML、附件多大算超限，这些必须由接口给出。前端硬编码一份的表现是管理员改了后台而输入框行为不变。
+ */
+export function clientConfig(settings) {
+  return {
+    allow_html: settings.cs_allow_html === true,
+    allow_bbcode: settings.cs_allow_bbcode !== false,
+    typing_trigger: settings.cs_typing_trigger || 'keypress',
+    upload_limit_mb: uploadLimits(settings),
+    message_max_chars: MESSAGE_MAX_CHARS,
+    max_attachments: MAX_ATTACHMENTS,
+    // 前端拿它显示「N 分钟无消息将自动关闭」。用户看得到这个数字，就不会把自动关闭当成掉线。
+    timeout_minutes: {
+      presale: Number(settings.cs_timeout_presale_minutes) || 30,
+      postsale: Number(settings.cs_timeout_postsale_minutes) || 60
+    },
+    mutable_window_ms: 2 * 60 * 1000
+  }
+}
 
 /**
  * 记一条会话事件（§2.10 的介入、§2.12 的分配、§2.5 的开关）。

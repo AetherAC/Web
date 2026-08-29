@@ -197,3 +197,125 @@ button { color: inherit; }
 .fluent-notice.compact{font-size:12px}
 .fluent-notice.compact p{margin:6px 0 0;line-height:1.75}
 .fluent-notice code{color:#83e7ca}
+
+/* --- §2/§4/§7 客服 ------------------------------------------------------------------------------
+   挂件是 position:fixed 的，所以它不受页面 layout:false 的影响——这正是它挂在 DefaultTheme.Layout
+   兄弟位置也能显示的原因。z-index 取 60：默认主题的导航栏是 30，弹出层是 50。 */
+.cs-widget{position:fixed;right:20px;bottom:20px;z-index:60;display:flex;flex-direction:column;align-items:flex-end;gap:12px}
+.cs-launcher{position:relative;display:grid;place-items:center;width:52px;height:52px;border:0;border-radius:50%;background:linear-gradient(150deg,#60e1bd,#2f9c7c);color:#04140f;box-shadow:0 14px 34px rgba(0,0,0,.42);cursor:pointer;transition:transform .18s}
+.cs-launcher:hover{transform:translateY(-2px)}
+.cs-launcher.active{background:#151e1a;color:#8ef0d0;border:1px solid var(--fluent-stroke)}
+.cs-launcher em{position:absolute;top:-3px;right:-3px;min-width:19px;padding:0 5px;border-radius:10px;background:#ff6b6b;color:#fff;font-size:11px;font-style:normal;font-weight:750;line-height:19px}
+.cs-panel{display:flex;flex-direction:column;width:min(390px,calc(100vw - 40px));height:min(560px,calc(100vh - 130px));border:1px solid var(--fluent-stroke);border-radius:16px;background:var(--fluent-card);box-shadow:0 26px 60px rgba(0,0,0,.5);overflow:hidden;min-height:0}
+.cs-panel-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--fluent-stroke);background:var(--fluent-layer)}
+.cs-panel-head>div{flex:1;min-width:0}
+.cs-panel-head h3{margin:2px 0 0;font-size:15px}
+.cs-panel-head button{display:grid;place-items:center;width:28px;height:28px;border:1px solid transparent;border-radius:8px;background:0 0;color:#8aa39a;cursor:pointer}
+.cs-panel-head button:hover{border-color:var(--fluent-stroke);color:#d8efe6}
+.cs-pop-enter-active,.cs-pop-leave-active{transition:opacity .16s,transform .16s}
+.cs-pop-enter-from,.cs-pop-leave-to{opacity:0;transform:translateY(10px) scale(.98)}
+.cs-notice{margin:0;padding:9px 16px;border-bottom:1px solid var(--fluent-stroke);background:rgba(96,225,189,.09);color:#9df0d3;font-size:12px}
+.cs-start{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:13px;flex:1;padding:26px;color:#7f968d;text-align:center}
+.cs-start p{margin:0;font-size:13px;line-height:1.7}
+
+.cs-thread{display:flex;flex-direction:column;flex:1;min-height:0}
+.cs-scroll{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;min-height:0}
+.cs-hint,.cs-error{margin:0;color:#71857b;font-size:12px;text-align:center}
+.cs-error{padding:8px 16px;color:#ff9d9d;text-align:left}
+.cs-system{align-self:center;max-width:90%;padding:6px 12px;border-radius:10px;background:rgba(219,255,238,.06);color:#8aa39a;font-size:11.5px;line-height:1.6;text-align:center}
+.cs-system small{display:block;margin-top:3px;color:#c9a86a;font-size:10.5px}
+.cs-row{display:flex}
+.cs-row.mine{justify-content:flex-end}
+.cs-bubble{max-width:82%;padding:9px 12px;border:1px solid var(--fluent-stroke);border-radius:13px;background:var(--fluent-layer);font-size:13px}
+.cs-row.mine .cs-bubble{border-color:rgba(96,225,189,.34);background:rgba(48,131,108,.22)}
+.cs-bubble.recalled{opacity:.7}
+.cs-bubble.auto{border-style:dashed}
+.cs-bubble header{display:flex;align-items:baseline;gap:7px;margin-bottom:5px;font-size:11px;color:#7f968d}
+.cs-bubble header b{color:#bfe8d8;font-size:11.5px}
+.cs-bubble header small{padding:0 5px;border-radius:5px;background:rgba(219,255,238,.09);font-size:10px}
+.cs-bubble header time{margin-left:auto;font-size:10.5px}
+.cs-body{color:#e6f4ee;line-height:1.72;overflow-wrap:anywhere}
+.cs-body>:first-child{margin-top:0}
+.cs-body>:last-child{margin-bottom:0}
+.cs-body img{max-width:100%;border-radius:8px}
+.cs-body blockquote{margin:6px 0;padding-left:10px;border-left:2px solid var(--fluent-stroke);color:#a9c2b8}
+.cs-body code{padding:1px 5px;border-radius:4px;background:rgba(219,255,238,.08);font-size:12px}
+.cs-recalled{margin:0;color:#8aa39a;font-size:12px;font-style:italic}
+.cs-bubble footer{display:flex;align-items:center;gap:6px;margin-top:5px;min-height:16px}
+.cs-bubble footer button{display:inline-flex;align-items:center;gap:3px;padding:1px 5px;border:1px solid transparent;border-radius:6px;background:0 0;color:#7f968d;font-size:10.5px;cursor:pointer}
+.cs-bubble footer button:hover{border-color:var(--fluent-stroke);color:#c9e8dc}
+.cs-edited{color:#71857b;font-size:10.5px}
+.cs-edit textarea,.cs-composer textarea{width:100%;padding:9px 11px;border:1px solid var(--fluent-stroke);border-radius:9px;outline:0;background:#090f0d;color:#e2f1ea;font-family:inherit;font-size:13px;line-height:1.65;resize:vertical}
+.cs-edit textarea:focus,.cs-composer textarea:focus{border-color:var(--fluent)}
+.cs-edit-row{display:flex;gap:8px;margin-top:7px}
+.cs-edit-row button{padding:5px 12px;font-size:12px}
+.cs-revisions{margin-top:7px;padding-top:7px;border-top:1px dashed var(--fluent-stroke)}
+.cs-revisions p{display:flex;flex-wrap:wrap;gap:7px;margin:0 0 4px;color:#9db5ab;font-size:11.5px;line-height:1.6}
+.cs-revisions b{color:#c9a86a}
+.cs-revisions time{margin-left:auto;color:#6e8279;font-size:10.5px}
+.cs-attachments{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+.cs-image{display:block;max-width:210px;border-radius:9px;overflow:hidden}
+.cs-image img{display:block;width:100%;height:auto}
+.cs-image span{display:block;padding:22px 14px;background:rgba(219,255,238,.06);color:#7f968d;font-size:11.5px;text-align:center}
+.cs-attachments video{max-width:260px;border-radius:9px}
+.cs-file{display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border:1px solid var(--fluent-stroke);border-radius:9px;color:#cfe9de;font-size:12px;text-decoration:none}
+.cs-file:hover{border-color:var(--fluent)}
+.cs-file small{color:#71857b;font-size:10.5px}
+.cs-typing{display:flex;align-items:center;gap:4px;margin:0;color:#7f968d;font-size:11.5px}
+.cs-typing i{width:5px;height:5px;border-radius:50%;background:#60e1bd;animation:cs-blink 1.3s infinite}
+.cs-typing i:nth-child(2){animation-delay:.18s}
+.cs-typing i:nth-child(3){animation-delay:.36s;margin-right:5px}
+@keyframes cs-blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+.cs-pending{display:flex;flex-wrap:wrap;gap:7px;padding:9px 16px;border-top:1px solid var(--fluent-stroke)}
+.cs-pending span{display:inline-flex;align-items:center;gap:5px;padding:4px 8px;border:1px solid var(--fluent-stroke);border-radius:7px;color:#cfe9de;font-size:11.5px}
+.cs-pending small{color:#71857b;font-size:10.5px}
+.cs-pending button{display:grid;place-items:center;border:0;background:0 0;color:#8aa39a;cursor:pointer}
+.cs-uploading{color:#9df0d3 !important;border-style:dashed !important}
+.cs-closed{display:flex;align-items:center;gap:9px;padding:13px 16px;border-top:1px solid var(--fluent-stroke);background:var(--fluent-layer);color:#8aa39a;font-size:12.5px}
+.cs-closed button{margin-left:auto;padding:5px 13px;font-size:12px}
+.cs-composer{padding:11px 16px 14px;border-top:1px solid var(--fluent-stroke);background:var(--fluent-layer)}
+.cs-composer-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+.cs-composer-row>button[type=button]{display:grid;place-items:center;width:30px;height:30px;border:1px solid var(--fluent-stroke);border-radius:8px;background:0 0;color:#8aa39a;cursor:pointer}
+.cs-composer-row>button[type=button]:hover{border-color:var(--fluent);color:#bfe8d8}
+.cs-limit{flex:1;min-width:0;color:#6e8279;font-size:10.5px;line-height:1.4}
+.cs-count{color:#6e8279;font-size:10.5px}
+.cs-count.near{color:#e8c37a}
+.cs-composer-row .fluent-primary{padding:6px 14px;font-size:12.5px}
+
+/* 工作台 */
+.cs-presence{display:flex;flex-direction:column;gap:7px;padding:13px 0;border-bottom:1px solid var(--fluent-stroke)}
+.cs-presence small{color:#6e8279;font-size:10.5px;line-height:1.55}
+.cs-toggle{display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--fluent-stroke);border-radius:9px;background:0 0;color:#8aa39a;font-size:12.5px;font-weight:650;cursor:pointer}
+.cs-toggle.on{border-color:rgba(96,225,189,.42);background:rgba(48,131,108,.2);color:#8ef0d0}
+.cs-workbench{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:18px;align-items:start;min-height:0}
+.cs-list article{align-items:flex-start}
+.cs-list article>div{min-width:0}
+.cs-list article b{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.cs-list small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cs-meta{color:#6e8279 !important;font-size:10.5px !important}
+.cs-tag{padding:1px 6px;border-radius:6px;background:rgba(219,255,238,.09);color:#a9c2b8;font-size:10px;font-style:normal;font-weight:650}
+.cs-tag.unread{background:rgba(255,107,107,.16);color:#ffa8a8}
+.cs-tag.mode{background:rgba(232,195,122,.15);color:#e8c37a}
+.cs-claim{padding:5px 12px;font-size:12px;white-space:nowrap}
+.cs-detail{display:flex;flex-direction:column;border:1px solid var(--fluent-stroke);border-radius:14px;background:var(--fluent-card);height:min(72vh,720px);min-height:0;overflow:hidden}
+.cs-detail-head{display:flex;align-items:flex-start;gap:12px;padding:15px 17px;border-bottom:1px solid var(--fluent-stroke);background:var(--fluent-layer)}
+.cs-detail-head>div:first-child{flex:1;min-width:0}
+.cs-detail-head h2{margin:3px 0 0;font-size:16px}
+.cs-detail-head h2 small{margin-left:8px;color:#7f968d;font-size:11.5px;font-weight:400}
+.cs-detail-actions{display:flex;gap:6px}
+.cs-detail-actions button{display:grid;place-items:center;width:31px;height:31px;border:1px solid var(--fluent-stroke);border-radius:8px;background:0 0;color:#8aa39a;cursor:pointer}
+.cs-detail-actions button:hover{border-color:var(--fluent);color:#bfe8d8}
+.cs-detail-empty{align-self:start}
+.cs-modes{display:flex;flex-wrap:wrap;align-items:center;gap:7px;padding:10px 17px;border-bottom:1px solid var(--fluent-stroke)}
+.cs-modes>span{color:#6e8279;font-size:11px;font-weight:750;letter-spacing:1px}
+.cs-modes button{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;border:1px solid var(--fluent-stroke);border-radius:7px;background:0 0;color:#8aa39a;font-size:11.5px;cursor:pointer}
+.cs-modes button.on{border-color:rgba(232,195,122,.5);background:rgba(232,195,122,.13);color:#e8c37a}
+.cs-modes small{flex-basis:100%;color:#6e8279;font-size:10.5px;line-height:1.6}
+.cs-action-form{display:flex;flex-wrap:wrap;align-items:flex-end;gap:11px;padding:13px 17px;border-bottom:1px solid var(--fluent-stroke);background:rgba(219,255,238,.03)}
+.cs-action-form .field{flex:1;min-width:150px}
+.cs-action-form button{padding:7px 14px;font-size:12.5px}
+.cs-action-form small{flex-basis:100%;color:#6e8279;font-size:10.5px;line-height:1.6}
+.cs-orders{max-height:190px;overflow-y:auto;padding:11px 17px;border-bottom:1px solid var(--fluent-stroke)}
+.cs-orders .order-row{text-decoration:none}
+@media(max-width:980px){.cs-workbench{grid-template-columns:1fr}.cs-detail{height:min(66vh,620px)}}
+@media(max-width:600px){.cs-widget{right:12px;bottom:12px}.cs-panel{width:calc(100vw - 24px);height:calc(100vh - 100px)}}
