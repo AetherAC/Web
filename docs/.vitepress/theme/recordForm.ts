@@ -22,7 +22,7 @@ export const SCHEMA:Record<string,Field[]>={
     {key:'title',label:'标题',type:'text',required:true,wide:true,hint:'这个阶段在开发进度页显示的名字'},
     {key:'percent',label:'完成度（%）',type:'number',min:0,max:100,required:true,hint:'0 到 100 的整数，进度条按它渲染'},
     {key:'sort_order',label:'排序权重',type:'number',hint:'数字小的排在前面；相同时按更新时间'},
-    {key:'summary',label:'说明',type:'textarea',rows:4,required:true,wide:true,hint:'这个阶段具体在做什么，进度页会完整显示这段文字'}
+    {key:'summary',label:'说明（Markdown）',type:'textarea',rows:5,required:true,wide:true,hint:'这个阶段具体在做什么，进度页会完整显示；支持 Markdown 与换行。首页 mini 卡片只渲染行内格式（粗体 / 代码 / 链接），标题和列表在那里保持字面'}
   ],
   repositories:[
     {key:'name',label:'仓库',type:'text',required:true,pattern:'[^/]+/[^/]+',placeholder:'AetherAC/AetherAC',hint:'GitHub 的 owner/repo 格式，用来抓取提交数并显示在进度页'},
@@ -35,7 +35,7 @@ export const SCHEMA:Record<string,Field[]>={
     {key:'price_minor',label:'价格（最小货币单位）',type:'number',min:0,required:true,hint:'以分为单位填写整数：1999 表示 19.99'},
     {key:'currency',label:'货币',type:'text',required:true,pattern:'[A-Z]{3}',placeholder:'USD',hint:'三位大写 ISO 代码，例如 USD、CNY、EUR'},
     {key:'active',label:'上架销售',type:'boolean',hint:'取消勾选后商品从购买页下架，已产生的订单不受影响'},
-    {key:'description',label:'描述',type:'textarea',rows:4,wide:true,hint:'购买页显示在商品名下方的说明文字'},
+    {key:'description',label:'描述（Markdown）',type:'textarea',rows:6,wide:true,hint:'购买页显示在商品名下方；支持 Markdown：**粗体**、`代码`、- 列表、[文字](链接)，直接换行就会换行'},
     {key:'metadata',label:'附加元数据',type:'json',rows:5,wide:true,hint:'数据库里是自由结构的 jsonb，给后续功能留的扩展位；用不到就保留 {}'}
   ],
   payment_providers:[

@@ -22,6 +22,7 @@ import {
   toForm,
   toLocalInput
 } from '../docs/.vitepress/theme/recordForm.ts'
+import { preloadMarkdown, renderMarkdown, renderMarkdownInline } from '../docs/.vitepress/theme/markdown.ts'
 
 const originalRepository = process.env.GITHUB_REPOSITORY
 const originalToken = process.env.GITHUB_TOKEN
@@ -311,3 +312,52 @@ for (const [name, driver] of Object.entries(DRIVERS)) {
 }
 
 console.log('Payment drivers: OK')
+
+// CMS Markdown. These strings go through v-html, so the escaping and the link policy are the two
+// things that must not regress; the newline behaviour is the bug users actually reported.
+
+// First, the fallback that is on screen before the renderer chunk arrives — and for the whole page
+// load if it never does. It has to be exactly as safe as the real thing, and it has to keep line
+// breaks, or the reported bug comes back during the gap.
+assert(renderMarkdown('第一行\n第二行') === '第一行<br>\n第二行', 'the fallback keeps line breaks')
+assert(renderMarkdown('<script>alert(1)</script>') === '&lt;script&gt;alert(1)&lt;/script&gt;',
+  'the fallback escapes HTML — it must not be a hole that opens for a few milliseconds on every load')
+assert(renderMarkdownInline('**粗**') === '**粗**', 'the fallback leaves syntax literal rather than dropping text')
+assert(renderMarkdown('') === '' && renderMarkdown(null) === '', 'the fallback renders nothing for empty input')
+
+// A single call, awaited once: every assertion below runs against the real renderer.
+await preloadMarkdown()
+
+assert(renderMarkdown('第一行\n第二行') === '<p>第一行<br>\n第二行</p>\n',
+  'a single newline must become <br> — an author typing two lines in a textarea means two lines')
+assert(renderMarkdown('上\n\n下') === '<p>上</p>\n<p>下</p>\n', 'a blank line still separates paragraphs')
+assert(renderMarkdown('**粗** 和 `代码`').includes('<strong>粗</strong>')
+  && renderMarkdown('**粗** 和 `代码`').includes('<code>代码</code>'), 'basic emphasis and code spans must render')
+assert(renderMarkdown('## 小标题').trim() === '<h2>小标题</h2>', 'the syntax /admin advertises for posts.body must work')
+assert(renderMarkdown('- 甲\n- 乙').includes('<li>甲</li>'), 'list items must render as a real list')
+
+// html:false — a description is not a place to inject markup.
+assert(renderMarkdown('<script>alert(1)</script>').includes('&lt;script&gt;')
+  && !renderMarkdown('<script>alert(1)</script>').includes('<script>'), 'raw HTML must be escaped, not executed')
+assert(renderMarkdown('<img src=x onerror=alert(1)>').includes('&lt;img'), 'an inline HTML tag must be escaped too')
+
+// validateLink allowlist: only web, mail and same-origin targets survive.
+assert(renderMarkdown('[x](https://example.com)').includes('href="https://example.com"'), 'https links must be kept')
+assert(renderMarkdown('[x](/buy)').includes('href="/buy"'), 'site-relative links must be kept')
+assert(renderMarkdown('[x](mailto:a@b.c)').includes('href="mailto:a@b.c"'), 'mailto links must be kept')
+assert(!renderMarkdown('[x](javascript:alert(1))').includes('href='), 'a javascript: URL must not survive as a link')
+assert(!renderMarkdown('[x](data:text/html;base64,PHN2Zz4=)').includes('href='), 'a data: URL must not survive as a link')
+const external = renderMarkdown('[x](https://example.com)')
+assert(external.includes('target="_blank"') && external.includes('rel="noopener noreferrer"'),
+  'off-site links open in a new tab and must not hand over window.opener')
+assert(!renderMarkdown('[x](/buy)').includes('target='), 'a same-site link must stay in the current tab')
+
+// Inline renderer: the fixed-height cards on / and /buy must not be handed block elements.
+assert(renderMarkdownInline('**粗**') === '<strong>粗</strong>', 'inline rendering must not wrap text in <p>')
+assert(!renderMarkdownInline('## 标题').includes('<h2'), 'a heading must stay literal inside a fixed-height card')
+assert(renderMarkdownInline('<script>x</script>').includes('&lt;script&gt;'), 'the inline renderer escapes HTML as well')
+
+assert(renderMarkdown('') === '' && renderMarkdown(null) === '' && renderMarkdown(undefined) === ''
+  && renderMarkdownInline(null) === '', 'an empty or absent description must render nothing, not "null"')
+
+console.log('CMS Markdown: OK')

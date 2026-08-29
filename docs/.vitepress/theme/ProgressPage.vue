@@ -4,6 +4,7 @@ import { ArrowUpRight, CheckCircle2, CircleDot, Clock3, Github, GitPullRequest, 
 import SiteHeader from './SiteHeader.vue'
 import SiteFooter from './SiteFooter.vue'
 import { fetchProgress, formatDate, type ProgressEntry } from './content'
+import { preloadMarkdown, renderMarkdown } from './markdown'
 
 interface GithubProgress {
   configured: boolean
@@ -21,6 +22,8 @@ const syncing = ref(true)
 const repositories = ref<Array<{ name: string; label?: string }>>([])
 
 onMounted(async () => {
+  // Runs in parallel with the CMS request rather than in front of it; the summaries upgrade in place.
+  void preloadMarkdown()
   const cms = await fetchProgress()
   stages.value = cms.data
   cmsSource.value = cms.source
@@ -74,7 +77,7 @@ onMounted(async () => {
               <div class="stage-index">{{ stage.stage }}</div>
               <div class="stage-content">
                 <div><h3>{{ stage.title }}</h3><span :class="`status-${stage.status}`">{{ stage.status }}</span></div>
-                <p>{{ stage.summary }}</p>
+                <div class="stage-summary markdown-body" v-html="renderMarkdown(stage.summary)"></div>
                 <div class="progress-track"><i :style="{ width: `${stage.percent}%` }"></i></div>
               </div>
               <strong>{{ stage.percent }}%</strong>

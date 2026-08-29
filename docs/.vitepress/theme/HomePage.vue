@@ -8,6 +8,7 @@ import {
 import SiteHeader from './SiteHeader.vue'
 import SiteFooter from './SiteFooter.vue'
 import { fetchPosts, fetchProgress, formatDate, type ContentPost, type ProgressEntry } from './content'
+import { preloadMarkdown, renderMarkdownInline } from './markdown'
 
 const posts = ref<ContentPost[]>([])
 const progress = ref<ProgressEntry[]>([])
@@ -26,6 +27,9 @@ const checkGroups = [
 ]
 
 onMounted(async () => {
+  // Not awaited — the roadmap summaries must not wait on it, and the cards re-render themselves once
+  // the renderer lands.
+  void preloadMarkdown()
   const [news, roadmap] = await Promise.all([fetchPosts('news'), fetchProgress()])
   posts.value = news.data.slice(0, 3)
   progress.value = roadmap.data
@@ -105,7 +109,7 @@ onMounted(async () => {
 
       <section class="home-section progress-preview home-container">
         <div class="section-intro"><div><span class="section-code">05 / PUBLIC BUILD</span><h2>进度不是营销数字，<br>而是可追踪的工作。</h2></div><a class="text-action" href="/progress"><Github :size="16" /> 打开开发进度 <ArrowRight :size="15" /></a></div>
-        <div class="mini-roadmap"><article v-for="stage in progress.slice(0,4)" :key="stage.id"><div><span>STAGE {{ stage.stage }}</span><strong>{{ stage.percent }}%</strong></div><h3>{{ stage.title }}</h3><p>{{ stage.summary }}</p><i><b :style="{ width: `${stage.percent}%` }"></b></i></article></div>
+        <div class="mini-roadmap"><article v-for="stage in progress.slice(0,4)" :key="stage.id"><div><span>STAGE {{ stage.stage }}</span><strong>{{ stage.percent }}%</strong></div><h3>{{ stage.title }}</h3><p class="markdown-inline" v-html="renderMarkdownInline(stage.summary)"></p><i><b :style="{ width: `${stage.percent}%` }"></b></i></article></div>
       </section>
 
       <section class="news-section home-container">

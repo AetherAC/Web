@@ -4,6 +4,7 @@ import { ArrowRight, BookOpen, Newspaper, Radio, Tag } from 'lucide-vue-next'
 import SiteHeader from './SiteHeader.vue'
 import SiteFooter from './SiteFooter.vue'
 import { fetchPosts, formatDate, type ContentKind, type ContentPost } from './content'
+import { preloadMarkdown, renderMarkdown } from './markdown'
 
 const props = defineProps<{ kind: ContentKind }>()
 const posts = ref<ContentPost[]>([])
@@ -16,6 +17,9 @@ const lead = computed(() => props.kind === 'blog'
   : '发布里程碑、兼容性变化、测试计划与版本公告。')
 
 onMounted(async () => {
+  // Not awaited: the renderer download and the CMS request run side by side, and the body upgrades
+  // from plain text to Markdown on its own if the chunk happens to arrive second.
+  void preloadMarkdown()
   const result = await fetchPosts(props.kind)
   posts.value = result.data
   source.value = result.source
@@ -57,7 +61,7 @@ const closePost = () => {
           <h2>{{ selected.title }}</h2>
           <p class="article-summary">{{ selected.summary }}</p>
           <div class="article-rule"></div>
-          <p class="article-body">{{ selected.body }}</p>
+          <div class="article-body markdown-body" v-html="renderMarkdown(selected.body)"></div>
           <div class="tag-list"><span v-for="tag in selected.tags" :key="tag"><Tag :size="12" />{{ tag }}</span></div>
         </article>
       </section>
