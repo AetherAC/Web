@@ -376,3 +376,54 @@ button { color: inherit; }
 .cs-orders .order-row{text-decoration:none}
 @media(max-width:980px){.cs-workbench{grid-template-columns:1fr}.cs-detail{height:min(66vh,620px)}}
 @media(max-width:600px){.cs-widget{right:12px;bottom:12px}.cs-panel{width:calc(100vw - 24px);height:calc(100vh - 100px)}}
+
+/* --- §12 订单管理 -----------------------------------------------------------------------------
+   表格用 grid 而不是 <table>：行是 <button>（键盘要能 Tab 到），而 button 放不进 tr。药丸、b/small
+   的排版沿用买家订单页的 .order-table，所以这里的 class 是 "orders-"（带 s），只补它没有的东西。
+   列宽写死七列；窄屏下换成两列堆叠，不做横向滚动——订单号在最左边，横滚会把它滚出视野。 */
+.orders-filters{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;padding:18px 20px;border:1px solid var(--fluent-stroke);border-radius:10px;background:var(--fluent-card)}
+.orders-filters label{display:flex;flex-direction:column;gap:7px;min-width:0;color:#8ea198;font-size:12px}
+.orders-filters label.wide{grid-column:1/-1}
+.orders-filters select,.orders-filters input{min-width:0;padding:9px 11px;border:1px solid var(--fluent-stroke);border-radius:7px;outline:0;background:#090f0d;color:#e2f1ea;font-family:inherit;font-size:13px}
+.orders-filters select:focus,.orders-filters input:focus{border-color:var(--fluent)}
+.orders-filters small{color:#6e8279;font-size:10.5px;line-height:1.6}
+.orders-search{display:flex;gap:8px}
+.orders-search select{flex:none;width:112px}
+.orders-search input{flex:1}
+.orders-search button{flex:none;min-height:0;padding:0 15px;border-radius:7px;font-size:12.5px}
+.orders-bar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin:14px 0 12px;color:#8ea198;font-size:12.5px}
+.orders-bar button{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid var(--fluent-stroke);border-radius:7px;background:0 0;color:#b5c5bd;font-size:12.5px;cursor:pointer}
+.orders-bar button:hover:not(:disabled){border-color:var(--fluent);color:#d7efe6}
+.orders-bar button:disabled{opacity:.45;cursor:not-allowed}
+.orders-table{border:1px solid var(--fluent-stroke);border-radius:10px;background:var(--fluent-card);overflow:hidden}
+.orders-table header,.orders-table>button{display:grid;grid-template-columns:1.15fr 1.15fr 1.2fr 1.15fr .85fr .8fr .7fr;gap:14px;align-items:center;width:100%;padding:14px 20px;text-align:left}
+.orders-table header{border-bottom:1px solid var(--fluent-stroke);background:rgba(219,255,238,.03);color:#6e8279;font-size:10.5px;font-weight:750;letter-spacing:.9px}
+.orders-table>button{border:0;border-bottom:1px solid var(--fluent-stroke);background:0 0;color:#dce9e3;font-family:inherit;font-size:13px;cursor:pointer}
+.orders-table>button:last-child{border-bottom:0}
+.orders-table>button:hover{background:rgba(255,255,255,.025)}
+.orders-table>button.selected{background:rgba(96,225,189,.07)}
+.orders-table>button:focus-visible{outline:2px solid var(--fluent);outline-offset:-2px}
+.orders-table>button>span{min-width:0}
+.orders-table b,.orders-table small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.orders-table b{font-weight:650}
+.orders-table small{margin-top:5px;color:#71857b;font-size:11px}
+.orders-detail-head{margin-top:18px}
+.orders-detail-head>div{min-width:0}
+.orders-detail-head .icon-button{align-self:start;margin-left:14px;border-radius:8px}
+.orders-uuid{padding:2px 6px;border-radius:5px;background:rgba(219,255,238,.08);color:#a9c2b8;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11.5px;overflow-wrap:anywhere}
+/* 提示语的样式跟 .refund-hint 一致：灰字、金色图标，说明「为什么不能点」而不是报错。 */
+.orders-hint{display:flex;align-items:flex-start;gap:8px;margin:13px 0 0;color:#8aa39a;font-size:12.5px;line-height:1.7}
+.orders-hint svg{flex:none;margin-top:3px;color:#c9a86a}
+.orders-hint a{color:var(--fluent)}
+.orders-change,.orders-proxy form{display:flex;flex-direction:column;gap:13px;margin-top:16px}
+.orders-change label,.orders-proxy label{display:flex;flex-direction:column;gap:7px;color:#9aad9f;font-size:12px}
+.orders-change select,.orders-change textarea,.orders-proxy textarea,.orders-proxy input{width:100%;padding:11px;border:1px solid var(--fluent-stroke);border-radius:7px;outline:0;background:#09100d;color:#e2f1ea;font-family:inherit;font-size:13px;line-height:1.65;resize:vertical}
+.orders-change select:focus,.orders-change textarea:focus,.orders-proxy textarea:focus,.orders-proxy input:focus{border-color:var(--fluent)}
+.orders-change button,.orders-proxy button{min-height:38px;align-self:flex-start;padding:0 16px;border-radius:7px;font-size:13px}
+.orders-proxy{margin-top:20px;padding-top:18px;border-top:1px dashed var(--fluent-stroke)}
+.orders-proxy h3{display:flex;align-items:center;gap:7px;margin:0;font-size:14px}
+.orders-proxy h3 svg{color:#c9a86a}
+.orders-proxy button[disabled]{margin-top:14px;cursor:not-allowed;opacity:.55}
+.orders-refunds b{padding:4px 8px;border-radius:99px;background:#1a2822;color:#9fb1a8;font-family:inherit;font-size:10px;text-transform:uppercase}
+@media(max-width:1080px){.orders-filters{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:860px){.orders-table header{display:none}.orders-table>button{grid-template-columns:1fr 1fr;gap:9px;padding:15px 18px}.orders-search{flex-wrap:wrap}.orders-search select,.orders-search input{width:100%;flex:1 1 100%}}
