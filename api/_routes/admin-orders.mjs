@@ -67,7 +67,7 @@ export function maskEmail(email) {
   return `${name[0]}${'*'.repeat(Math.min(name.length - 2, 6))}${name[name.length - 1]}${domain}`
 }
 
-const maskTail = (value) => {
+export const maskTail = (value) => {
   const raw = String(value || '')
   if (raw.length <= 2) return raw ? `${raw[0]}*` : ''
   return `${raw[0]}${'*'.repeat(Math.min(raw.length - 2, 6))}${raw[raw.length - 1]}`

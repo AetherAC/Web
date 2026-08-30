@@ -18,8 +18,14 @@ export const isUuid = s => UUID.test(String(s || ''))
  *
  * 返回 { ok:false, status, error } 或 { ok:true, refund, order }。把「读不到」「状态不对」这些
  * 情况在这里一次答完，是为了让三个接口的正文只剩下各自真正不同的那部分。
+ *
+ * resumable：申请此刻已经就在 next 上时不再套状态图。状态图里没有 executing → executing 这条边，
+ * 那是对的——自环会让「执行中」这个状态失去含义。但 refund-execute 的第二步失败时会有意把申请留在
+ * executing、订单留在 REFUND_PENDING，等人再点一次把它走完（那个文件开头那段就是这么写的），而那一次
+ * 的语义是「接着走完」，不是一次新的迁移。不给这个开关的话，那些申请会被这里挡在
+ * 409「退款申请不能从执行中变更为执行中」——而它们被留在 executing 的全部目的就是避免这种死路。
  */
-export async function loadForDecision(db, refundId, next) {
+export async function loadForDecision(db, refundId, next, { resumable = false } = {}) {
   if (!isUuid(refundId)) return { ok: false, status: 400, error: '退款申请号格式不正确' }
 
   const { data: refund, error } = await db.from('refund_requests')
@@ -28,8 +34,10 @@ export async function loadForDecision(db, refundId, next) {
   if (error) return { ok: false, status: 500, error: '读取退款申请失败' }
   if (!refund) return { ok: false, status: 404, error: '退款申请不存在' }
 
-  const move = assertRefundTransition(refund.status, next)
-  if (!move.ok) return { ok: false, status: 409, error: move.error }
+  if (!(resumable && refund.status === next)) {
+    const move = assertRefundTransition(refund.status, next)
+    if (!move.ok) return { ok: false, status: 409, error: move.error }
+  }
 
   const { data: order, error: orderErr } = await db.from('orders')
     .select('id,user_id,status,amount_minor,paid_amount_minor,currency,paid_currency')

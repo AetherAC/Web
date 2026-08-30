@@ -508,3 +508,61 @@ button { color: inherit; }
 .ar-verdict-shadow svg{color:#d8ac63}
 .ar-verdict-off{background:rgba(240,109,109,.1);color:#e5a7a7}
 .ar-verdict-off svg{color:#ef9999}
+
+/* --- §10.6 退款审批看板 -----------------------------------------------------------------------
+   看板整块套的是 §12 那一套（.orders-filters / .orders-bar / .orders-table / .order-detail-grid），
+   这里只补三样它没有的东西，外加一处必要的覆盖：
+
+   - 顶上那三个数。它们是可点的筛选入口，所以是 button 而不是 .metric-grid 的 article；超时和卡在
+     执行中不为 0 时描边变金色（.alert），因为这两个数字的存在本身就是要处理的事。
+   - 表格换成 7 列。列宽和订单表不一样：这里最宽的是「用户」和「订单」，而订单表最宽的是订单号。
+     宽度在 .orders-table 之后覆盖，所以 860px 那条折叠规则也得在这里重来一遍——它写在前面，同
+     等特异度下会输给这里的覆盖。
+   - 补齐区（§10.7）沿用 .orders-proxy 的虚线分隔，图标是金色的：它不是「保存」，是「上一次没写完」。
+
+   订单状态药丸出现在两个地方，都需要单独兜一下：表格里它是 small（.order-table small 是 block，
+   而状态色只给了 background，不给内边距，直接染成一条通栏），详情里它在 dd 里，压根不在
+   .order-table 的作用域内。两处都在这里补成药丸形状。 */
+.refunds-pane{min-width:0}
+.refund-counts{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}
+.refund-counts button{display:flex;flex-direction:column;align-items:flex-start;gap:7px;padding:18px 20px;border:1px solid var(--fluent-stroke);border-radius:10px;background:var(--fluent-card);color:#8ea198;font-family:inherit;text-align:left;cursor:pointer}
+.refund-counts button:hover:not(:disabled){border-color:var(--fluent)}
+.refund-counts button:disabled{cursor:default;opacity:.72}
+.refund-counts svg{color:var(--fluent)}
+.refund-counts b{color:#eef7f2;font-size:29px;font-weight:750;line-height:1;font-variant-numeric:tabular-nums}
+.refund-counts span{font-size:12px;line-height:1.55}
+.refund-counts .alert{border-color:rgba(245,191,92,.45);background:rgba(245,191,92,.07)}
+.refund-counts .alert svg,.refund-counts .alert b{color:#ebca89}
+.orders-filters .refund-check{flex-direction:row;align-items:center;gap:10px}
+.orders-filters .refund-check input{width:auto;padding:0}
+.orders-filters .refund-check span{color:#a9c2b8;font-size:12.5px}
+.orders-filters .refund-check button{min-height:36px;margin-left:auto;padding:0 16px;border-radius:7px;font-size:12.5px}
+.refunds-table header,.refunds-table>button{grid-template-columns:.95fr 1.05fr 1.2fr .95fr 1fr 1.15fr .75fr}
+.refunds-table>button.row-overdue{box-shadow:inset 3px 0 #d8ac63}
+.refunds-table small[class^=order-]{display:inline-block;margin-top:6px;padding:3px 7px;border-radius:99px;background:#1a2822;color:#9fb1a8;font-size:10px;text-transform:uppercase}
+.order-detail-grid dd em{display:inline-block;padding:4px 8px;border-radius:99px;background:#1a2822;color:#9fb1a8;font-size:10px;font-style:normal;text-transform:uppercase}
+.refund-overdue dt,.refund-overdue dd{color:#ebca89!important}
+.refund-order-link{display:inline-flex;align-items:center;gap:7px;color:var(--fluent);font-size:13px}
+.refund-buttons{display:flex;flex-wrap:wrap;gap:9px;margin-top:16px}
+.refund-buttons button{min-height:38px;padding:0 15px;border-radius:7px;font-size:13px}
+.refund-buttons button.active{outline:2px solid var(--fluent);outline-offset:2px}
+.refund-buttons button:disabled{cursor:not-allowed;opacity:.55}
+.refund-form-hint{margin:0;padding:11px 13px;border-radius:8px;background:rgba(219,255,238,.05);color:#a9c2b8;font-size:12.5px;line-height:1.7}
+.refund-actions .orders-change select,.refund-actions .orders-change input{width:100%;padding:11px;border:1px solid var(--fluent-stroke);border-radius:7px;outline:0;background:#09100d;color:#e2f1ea;font-family:inherit;font-size:13px}
+.refund-actions .orders-change small{color:#6e8279;font-size:11px;line-height:1.6}
+.refund-repair{margin-top:20px;padding-top:18px;border-top:1px dashed var(--fluent-stroke)}
+.refund-repair h3{display:flex;align-items:center;gap:7px;margin:0 0 8px;font-size:14px}
+.refund-repair h3 svg{color:#c9a86a}
+.refund-repair p{margin:0 0 12px;color:#93a89e;font-size:12.5px;line-height:1.7}
+.refund-repair label{display:flex;flex-direction:column;gap:7px;color:#9aad9f;font-size:12px}
+.refund-repair input{width:100%;padding:11px;border:1px solid var(--fluent-stroke);border-radius:7px;outline:0;background:#09100d;color:#e2f1ea;font-family:inherit;font-size:13px}
+.refund-repair input:focus{border-color:var(--fluent)}
+.refund-repair button{min-height:38px;margin-top:13px;padding:0 16px;border-radius:7px;font-size:13px}
+.refund-repair button:disabled{cursor:not-allowed;opacity:.55}
+.refund-audit li{padding:11px 0}
+/* 收尾那句是说明，不是警告：图标跟着文字走灰，别用 .orders-hint 的金色抢注意力。 */
+.refund-foot{margin-top:18px;padding-top:15px;border-top:1px solid var(--fluent-stroke)}
+.refund-foot svg{color:#8aa39a!important}
+.orders-goto-refunds{display:inline-flex;align-items:center;gap:7px;min-height:36px;margin-top:12px;padding:0 14px;border-radius:7px;font-size:12.5px}
+@media(max-width:1080px){.refund-counts{grid-template-columns:1fr}}
+@media(max-width:860px){.refunds-table>button{grid-template-columns:1fr 1fr}}

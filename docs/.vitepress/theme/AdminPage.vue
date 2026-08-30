@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { Ban, BadgePercent, BarChart3, Boxes, CreditCard, FileText, Github, GitBranch, KeyRound, LayoutDashboard, Plus, ReceiptText, RefreshCw, Save, Settings, ShieldCheck, Trash2, UserX, Users, Zap } from 'lucide-vue-next'
+import { Ban, BadgePercent, BarChart3, Boxes, CreditCard, FileText, Gavel, Github, GitBranch, KeyRound, LayoutDashboard, Plus, ReceiptText, RefreshCw, Save, Settings, ShieldCheck, Trash2, UserX, Users, Zap } from 'lucide-vue-next'
 import SiteHeader from './SiteHeader.vue'
 import AdminOrders from './AdminOrders.vue'
+import AdminRefunds from './AdminRefunds.vue'
 import AdminCoupons from './AdminCoupons.vue'
 import AdminAutoReplies from './AdminAutoReplies.vue'
 import { GROUP_LABEL, GROUP_ORDER, supabase, useAuth } from './auth'
 import { SCHEMA, defaultRecord, fieldHint as hintFor, fromForm, rowMeta as metaFor, toForm, type Field } from './recordForm'
 const auth = useAuth()
-type Tab = 'overview'|'posts'|'progress_entries'|'orders'|'coupons'|'auto_replies'|'repositories'|'artifacts'|'payment_providers'|'user_profiles'|'site_settings'|'environment'
+type Tab = 'overview'|'posts'|'progress_entries'|'orders'|'refunds'|'coupons'|'auto_replies'|'repositories'|'artifacts'|'payment_providers'|'user_profiles'|'site_settings'|'environment'
 const tab=ref<Tab>('overview'); const rows=ref<any[]>([]); const selected=ref<any>(null); const message=ref(''); const stats=ref<any>(null)
 const envs=ref<any[]>([]); const envForm=ref({id:'',key:'',value:'',sensitive:true}); const loading=ref(false)
 const userStats=ref({admins:0}); const cascade=ref(false)
@@ -28,6 +29,10 @@ const tabs=computed(()=>[
   ...(auth.canViewOrders.value?[{id:'orders',label:'订单管理',icon:ReceiptText}]:[]),
   // §1.1：发券是管理员和客服都有的权限（删券只有管理员，那一条在接口里判）。
   ...(auth.isStaff.value?[
+    // §10.6：门槛和 api/_routes/admin-refunds.mjs 一样是 STAFF——售后要能看板子上有什么、发起了什么，
+    // 但批准和执行只有 admin 能点。谁能点由服务端的 can_decide 和每行的 actions 决定，不由这里决定：
+    // 客服看到一块灰掉的按钮，比看到一个空页面更能说明「这一步要找管理员」。
+    {id:'refunds',label:'退款审批',icon:Gavel},
     {id:'coupons',label:'优惠券',icon:BadgePercent},
     // §3：改规则只有 admin，但客服要能看——用户会话开头收到的那句话是哪条规则发的，只有这里说得清。
     {id:'auto_replies',label:'自动回复',icon:Zap}
@@ -47,7 +52,7 @@ async function load(){
   // endpoint checks for admin and an unauthenticated fetch would come back 401.
   if(tab.value==='overview'){ try{stats.value=await api('/api/installation-stats')}catch(e:any){stats.value=null;message.value=e.message} return }
   if(tab.value==='environment'){ await loadEnv(); return }
-  if(tab.value==='orders'||tab.value==='coupons'||tab.value==='auto_replies'){ childKey.value++; return }
+  if(tab.value==='orders'||tab.value==='refunds'||tab.value==='coupons'||tab.value==='auto_replies'){ childKey.value++; return }
   if(tab.value==='user_profiles'){ await loadUsers(); return }
   const {data,error}=await supabase!.from(tab.value).select('*').order('updated_at',{ascending:false})
   rows.value=data??[]; message.value=error?.message??''
@@ -89,13 +94,21 @@ async function api(path:string,options:any={}){const token=auth.session.value?.a
 async function loadEnv(){loading.value=true;try{envs.value=(await api('/api/admin-env')).variables}catch(e:any){message.value=e.message}finally{loading.value=false}}
 async function saveEnv(){try{const result=await api('/api/admin-env',{method:'PUT',body:JSON.stringify(envForm.value)});envForm.value={id:'',key:'',value:'',sensitive:true};message.value=result.redeployRequired?'环境变量已保存；请重新部署后生效。':'环境变量已保存，已触发重新部署。';await loadEnv()}catch(e:any){message.value=e.message}}
 async function deleteEnv(v:any){if(!confirm(`删除 ${v.key}？`))return;await api('/api/admin-env',{method:'DELETE',body:JSON.stringify({id:v.id})});await loadEnv()}
-async function selectTab(id:Tab){tab.value=id;await load()}
+// 从订单管理页「到退款审批看板处理这笔」跳过来时带的订单号。只在这一次跳转里有效：手动点侧栏的
+// 「退款审批」走的是 selectTab(id) 的默认参数，会把它清空——否则上次看过的那笔订单会一直挂在筛选
+// 条件上，而这块看板默认该显示的是所有在途申请。
+const refundOrderId=ref('')
+const openRefunds=(orderId:string)=>selectTab('refunds',orderId)
+// load() 会把 childKey +1 把子组件整个重挂，所以 order-id 必须在那之前赋好值，不能指望同一个 tick 里
+// 的批量更新替我们排序。
+async function selectTab(id:Tab,orderId=''){refundOrderId.value=id==='refunds'?orderId:'';tab.value=id;await load()}
 </script>
 <template><div class="fluent-page admin-page"><SiteHeader/><main class="admin-shell"><aside class="admin-rail"><div class="admin-title"><span>A</span><div><b>Aether Admin</b><small>{{auth.user.value?.email}}</small></div></div><nav><button v-for="item in tabs" :key="item.id" :class="{active:tab===item.id}" @click="selectTab(item.id)"><component :is="item.icon" :size="19"/>{{item.label}}</button></nav><a href="/me">返回我的账户</a></aside><section class="admin-workspace">
 <header class="workspace-head"><div><p>ADMIN CENTER / {{tab.toUpperCase()}}</p><h1>{{tabs.find(x=>x.id===tab)?.label}}</h1></div><button class="icon-button" @click="load"><RefreshCw :size="18"/></button></header>
 <div v-if="auth.ready.value&&!auth.user.value" class="fluent-empty">正在跳转到登录页…</div><div v-else-if="auth.group.value==='default'" class="fluent-empty"><KeyRound :size="28"/><h2>您的用户组无权访问此页面</h2></div>
 <template v-else-if="tab==='overview'"><div class="metric-grid"><article><span>累计装机量</span><strong>{{stats?.installed_hwid??'—'}}</strong><small>按 hwid 去重，每个装机一行</small></article><article><span>当前运行量</span><strong>{{stats?.running_hwid??'—'}}</strong><small>{{stats?.configured?`最近 ${stats.running_window_minutes} 分钟内上报过`:'尚未配置 TELEMETRY_INGEST_KEY，无法接收上报'}}</small></article><article><span>当前权限</span><strong>{{auth.group.value}}</strong><small>由 Supabase RLS 强制执行</small></article></div><div class="metric-grid"><article><span>累计错误</span><strong>{{stats?.errors??'—'}}</strong><small>详细堆栈在 Sentry</small></article><article><span>累计崩溃</span><strong>{{stats?.crashes??'—'}}</strong><small>致命异常，含启动失败</small></article><article><span>累计警告</span><strong>{{stats?.warns??'—'}}</strong><small>日志中的 WARN 计数</small></article></div><div v-if="stats?.installed_hwid" class="telemetry-breakdown"><section v-for="group in breakdowns" :key="group.key"><h3>{{group.label}}</h3><p v-if="!Object.keys(stats[group.key]||{}).length" class="breakdown-empty">窗口内没有运行中的装机</p><ul v-else><li v-for="(count,value) in stats[group.key]" :key="value"><b>{{value}}</b><i><em :style="{width:`${count/stats.running_hwid*100}%`}"/></i><span>{{count}}</span></li></ul></section></div><div class="admin-callout"><h3>这些数字从哪来</h3><p>装机量与运行量来自装机自身向 <code>/api/telemetry</code> 上报的心跳，落在 <code>telemetry_installs</code> 表里，一个 hwid 一行；上报需要在“环境变量”中设置 <code>TELEMETRY_INGEST_KEY</code>，未设置时端点会直接拒收而不是匿名接受。<code>hwid</code> 是对稳定机器特征做加盐 SHA-256 后的结果，不是可还原的机器标识。<br>错误、崩溃与日志正文走 Sentry，插件用 DSN 直接投递，这里只显示计数。计数不从 Sentry 反查：Sentry 的 errors 数据集只装得下出过错的装机，用它统计装机量会把干净运行的服务器整个漏掉；而把心跳也发成 Sentry 事件，按 5 分钟一次算单台每月约 8,640 条，一台就能打满免费额度。</p></div></template>
-<template v-else-if="tab==='orders'"><AdminOrders :key="childKey"/></template>
+<template v-else-if="tab==='orders'"><AdminOrders :key="childKey" @open-refunds="openRefunds"/></template>
+<template v-else-if="tab==='refunds'"><AdminRefunds :key="childKey" :order-id="refundOrderId"/></template>
 <template v-else-if="tab==='coupons'"><AdminCoupons :key="childKey"/></template>
 <template v-else-if="tab==='auto_replies'"><AdminAutoReplies :key="childKey"/></template>
 <template v-else-if="tab==='environment'"><div class="env-layout"><section class="env-list"><div class="section-toolbar"><div><h2>Vercel 环境变量</h2><p>值不会返回浏览器；修改后需重新部署。</p></div></div><div v-if="loading">加载中…</div><article v-for="v in envs" :key="v.id"><KeyRound :size="18"/><div><b>{{v.key}}</b><small>{{v.target?.join(', ')}} · {{v.type}}</small></div><button @click="envForm={id:v.id,key:v.key,value:'',sensitive:v.type!=='plain'}">替换</button><button @click="deleteEnv(v)"><Trash2 :size="16"/></button></article></section><form class="record-editor env-form" @submit.prevent="saveEnv"><h2>{{envForm.id?'替换变量':'添加变量'}}</h2><label>变量名<input v-model="envForm.key" required pattern="[A-Z][A-Z0-9_]*" placeholder="SENTRY_AUTH_TOKEN"><small>只能用大写字母、数字和下划线，必须以字母开头。填一个已存在的名字等于覆盖它的值。</small></label><label>新值<textarea v-model="envForm.value" required rows="6" placeholder="值仅发送到 Vercel"></textarea><small>整段粘贴，前后空格会被 Vercel 保留。值只发往 Vercel，不写入数据库也不会再回显到这个页面。</small></label><label class="check-label"><input v-model="envForm.sensitive" type="checkbox">敏感值（推荐）</label><small class="env-note">勾选后这个值在 Vercel 控制台和 <code>vercel env pull</code> 里都不再可读，只有函数运行时能取到；密钥、令牌、数据库密码都应该勾。</small><button class="fluent-primary"><Save :size="17"/>保存到 Vercel</button><div class="admin-callout compact"><b>首次引导</b><p>必须先在 Vercel 控制台设置 <code>VERCEL_API_TOKEN</code>、<code>VERCEL_PROJECT_ID</code>，团队项目还需 <code>VERCEL_TEAM_ID</code>。</p></div></form></div></template>

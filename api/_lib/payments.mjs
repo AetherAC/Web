@@ -355,9 +355,10 @@ const payerurl = {
 // 一个模板化的 JSON POST。只把 ALIPAY_* 变量填好而没有驱动，得到的只会是网关的 Invalid signature——
 // 这也是原来 schema 里那四个变量名的真实处境：一份没有任何代码读的清单。
 //
-// 这里一次网络请求都不发。page.pay / wap.pay 的正确用法是把签好名的参数拼成一条 GET URL 让买家跳过去
-// （官方 SDK 的 pageExecute(request, "GET") 返回的就是这个），所以 create 只做拼装和签名，既不会因为
-// 网关抖动而失败，也不会留下「订单已建好但没有 checkout_url」的中间态。
+// 支付宝网关这边一次请求都不发。page.pay / wap.pay 的正确用法是把签好名的参数拼成一条 GET URL 让买家
+// 跳过去（官方 SDK 的 pageExecute(request, "GET") 返回的就是这个），所以 create 只做拼装和签名，既不会
+// 因为网关抖动而失败，也不会留下「订单已建好但没有 checkout_url」的中间态。唯一的外部调用是非人民币
+// 订单的汇率查询（见 alipayRate），人民币订单走不到那里。
 //
 // 密钥用「公钥模式」而不是「证书模式」：证书模式要三个 .crt 文件，塞不进一个环境变量。
 // ALIPAY_PRIVATE_KEY 是商户自己的 RSA 私钥（签请求用），ALIPAY_PUBLIC_KEY 是支付宝公钥（验通知用），
@@ -432,23 +433,102 @@ export function alipayVerify(params, publicKey) {
 // out_trade_no 只允许字母、数字和下划线，而订单 id 是带连字符的 UUID。去掉连字符得到 32 位十六进制，
 // 通知回来时再按 8-4-4-4-12 补回去；映射双向确定，所以不必为此多存一列。不是 32 位十六进制的原样返回，
 // 这样即使以后订单 id 换了形态，orderId 也不会被读成 null。
-export const alipayOutTradeNo = (orderId) => String(orderId || '').replace(/-/g, '')
+//
+// 换算过的订单在后面接三段「订单货币_订单金额_人民币金额」。这是回调唯一能拿到下单那一刻汇率的地方：
+// verify 只收到通知正文和 public_config，拿不到订单行，而通知里的金额是人民币，订单行上的是原币种，
+// 两者得能对上。为什么不写进 orders：out_trade_no 由支付宝原样回传且在签名覆盖范围内（买家改不了一个
+// 字符，改了整条通知就验不过），所以它已经是一条带签名的回执，再加一列一次查询只是把同一个事实多存
+// 一份。上限 64 字节，这里最长 32+1+3+1+10+1+10 = 58。
+export const alipayOutTradeNo = (orderId, fx = null) => {
+  const base = String(orderId || '').replace(/-/g, '')
+  return fx ? `${base}_${fx.currency}_${fx.amountMinor}_${fx.cnyMinor}` : base
+}
 export function alipayOrderId(outTradeNo) {
-  const text = String(outTradeNo || '')
-  if (!/^[0-9a-f]{32}$/i.test(text)) return text || null
+  const raw = String(outTradeNo || '')
+  const text = raw.split('_')[0]
+  if (!/^[0-9a-f]{32}$/i.test(text)) return raw || null
   const grouped = [text.slice(0, 8), text.slice(8, 12), text.slice(12, 16), text.slice(16, 20), text.slice(20)]
   return grouped.join('-').toLowerCase()
 }
 
-// 支付宝国内商户只结算人民币，total_amount 的单位是元。拿一笔美元订单的数字去下单，收到的会是同样数字
-// 的人民币——少收约 86%，而且从下单到通知没有任何一步会报错。所以币种不对就抛，绝不换算：汇率不在这里，
-// 猜一个只会把一个能看见的错误变成一个看不见的错误。
-export function alipayAmount(order) {
+/** 从 out_trade_no 里取回下单时锁定的换算。三段缺一不可，形状不对就当没有换算（人民币订单）。 */
+export function alipayFx(outTradeNo) {
+  const parts = String(outTradeNo || '').split('_')
+  if (parts.length !== 4) return null
+  const [, currency, amount, cny] = parts
+  const amountMinor = Number(amount)
+  const cnyMinor = Number(cny)
+  if (!/^[A-Z]{3}$/.test(currency)) return null
+  if (!Number.isInteger(amountMinor) || amountMinor <= 0 || !Number.isInteger(cnyMinor) || cnyMinor <= 0) return null
+  return { currency, amountMinor, cnyMinor }
+}
+
+/**
+ * 非人民币订单的换算汇率：1 单位订单货币兑多少人民币。
+ *
+ * 支付宝国内商户只结算人民币，total_amount 的单位是元，所以一笔美元订单要么换算要么根本发不出去——把
+ * 19.99 直接当成 19.99 元，收到的是同样数字的人民币，少收约 86%，而从下单到通知没有一步会报错。
+ *
+ * 两个来源，顺序是有意的：
+ * 1. public_config.fx_rates（如 {"USD": 7.15}）。管理员钉死的数字，一次网络请求都不发，也不会因为第三方
+ *    停服而下不了单。想按某个内部结算价收款就填这里。
+ * 2. 否则查 fx_url（默认 frankfurter.app，转的是欧洲央行每日参考汇率，免费、不要 key）。
+ *
+ * 查不到就抛，绝不回落到 1：回落把「不知道汇率」变成「按 1:1 收款」，而那正是这个函数存在的原因。抛出来
+ * 的是一个买家在结账页上能看见的错误，比一笔静默少收八成的成交要好。
+ *
+ * 参考汇率是中间价，实际结汇有点差；public_config.fx_markup 填 0.02 就在汇率上加 2%，默认不加——擅自
+ * 加价比少收一点更难向买家解释。
+ */
+export const ALIPAY_FX_URL = 'https://api.frankfurter.app/latest'
+const ALIPAY_FX_TTL_MS = 10 * 60 * 1000
+// 只在一个函数实例的生命周期内有效。Fluid Compute 会复用实例，所以这挡掉的是「同一分钟里每次下单都打一
+// 次外部接口」；实例换了就重新查，不需要跨实例一致——汇率只要在下单那一刻是真的。缓存的是原始汇率而不是
+// 加过点差的值，这样改 fx_markup 立刻生效。
+const alipayFxCache = new Map()
+
+export async function alipayRate(currency, config = {}, { now = Date.now(), fetchJson = json } = {}) {
+  const code = String(currency || '').toUpperCase()
+  if (!code || code === 'CNY') return 1
+  const markup = Number(config.fx_markup)
+  const factor = 1 + (Number.isFinite(markup) && markup > 0 && markup <= 0.2 ? markup : 0)
+
+  const pinned = Number(config.fx_rates?.[code])
+  if (Number.isFinite(pinned) && pinned > 0) return pinned * factor
+
+  const cached = alipayFxCache.get(code)
+  if (cached && now - cached.at < ALIPAY_FX_TTL_MS) return cached.rate * factor
+
+  const url = `${config.fx_url || ALIPAY_FX_URL}?from=${encodeURIComponent(code)}&to=CNY`
+  let rate = NaN
+  try {
+    const body = await fetchJson(url)
+    rate = Number(body?.rates?.CNY ?? body?.CNY ?? body?.rate)
+  } catch (error) {
+    throw new Error(`拿不到 ${code} 兑人民币的汇率（${error.message}），请稍后重试，或在支付宝的公开配置里用 fx_rates 钉一个汇率`)
+  }
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw new Error(`汇率接口没有返回 ${code} 兑人民币的汇率，请在支付宝的公开配置里用 fx_rates 钉一个`)
+  }
+  alipayFxCache.set(code, { rate, at: now })
+  return rate * factor
+}
+
+/**
+ * 订单金额 → 支付宝要的 total_amount（元，两位小数），外加一份能在回调里复原的换算记录。
+ *
+ * rate 是 1 单位订单货币兑多少人民币，人民币订单不看它。分位向上取整：向下取整会让每一笔换算过的订单少
+ * 收最多一分，而少收一分在回调里就是一个 409——payment-callback 拿通知金额跟订单行比，差一分就不放货。
+ * 向上取整之后 floor(amountMinor × 实收人民币 ÷ 应收人民币) 必然回到订单金额本身，那条比较才恒真。
+ */
+export function alipayCharge(order, rate = 1) {
   const currency = String(order?.currency || '').toUpperCase()
-  if (currency !== 'CNY') throw new Error(`支付宝只能收人民币，这笔订单的币种是 ${currency || '（空）'}`)
-  const yuan = Number(order.amount_minor) / 100
-  if (!Number.isFinite(yuan) || yuan < 0.01) throw new Error('支付宝的最小收款金额是 0.01 元')
-  return yuan.toFixed(2)
+  const minor = Math.round(Number(order?.amount_minor))
+  if (!Number.isFinite(minor) || minor < 1) throw new Error('支付宝的最小收款金额是 0.01 元')
+  if (currency === 'CNY') return { total: (minor / 100).toFixed(2), fx: null }
+  if (!Number.isFinite(rate) || rate <= 0) throw new Error(`没有 ${currency || '（空）'} 兑人民币的汇率，这笔订单发不出去`)
+  const cnyMinor = Math.ceil(minor * rate)
+  return { total: (cnyMinor / 100).toFixed(2), fx: { currency, amountMinor: minor, cnyMinor } }
 }
 
 // 手机浏览器要走 wap.pay：page.pay 在手机上会渲染成一个缩得很小的电脑收银台，也唤不起支付宝 App。
@@ -474,11 +554,12 @@ export function alipayBytes(text, limit) {
   return out
 }
 
-export function alipayRequestParams({ order, artifact, siteUrl, config = {}, headers = {}, now = new Date() }) {
+export function alipayRequestParams({ order, artifact, siteUrl, config = {}, headers = {}, now = new Date(), rate = 1 }) {
   const product = alipayProduct(config, headers)
+  const charge = alipayCharge(order, rate)
   const biz = {
-    out_trade_no: alipayOutTradeNo(order.id),
-    total_amount: alipayAmount(order),
+    out_trade_no: alipayOutTradeNo(order.id, charge.fx),
+    total_amount: charge.total,
     // subject 上限 256 字节，换行会让收银台标题串行，所以先折叠空白再按字节裁。
     subject: alipayBytes(String(artifact?.name || order.sku || '订单').replace(/\s+/g, ' ').trim(), 128),
     product_code: product.productCode,
@@ -511,11 +592,15 @@ export function alipayCheckoutUrl(params, privateKey, gateway = ALIPAY_GATEWAY) 
 
 const alipay = {
   async create({ order, artifact, siteUrl, config = {}, headers = {} }) {
-    const params = alipayRequestParams({ order, artifact, siteUrl, config, headers })
+    // 人民币订单这里直接拿到 1，走不到汇率接口；非人民币订单在这一刻把汇率锁进 out_trade_no。
+    const rate = await alipayRate(order?.currency, config)
+    const params = alipayRequestParams({ order, artifact, siteUrl, config, headers, rate })
     const checkoutUrl = alipayCheckoutUrl(params, env(config.private_key_env || 'ALIPAY_PRIVATE_KEY'), alipayGateway(config))
     // 买家付款之前，支付宝侧不存在任何单号，所以这里回的是商户订单号——它同时是支付宝后台「商户订单号」
-    // 那一栏能搜到的值，出问题时有个东西可查。通知到达后会被换成 trade_no（支付宝自己的交易号）。
-    return { checkoutUrl, providerOrderId: params.biz_content ? alipayOutTradeNo(order.id) : null }
+    // 那一栏能搜到的值，出问题时有个东西可查。通知到达后会被换成 trade_no（支付宝自己的交易号）。从
+    // biz_content 里读回来而不是重算一遍：换算过的订单，单号尾部带着那三段汇率，重算会得到一个网关侧
+    // 根本不存在的号。
+    return { checkoutUrl, providerOrderId: JSON.parse(params.biz_content).out_trade_no }
   },
   /**
    * 异步通知。ack 里那两个字面量是硬要求：支付宝只认正文等于 success，任何别的正文（包括一个
@@ -543,15 +628,26 @@ const alipay = {
     const orderId = alipayOrderId(body.out_trade_no)
     if (!orderId) return { ack, reject: { status: 400, error: 'Alipay callback carries no out_trade_no' } }
     const total = Number(body.total_amount)
+    // total_amount 是这笔交易的订单总额，单位是元，币种恒为人民币。
+    const paidCny = Number.isFinite(total) && total > 0 ? Math.round(total * 100) : 0
+    // 换算过的订单，下单时那一刻的「原币金额 ↔ 人民币金额」被锁在 out_trade_no 里跟着通知回来了。
+    const fx = alipayFx(body.out_trade_no)
     return {
       orderId,
       // TRADE_FINISHED 是「交易结束、不可退款」，钱早就到账了，不是失败。WAIT_BUYER_PAY 两个都不是，
       // 订单留在 pending，等 timeout_express 到点后的 TRADE_CLOSED 来收尾。
       paid: status === 'TRADE_SUCCESS' || status === 'TRADE_FINISHED',
       failed: status === 'TRADE_CLOSED',
-      providerOrderId: body.trade_no ? String(body.trade_no) : alipayOutTradeNo(orderId),
-      // total_amount 是这笔交易的订单总额（元）。少付一分就不放货：handler 会拿它跟订单行比。
-      expect: Number.isFinite(total) && total > 0 ? { amountMinor: Math.round(total * 100), currency: 'CNY' } : null,
+      // 换算过的订单号带着尾部三段，原样回传的就是它；重新拼一个 32 位的会让后台搜不到。
+      providerOrderId: body.trade_no ? String(body.trade_no) : String(body.out_trade_no || ''),
+      // 少付一分就不放货：handler 会拿这里的数字跟订单行比。换算过的订单按下单时锁定的那一对金额成
+      // 比例折回原币种，而不是用通知到达这一刻的汇率重算——汇率每天都在动，重算会把一笔足额付款变成
+      // 409。整数运算，且下单时是向上取整的，所以足额付款折回来必然正好等于订单金额。
+      expect: paidCny > 0
+        ? (fx
+            ? { amountMinor: Math.floor(fx.amountMinor * paidCny / fx.cnyMinor), currency: fx.currency }
+            : { amountMinor: paidCny, currency: 'CNY' })
+        : null,
       payload: body,
       ack
     }

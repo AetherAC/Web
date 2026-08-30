@@ -17,7 +17,7 @@
  */
 import { computed, reactive, ref, watch } from 'vue'
 import {
-  ChevronLeft, ChevronRight, CircleAlert, Download, PackageOpen, ReceiptText,
+  ChevronLeft, ChevronRight, CircleAlert, Download, Gavel, PackageOpen, ReceiptText,
   RotateCcw, Search, ShieldCheck, UserRound, Wallet, X
 } from 'lucide-vue-next'
 import { supabase, useAuth } from './auth'
@@ -28,6 +28,13 @@ import {
 import { formatMinor } from '../../../shared/coupons.mjs'
 
 const auth = useAuth()
+
+/**
+ * 「到退款审批看板处理这笔」把订单号交给父组件（AdminPage 切 tab）。
+ *
+ * 走 emit 而不是 <a href="/admin?tab=refunds">：后台是单页，tab 只是一个 ref，链接会整页重载并回到概览。
+ */
+const emit = defineEmits<{ (e: 'open-refunds', orderId: string): void }>()
 
 /** §12.3 的筛选条件。空串一律不拼进 query，后端把缺省当「不筛」。 */
 const FILTER_DEFAULTS = {
@@ -466,10 +473,20 @@ watch(() => auth.ready.value, ready => {
           <small>{{ when(r.created_at) }}</small>
         </li>
       </ol>
-      <!-- 审批、转交、打款都不在这一页：那三个动作要记下审批人和理由，而记录是通知上的按钮在做。 -->
+      <!--
+        审批、转交、打款都不在这一页：那三个动作要记下审批人、理由和二次确认，而记录是 §10.6 的退款审批
+        看板在做。这里只给一个跳过去的入口，不复制那几个按钮——同一个动作有两个入口，就有两份「谁点的」
+        判断，而退款是不可逆的那一类操作。
+
+        按钮只对 STAFF 显示：rank 111 的组织成员能翻订单（§12.2），但看不到退款看板那个 tab，给他们一个
+        点了没反应的按钮比不给更糟。
+      -->
       <p class="orders-hint">
-        <CircleAlert :size="15" />审批、转交和执行打款在<a href="/inbox">收件箱</a>的审批通知上操作——审批人、理由和二次确认都由那条通知记录，这一页只显示进展。
+        <CircleAlert :size="15" />审批、转交和执行打款在<b>退款审批</b>看板上操作——审批人、理由和二次确认都由那一页记录，这一页只显示进展。也可以从<a href="/inbox">收件箱</a>的审批通知直接点。
       </p>
+      <button v-if="auth.isStaff.value" type="button" class="fluent-secondary orders-goto-refunds" @click="emit('open-refunds', detail.order.id)">
+        <Gavel :size="16" />到退款审批看板处理这笔
+      </button>
     </section>
 
     <section v-if="detail.logs.length" class="order-log">

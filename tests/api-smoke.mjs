@@ -3,13 +3,15 @@ import usersHandler, { isBanned } from '../api/_routes/admin-users.mjs'
 import {
   DRIVERS,
   ALIPAY_GATEWAY,
-  alipayAmount,
   alipayBytes,
+  alipayCharge,
   alipayCheckoutUrl,
+  alipayFx,
   alipayOrderId,
   alipayOutTradeNo,
   alipayPem,
   alipayProduct,
+  alipayRate,
   alipayRequestParams,
   alipaySign,
   alipaySignContent,
@@ -42,6 +44,9 @@ import telemetryHandler from '../api/_routes/telemetry.mjs'
 import {
   exportOrders, listOrders, maskEmail, orderDetail, toCsv, updateOrderStatus
 } from '../api/_routes/admin-orders.mjs'
+import {
+  actionsFor, boardCounts, executeBlock, exportRefundAudit, listRefunds, refundDetail, repairRefund
+} from '../api/_routes/admin-refunds.mjs'
 import { couponFieldsFor, redeemOrRollback } from '../api/_lib/coupons.mjs'
 import { quoteCoupon } from '../api/_routes/coupon.mjs'
 import { NEVER_WRITABLE, forValidation } from '../api/_routes/admin-coupons.mjs'
@@ -509,14 +514,45 @@ assert(alipayOutTradeNo(order.id) === 'a1b2c3d4000040008000000000000001' && !ali
 assert(alipayOrderId(alipayOutTradeNo(order.id)) === order.id, 'the mapping must be reversible, or a paid callback cannot find its order')
 assert(alipayOrderId('LEGACY_REF_1') === 'LEGACY_REF_1' && alipayOrderId('') === null, 'anything that is not 32 hex digits passes through instead of becoming null')
 
+// 换算过的订单把「原币_原币金额_人民币金额」锁在单号尾部，因为 verify 只拿到通知正文，拿不到订单行。
+const fxRef = alipayOutTradeNo(order.id, { currency: 'USD', amountMinor: 1999, cnyMinor: 14294 })
+assert(fxRef === 'a1b2c3d4000040008000000000000001_USD_1999_14294' && fxRef.length <= 64 && /^[A-Za-z0-9_]+$/.test(fxRef),
+  'the locked rate rides in out_trade_no, and it must still be letters/digits/underscore inside 64 bytes')
+assert(alipayOrderId(fxRef) === order.id, 'the suffix must not stop a paid callback from finding its order')
+assert(alipayFx(fxRef).cnyMinor === 14294 && alipayFx(fxRef).currency === 'USD' && alipayFx(fxRef).amountMinor === 1999,
+  'the three segments must come back exactly, or a converted payment cannot be checked against the order')
+assert(alipayFx(alipayOutTradeNo(order.id)) === null && alipayFx('LEGACY_REF_1') === null && alipayFx('x_usd_1_2') === null,
+  'a CNY order carries no conversion, and a malformed suffix must read as none rather than as a made-up rate')
+
 assert(alipayBytes('入门版专业版', 9) === '入门版', 'subject is capped in bytes, and a half-cut character would garble the cashier title')
 assert(alipayBytes('abc', 9) === 'abc', 'a short subject is left alone')
 
 const cnyOrder = { ...order, currency: 'CNY' }
-assert(alipayAmount(cnyOrder) === '19.99', 'total_amount is yuan, not the minor unit')
+assert(alipayCharge(cnyOrder).total === '19.99' && alipayCharge(cnyOrder).fx === null, 'total_amount is yuan, not the minor unit, and a CNY order needs no conversion')
+// 支付宝国内商户结算的是人民币，所以非人民币订单按汇率折成人民币再发出去。分位向上取整：向下取整会让每
+// 一笔换算订单少收最多一分，而那一分回来就是一个 409。
+const usdCharge = alipayCharge(order, 7.1503)
+assert(usdCharge.total === '142.94' && usdCharge.fx.cnyMinor === 14294 && usdCharge.fx.currency === 'USD' && usdCharge.fx.amountMinor === 1999,
+  'a USD order is converted at the rate rather than charged the same number in yuan — that would be a silent 86% undercharge that never errors')
+assert(Math.floor(usdCharge.fx.amountMinor * (usdCharge.fx.cnyMinor - 1) / usdCharge.fx.cnyMinor) < 1999,
+  'one fen short must fold back to below the order amount, or payment-callback would release an underpaid order')
 let alipayThrew = false
-try { alipayAmount(order) } catch { alipayThrew = true }
-assert(alipayThrew, 'a USD order must throw rather than be charged the same number in yuan — a silent 86% undercharge that never errors')
+try { alipayCharge(order, 0) } catch { alipayThrew = true }
+assert(alipayThrew, 'with no rate the order must not go out at all; charging 1:1 is the failure this conversion exists to prevent')
+
+// 汇率来源：钉死的优先且不联网，否则查接口并缓存，查不到就抛而不是回落到 1。
+const fxCalls = []
+const fxStub = async (url) => { fxCalls.push(url); return { rates: { CNY: 7.2 } } }
+assert(await alipayRate('CNY', {}, { fetchJson: fxStub }) === 1 && fxCalls.length === 0, 'a CNY order must never touch the rate feed')
+assert(await alipayRate('USD', { fx_rates: { USD: 7.1 } }, { fetchJson: fxStub }) === 7.1 && fxCalls.length === 0,
+  'public_config.fx_rates pins the rate without a network call, so a third-party outage cannot block checkout')
+assert(Math.abs(await alipayRate('USD', { fx_rates: { USD: 7.1 }, fx_markup: 0.02 }, { fetchJson: fxStub }) - 7.242) < 1e-9,
+  'fx_markup adds the spread on top of the mid-market rate')
+assert(await alipayRate('SEK', {}, { fetchJson: fxStub }) === 7.2 && fxCalls[0].includes('from=SEK&to=CNY'), 'the feed is asked for the order currency against CNY')
+assert(await alipayRate('SEK', {}, { fetchJson: fxStub }) === 7.2 && fxCalls.length === 1, 'the rate is cached inside the instance rather than fetched on every checkout')
+let fxThrew = false
+try { await alipayRate('ZWL', {}, { fetchJson: async () => ({ rates: {} }) }) } catch { fxThrew = true }
+assert(fxThrew, 'a currency the feed does not quote must throw; falling back to 1 turns "no rate" into "charge 1:1"')
 
 assert(alipayProduct({}, {}).method === 'alipay.trade.page.pay', 'a desktop browser gets 电脑网站支付')
 assert(alipayProduct({}, { 'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' }).method === 'alipay.trade.wap.pay',
@@ -565,6 +601,20 @@ assert(alipayPaid.ack.ok === 'success' && alipayPaid.ack.fail === 'failure',
   'Alipay reads anything but the literal success as a failed notify and redelivers it 8 times over 24h')
 assert(alipayPaid.expect.amountMinor === 1999 && alipayPaid.expect.currency === 'CNY', 'total_amount is compared against the order row, so an underpayment cannot release it')
 assert(alipayPaid.providerOrderId === notify.trade_no, "the row must end up holding Alipay's own trade number, which is what the console searches on")
+
+// 换算过的订单走完整一圈：下单时锁进单号的那一对金额，让一笔人民币付款能跟一行美元订单对上。这一段钉住的
+// 是 payment-callback 里那条 `expect.amountMinor < row.amount_minor` 比较——足额必须恰好相等（差一分就是
+// 409，一笔真付款被拒），少付必须严格小于（否则一笔少付的订单被放货）。
+const fxNotify = { ...notify, out_trade_no: fxRef, total_amount: '142.94', receipt_amount: '142.94' }
+const fxPaid = await DRIVERS.alipay.verify({ payload: signedNotify(fxNotify), config: {} })
+assert(fxPaid.paid === true && fxPaid.orderId === order.id, 'the suffix must not stop the converted order from being found')
+assert(fxPaid.expect.currency === 'USD' && fxPaid.expect.amountMinor === 1999,
+  'the CNY the buyer actually paid folds back to the order currency at the rate locked at checkout, not at the rate on the day the notify arrives')
+const fxShort = await DRIVERS.alipay.verify({ payload: signedNotify({ ...fxNotify, total_amount: '142.93', receipt_amount: '142.93' }), config: {} })
+assert(fxShort.expect.currency === 'USD' && fxShort.expect.amountMinor < 1999, 'one fen short of the converted price must still be refused')
+assert(fxPaid.providerOrderId === notify.trade_no
+  && (await DRIVERS.alipay.verify({ payload: signedNotify({ ...fxNotify, trade_no: '' }), config: {} })).providerOrderId === fxRef,
+  'with no trade_no yet the row keeps the merchant reference verbatim — a rebuilt 32-hex one exists nowhere in the console')
 
 assert((await DRIVERS.alipay.verify({ payload: signedNotify({ ...notify, trade_status: 'TRADE_FINISHED' }), config: {} })).paid === true,
   'TRADE_FINISHED means the money arrived and can no longer be refunded — not that it failed')
@@ -2247,6 +2297,20 @@ const retried = await executeRefund(execDb({ refund: { ...approvedRefund, status
   { userId: ADMIN1, group: 'admin' }, { refund_id: REFUND, outcome: 'success', confirm: true })
 assert(retried.status === 200, '上次失败的退款可以重试，而不是让人另开一条申请丢掉审计链')
 
+// 上次「抢到了但订单没改成」留在 executing 的，必须能接着走完。状态图里没有 executing → executing
+// 这条边（自环会让「执行中」失去含义），所以这一次不按迁移检查——refund-execute 传的是 resumable。
+// 少了这一条，那些被有意留在 executing 的申请会撞上 409「不能从执行中变更为执行中」，而它们留在
+// 那里的全部目的就是避免这种死路：订单还在退款中，别处没有任何入口能推完它。
+const resumeDb = execDb({ refund: { ...approvedRefund, status: 'executing' } })
+const resumed = await executeRefund(resumeDb, { userId: ADMIN1, group: 'admin' },
+  { refund_id: REFUND, outcome: 'success', confirm: true })
+assert(resumed.status === 200 && resumed.body.status === 'completed',
+  '停在执行中的申请可以接着走完，而不是永久卡住')
+const resumeUpds = resumeDb.calls.filter(c => c.table === 'refund_requests' && c.op === 'update')
+assert(resumeUpds[0].filters.status === 'executing', '这一次的抢占条件是它此刻的状态')
+assert(resumeDb.calls.find(c => c.table === 'orders' && c.op === 'update').payload.status === 'refunded',
+  '订单仍然要从退款中走到已退款')
+
 // 订单必须在 REFUND_PENDING。这一条不能靠「申请是 approved」推出来：批准时改订单那一步可能失败过，
 // 那时申请已批准而订单还是 PAID，此时登记成功会把一笔没进退款流程的订单直接改成已退款。
 for (const pendingOrder of ['paid', 'pending', 'refunded', 'cancelled', 'failed']) {
@@ -2774,6 +2838,243 @@ for (const target of ['refund_pending', 'refunded']) {
 }
 
 console.log('Admin orders: OK')
+
+// --- api/admin-refunds.mjs (§10.6 / §10.8) ---------------------------------------------------------
+// 这一段盯的是两件事：谁能看、谁能改（读是 STAFF、写只有 admin，和 schema 里的策略一致），以及
+// 「只写了一半」的那三种状态各自被算成哪一个补法。后者错一次就是把一笔没退出去的钱标成已退款。
+const RFD = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+const RFD_ORDER = '11111111-2222-3333-4444-555555555555'
+const RFD_AT = '2026-08-01T00:00:00Z'
+const REFUND_ROW = {
+  id: RFD, order_id: RFD_ORDER, user_id: BUYER, status: 'pending', amount_minor: 9500, currency: 'USD',
+  reason_code: '不好用', reason_detail: '和描述不符', evidence_paths: [], admin_note: '',
+  initiated_by: BUYER, initiator_role: 'user', decided_by: null, decided_at: null, decision_note: '',
+  transferred_to: null, escalated_at: null, reminded_at: null, executed_at: null, execution_note: '',
+  created_at: RFD_AT, updated_at: RFD_AT
+}
+// 两套结果形状：看板列表用 .in() 一次取回多行，而 repair 是先 maybeSingle 读一行再 update。
+// 同一个假 db 要能分别作答，所以 repair 那条路径显式说明自己是它。
+const refundsDb = (opts = {}) => recorder({
+  refund_requests: opts.refund_requests ?? (opts.repair
+    ? [{ data: opts.refund ?? REFUND_ROW, error: null }, { data: [{ id: RFD }], error: null }]
+    : { data: [opts.refund ?? REFUND_ROW], error: null, count: opts.count ?? 42 }),
+  orders: opts.orders ?? (opts.repair
+    ? [{ data: { ...ORDER_ROW, status: opts.orderStatus ?? 'paid' }, error: null }, { data: [{ id: RFD_ORDER }], error: null }]
+    : { data: [{ ...ORDER_ROW, status: opts.orderStatus ?? 'paid' }], error: null }),
+  user_profiles: { data: [{ user_id: BUYER, email: 'zhangsan@example.com', display_name: '张三', group_name: 'default' }], error: null },
+  refund_audit_log: { data: opts.logs ?? [], error: null },
+  site_settings: settings(opts.config ?? {})
+})
+
+// planRepair 的三种情况，各自只有一个合理的补法。判断只看订单状态——那是这笔钱的唯一事实来源。
+{
+  const approvedPaid = await repairRefund(refundsDb({ repair: true, refund: { ...REFUND_ROW, status: 'approved' }, orderStatus: 'paid' }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: RFD, action: 'repair_order_move' })
+  assert(approvedPaid.status === 200 && approvedPaid.body.order_status === 'refund_pending',
+    '已批准但订单还是已支付：补的是订单，而不是把申请推到别的状态')
+
+  const doneStuck = await repairRefund(refundsDb({ repair: true, refund: { ...REFUND_ROW, status: 'executing' }, orderStatus: 'refunded' }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: RFD, action: 'repair_settle_completed' })
+  assert(doneStuck.status === 200 && doneStuck.body.status === 'completed',
+    '订单已退款、申请停在执行中：补成已完成，不要再退一次款')
+
+  const failStuck = await repairRefund(refundsDb({ repair: true, refund: { ...REFUND_ROW, status: 'executing' }, orderStatus: 'paid' }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: RFD, action: 'repair_settle_failed' })
+  assert(failStuck.status === 200 && failStuck.body.status === 'failed',
+    '订单退回已支付说明钱没退出去，终态必须是失败而不是已完成——后者是把没退的钱记成退了')
+}
+
+// actionsFor / executeBlock：界面上亮着的按钮和接口愿意接受的动作必须是同一份判断。
+{
+  const acts = (status, orderStatus) => actionsFor({ status }, { status: orderStatus })
+  assert(acts('pending', 'paid').join(',') === 'approve,reject,transfer', '待审批的三个按钮')
+  assert(acts('approved', 'refund_pending').includes('execute_success'), '订单在退款中才能登记结果')
+  assert(!acts('approved', 'paid').includes('execute_success'),
+    '订单还是已支付时不能登记退款结果——那会把一笔没进退款流程的订单标成已退款')
+  assert(acts('executing', 'refund_pending').includes('execute_failed'),
+    '停在执行中的可以接着走完，所以按钮还在')
+  assert(acts('completed', 'refunded').length === 0, '终态没有按钮')
+  assert(executeBlock({ status: 'approved' }, { status: 'paid' }).includes('补齐订单状态'),
+    '按钮不亮时要写出为什么，否则下一个人的处置办法是「再退一次款」')
+  assert(executeBlock({ status: 'executing' }, { status: 'refunded' }).includes('不要再退一次款'),
+    '这一句是这一页存在的理由：订单页和收件箱都看不出中间那一步没写完')
+  assert(executeBlock({ status: 'pending' }, { status: 'paid' }) === '', '还没批准的不用解释执行为什么点不了')
+  assert(executeBlock({ status: 'approved' }, { status: 'refund_pending' }) === '', '能点的时候不要挂一句说明')
+}
+
+// repair 的三道门：非 admin、状态本来就一致、以及前端看到的情况已经过期。
+{
+  for (const group of ['cs', 'postsale', 'presale', 'coworker', 'read', 'default']) {
+    const db = refundsDb({ repair: true, refund: { ...REFUND_ROW, status: 'executing' }, orderStatus: 'refunded' })
+    const out = await repairRefund(db, { userId: ADMIN1, group }, { refund_id: RFD })
+    assert(out.status === 403, `${group} 不能补齐退款记录——这是在改钱的记录`)
+    assert(db.calls.length === 0, `${group} 被拒时不该产生任何数据库调用`)
+  }
+  const consistent = await repairRefund(refundsDb({ repair: true, refund: { ...REFUND_ROW, status: 'approved' }, orderStatus: 'refund_pending' }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: RFD })
+  assert(consistent.status === 409, '两边一致时没有可补的，不能凭空改一个状态')
+  const stale = await repairRefund(refundsDb({ repair: true, refund: { ...REFUND_ROW, status: 'executing' }, orderStatus: 'refunded' }),
+    { userId: ADMIN1, group: 'admin' }, { refund_id: RFD, action: 'repair_settle_failed' })
+  assert(stale.status === 409 && stale.body.expected === 'repair_settle_completed',
+    '看板开了十分钟，情况变了就让人重新看一眼，而不是默默执行另一件他没打算做的事')
+  for (const bad of [undefined, '', 'abc', 123]) {
+    const out = await repairRefund(refundsDb(), { userId: ADMIN1, group: 'admin' }, { refund_id: bad })
+    assert(out.status === 400, `refund_id=${JSON.stringify(bad)} 应拒`)
+  }
+}
+
+// 补齐时的并发保护和审计。这两句 .eq 是全部的保护：Vercel 上没有事务。
+{
+  const db = refundsDb({
+    repair: true, refund: { ...REFUND_ROW, status: 'approved' },
+    orders: [{ data: { ...ORDER_ROW, status: 'paid' }, error: null }, { data: [{ id: RFD_ORDER }], error: null }]
+  })
+  await repairRefund(db, { userId: ADMIN1, group: 'admin' }, { refund_id: RFD, note: '渠道后台已确认' })
+  const upd = db.calls.find(c => c.table === 'orders' && c.op === 'update')
+  assert(upd.filters.status === 'paid', '订单的 update 要求它此刻还是已支付，慢的那次影响 0 行')
+  assert(upd.payload.status === 'refund_pending', '补的就是批准时该做的那一步')
+  const olog = db.calls.find(c => c.table === 'order_status_log').payload
+  assert(olog.from_status === 'paid' && olog.to_status === 'refund_pending' && olog.source === 'admin',
+    '订单侧要留状态日志，三个月后对账的人要看得到这一步是人工补的')
+  assert(olog.note.includes('渠道后台已确认'), '操作人写的原因要留着')
+  const alog = db.calls.find(c => c.table === 'refund_audit_log').payload
+  assert(alog.action === 'repair_order_move' && alog.to_status === 'approved',
+    '申请状态没动，所以 from/to 都是 approved——留空会让这一行看起来像一次失败的迁移')
+  assert(!db.calls.some(c => c.table === 'notifications'),
+    '不发站内信：批准通知早发过了，再发一条只会让用户以为又发生了一次退款')
+
+  const lost = refundsDb({
+    repair: true, refund: { ...REFUND_ROW, status: 'approved' },
+    orders: [{ data: { ...ORDER_ROW, status: 'paid' }, error: null }, { data: [], error: null }]
+  })
+  const lostOut = await repairRefund(lost, { userId: ADMIN1, group: 'admin' }, { refund_id: RFD })
+  assert(lostOut.status === 409, '订单被别人抢先改过就报 409')
+  assert(!lost.tables.includes('order_status_log'), '订单没动就不写日志')
+
+  const settleDb = refundsDb({
+    repair: true, refund: { ...REFUND_ROW, status: 'executing' }, orderStatus: 'refunded'
+  })
+  await repairRefund(settleDb, { userId: ADMIN1, group: 'admin' }, { refund_id: RFD })
+  const rUpd = settleDb.calls.find(c => c.table === 'refund_requests' && c.op === 'update')
+  assert(rUpd.filters.status === 'executing', '申请的 update 要求它此刻还在执行中')
+  assert(rUpd.payload.status === 'completed', '补成已完成')
+  assert(!('execution_note' in rUpd.payload),
+    '不覆盖 execution_note：refund-execute 当时写的东西是当时的事实，补记的原因进审计轨迹')
+  assert(!settleDb.calls.some(c => c.table === 'orders' && c.op === 'update'), '订单已经在它该在的地方，不要动')
+}
+
+// 列表的筛选、分页和超时。
+{
+  const db = refundsDb()
+  const out = await listRefunds(db, { status: 'open', initiator_role: 'cs', order_id: RFD_ORDER, limit: '25', offset: '50' },
+    { timeoutHours: 48 })
+  assert(out.status === 200 && out.body.total === 42, '总数来自 count')
+  const q = db.calls.find(c => c.table === 'refund_requests')
+  assert(q.selectOpts?.count === 'exact', "分页要靠 { count: 'exact' } 拿总数")
+  assert(q.in.status.length === 4 && !q.in.status.includes('completed'),
+    'open 展开成四个在途状态，和 schema 里 one_open_refund_per_order 的谓词一致')
+  assert(q.filters.initiator_role === 'cs' && q.filters.order_id === RFD_ORDER, '两个等值条件各自成立')
+  assert(q.range.from === 50 && q.range.to === 74, 'offset 50 取 25 条是 [50,74]')
+  assert(q.order.col === 'created_at' && q.order.ascending === false, '最新的申请排在前面')
+
+  const capped = await listRefunds(refundsDb(), { limit: '99999' }, { timeoutHours: 48 })
+  assert(capped.body.limit === 200, 'limit 被 cap 夹住，前端传个大数不能变成整表导出')
+  for (const [query, label] of [
+    [{ status: 'maybe' }, '状态'], [{ initiator_role: 'boss' }, '发起方'],
+    [{ order_id: 'not-a-uuid' }, '订单号'], [{ user_id: '1' }, '用户 ID']
+  ]) {
+    const bad = await listRefunds(refundsDb(), query, { timeoutHours: 48 })
+    assert(bad.status === 400, `${label} 不合法要 400，而不是把随手输入的东西拼进查询`)
+  }
+
+  // 超时按 created_at 算，不按 updated_at：转交会刷新 updated_at，而用户从提交那一刻起就在等。
+  const od = refundsDb()
+  await listRefunds(od, { overdue: '1' }, { timeoutHours: 48 })
+  const oq = od.calls.find(c => c.table === 'refund_requests')
+  assert(oq.lte.created_at && !(oq.lte.updated_at), '超时看提交时间')
+  assert(oq.filters.status === 'pending', '不选状态时超时默认只看还在等决定的')
+  const odHist = refundsDb()
+  await listRefunds(odHist, { overdue: '1', status: 'completed' }, { timeoutHours: 48 })
+  const ohq = odHist.calls.find(c => c.table === 'refund_requests')
+  assert(ohq.filters.status === 'completed' && ohq.lte.created_at,
+    '显式选了状态就只保留时间条件——再补一个 pending 会让两个条件互相抵消成 0 行')
+}
+
+// 看板顶上那三个数字：一次有上界的查询在内存里数，而不是三次 count。
+{
+  const old = new Date(Date.now() - 100 * 3600_000).toISOString()
+  const now = new Date().toISOString()
+  const db = refundsDb({
+    refund_requests: {
+      data: [
+        { id: 'a', status: 'pending', created_at: old }, { id: 'b', status: 'pending', created_at: now },
+        { id: 'c', status: 'executing', created_at: old }, { id: 'd', status: 'transferred', created_at: now }
+      ], error: null
+    }
+  })
+  const counts = await boardCounts(db, { timeoutHours: 48 })
+  assert(counts.open === 4 && counts.overdue === 1 && counts.executing === 1, '在途 / 超时 / 卡在执行中')
+  assert(counts.counted === true, '数出来了就说数出来了')
+  const q = db.calls.find(c => c.table === 'refund_requests')
+  assert(typeof q.limit === 'number' && q.limit > 0, '这条查询要有上界，否则这一页会超时')
+  const broken = await boardCounts(refundsDb({ refund_requests: { data: null, error: { message: 'boom' } } }), { timeoutHours: 48 })
+  assert(broken.counted === false, '数不出来就说数不出来，不要报一个 0 让人以为没有待办')
+}
+
+// 详情：申请 + 订单 + 按时间正序的审计轨迹。
+{
+  const db = refundsDb({
+    refund_requests: { data: { ...REFUND_ROW, status: 'approved' }, error: null },
+    logs: [{ id: 'l1', actor_id: ADMIN1, actor_group: 'admin', action: 'create', from_status: null, to_status: 'pending', created_at: RFD_AT }]
+  })
+  const out = await refundDetail(db, RFD, { timeoutHours: 48 })
+  assert(out.status === 200 && out.body.refund.id === RFD, '读出这一条')
+  assert(out.body.order.status_label, '订单状态要带中文标签，界面上不要出现 refund_pending 这种字样')
+  assert(out.body.refund.repair, '已批准而订单还是已支付，这里要算出补法')
+  assert(out.body.refund.execute_block.includes('补齐订单状态'), '也要说清为什么执行按钮点不了')
+  const lq = db.calls.find(c => c.table === 'refund_audit_log')
+  assert(lq.order.ascending === true, '一条申请的经过要从头读起，和列表的倒序相反')
+  assert(lq.filters.refund_id === RFD, '只读这一条的轨迹')
+  const notFound = await refundDetail(refundsDb({ refund_requests: { data: null, error: null } }), RFD, { timeoutHours: 48 })
+  assert(notFound.status === 404, '不存在就是 404')
+  assert((await refundDetail(refundsDb(), 'nope', { timeoutHours: 48 })).status === 400, '形状不对是 400')
+}
+
+// §10.8 的导出：一行一个审计事件，脱敏和防公式注入跟着 admin-orders 的那一份走。
+{
+  const db = refundsDb({
+    logs: [
+      { refund_id: RFD, actor_id: BUYER, actor_group: 'default', action: 'create', from_status: null, to_status: 'pending', amount_minor: 9500, note: '和描述不符', created_at: RFD_AT },
+      { refund_id: RFD, actor_id: null, actor_group: null, action: 'escalate', from_status: 'pending', to_status: 'pending', amount_minor: null, note: '超时未处理', created_at: RFD_AT }
+    ]
+  })
+  const out = await exportRefundAudit(db, {}, { timeoutHours: 48 })
+  assert(out.status === 200 && out.filename === `refund-audit-${new Date().toISOString().slice(0, 10)}.csv`, '文件名带日期')
+  assert(out.exported === 2, '两条审计行，不是一条申请一行——「全流程可审计」要的是经过')
+  assert(out.csv.includes('张*') && !out.csv.includes('张三'), '导出里的人名同样脱敏')
+  assert(out.csv.includes('"系统"'), '没有 actor_id 的行如实写「系统」，空单元格看起来像导出漏了一列')
+  assert(out.csv.includes('pending'), '状态变化要在表里，否则看不出谁把它推到了哪一步')
+  assert(out.csv.startsWith('﻿'), '和订单导出用同一个 toCsv，所以 BOM 和公式转义都在')
+  const capped = await exportRefundAudit(refundsDb({
+    refund_requests: { data: [REFUND_ROW], error: null, count: 90000 }, logs: []
+  }), {}, { timeoutHours: 48 })
+  assert(capped.truncated === true, '被上限截断要如实说')
+}
+
+// 和 schema.sql 对齐：读的门槛、写的门槛、以及 §14 的四个键。
+{
+  const auditRead = schemaSql.match(/policy refund_audit_read on public\.refund_audit_log[\s\S]{0,300}/)
+  assert(/is_staff\(\)/.test(auditRead[0]),
+    'refund_audit_read 给的是 staff——客服要能看自己发起的退款进展，所以这一页的读门槛是 STAFF 而不是 ADMIN')
+  const rfUpd = schemaSql.match(/policy admin_refunds_update on public\.refund_requests[\s\S]{0,200}/)
+  assert(/is_admin\(\)/.test(rfUpd[0]), 'refund_requests 的 UPDATE 只给 admin，repair 跟着它')
+  for (const key of ['refund_approval_timeout_hours', 'refund_reminder_interval_hours',
+    'refund_require_second_confirm', 'refund_auto_execute']) {
+    assert(schemaSql.includes(`'${key}'`), `§14 的 ${key} 要在 seed 里，否则这一页读到的全是兜底值`)
+  }
+}
+
+console.log('Admin refunds: OK')
 
 // ---------------------------------------------------------------------------
 // §1 优惠券

@@ -18,6 +18,7 @@ const ROUTES = {
   'admin-coupons': () => import('./_routes/admin-coupons.mjs'),
   'admin-env': () => import('./_routes/admin-env.mjs'),
   'admin-orders': () => import('./_routes/admin-orders.mjs'),
+  'admin-refunds': () => import('./_routes/admin-refunds.mjs'),
   'admin-users': () => import('./_routes/admin-users.mjs'),
   'cancel-order': () => import('./_routes/cancel-order.mjs'),
   checkout: () => import('./_routes/checkout.mjs'),

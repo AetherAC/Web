@@ -60,7 +60,9 @@ export async function executeRefund(db, caller, input) {
     return { status: 400, body: { error: 'outcome 只能是 success 或 failed' } }
   }
 
-  const loaded = await loadForDecision(db, input?.refund_id, 'executing')
+  // resumable：申请可能已经就在 executing 上——上一次点的时候第二步（改订单）失败了，它被有意留在
+  // 那里等人再点一次。状态图里没有 executing → executing 这条边，所以这一次不能按迁移检查。
+  const loaded = await loadForDecision(db, input?.refund_id, 'executing', { resumable: true })
   if (!loaded.ok) return { status: loaded.status, body: { error: loaded.error } }
   const { refund, order } = loaded
 
@@ -92,6 +94,10 @@ export async function executeRefund(db, caller, input) {
 
   const now = new Date().toISOString()
   // 第一步：把申请从 approved（或上次失败留下的 failed）抢到 executing。抢到的人才继续。
+  //
+  // 申请本来就在 executing 时（上次第二步没落地，接着走完的那一次），这一次是 executing → executing，
+  // 于是这句话不再排他：两个管理员同时点都会「抢到」。可以接受，因为真正动钱的那一步是下面那句带
+  // .eq('status','refund_pending') 的订单更新，它仍然只有一个人能改成，另一个会走到下面的 409。
   const claimed = await moveRefund(db, refund.id, refund.status, 'executing', { executed_at: now })
   if (!claimed) return { status: 409, body: { error: '这条申请正在被其他管理员处理' } }
   await logRefundAction(db, {
