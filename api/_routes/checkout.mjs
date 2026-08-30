@@ -72,11 +72,14 @@ export default async function handler(req, res) {
       .replaceAll('{callback_url}', encodeURIComponent(vars.callback_url)) : null
     let resolvedUrl = checkoutUrl
     let providerOrderId = null
-    // A driver (Stripe, PayPal, PayerURL) needs more than one configurable request, so it takes
-    // precedence. `user` is passed because PayerURL refuses an order without a billing identity.
+    // A driver (Stripe, PayPal, PayerURL, Alipay) needs more than one configurable request, so it takes
+    // precedence. `user` is passed because PayerURL refuses an order without a billing identity;
+    // `headers` because Alipay's 电脑网站支付 and 手机网站支付 are two different methods and the
+    // User-Agent is the only thing that tells them apart — page.pay on a phone renders a shrunken
+    // desktop cashier that cannot open the Alipay app.
     const driver = driverFor(config)
     if (driver) {
-      const created = await driver.create({ order, artifact, siteUrl, config, user: auth.user })
+      const created = await driver.create({ order, artifact, siteUrl, config, user: auth.user, headers: req.headers })
       resolvedUrl = created.checkoutUrl
       providerOrderId = created.providerOrderId
     } else if (!resolvedUrl && config.create_url) {

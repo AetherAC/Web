@@ -2,6 +2,18 @@ import handler from '../api/_routes/github-progress.mjs'
 import usersHandler, { isBanned } from '../api/_routes/admin-users.mjs'
 import {
   DRIVERS,
+  ALIPAY_GATEWAY,
+  alipayAmount,
+  alipayBytes,
+  alipayCheckoutUrl,
+  alipayOrderId,
+  alipayOutTradeNo,
+  alipayPem,
+  alipayProduct,
+  alipayRequestParams,
+  alipaySign,
+  alipaySignContent,
+  alipayTimestamp,
   approvalLink,
   decimalAmount,
   driverFor,
@@ -41,6 +53,7 @@ import {
   summarise
 } from '../api/_lib/telemetry.mjs'
 import { readFileSync } from 'node:fs'
+import nodeCrypto from 'node:crypto'
 import {
   EDITOR_GROUPS,
   GROUP_LABEL,
@@ -465,8 +478,118 @@ const noTxn = { ...callback, transaction_id: '' }
 const missingTxn = await DRIVERS.payerurl.verify({ payload: { ...noTxn, authStr: sign(noTxn) }, headers: {}, config: {} })
 assert(missingTxn.reject?.response.status === 2050, 'a callback without a transaction id cannot be reconciled and must be refused')
 
+// 支付宝。开放平台的沙箱没法在 CI 里跑，所以钉住的是「待签名串」和参数拼装——签名本身用一对临时密钥
+// 往返验证。待签名串错一个字符的后果不是报错：请求那头是网关回一句 Invalid signature，通知那头是每一笔
+// 付款都验不过、订单永远停在待支付。
+process.env.ALIPAY_APP_ID = '2021000000000001'
+const alipayKeys = nodeCrypto.generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+  privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+})
+process.env.ALIPAY_PRIVATE_KEY = alipayKeys.privateKey
+process.env.ALIPAY_PUBLIC_KEY = alipayKeys.publicKey
+
+assert(alipayPem('QUFB', 'public').startsWith('-----BEGIN PUBLIC KEY-----\nQUFB'), 'the key tool hands out bare base64, and Node crypto only accepts PEM')
+assert(alipayPem(alipayKeys.publicKey, 'public') === alipayKeys.publicKey.trim(), 'a key that already carries PEM headers must be used verbatim')
+assert(alipayPem('-----BEGIN PUBLIC KEY-----\\nQUFB\\n-----END PUBLIC KEY-----', 'public').split('\n').length === 3,
+  'an env var stores newlines as literal \\n, and a key with those left in place fails to parse')
+
+// 网关只接受与自己相差一小时以内的时间戳，而函数不在 Asia/Shanghai 跑。
+assert(alipayTimestamp(new Date('2026-08-30T01:02:03Z')) === '2026-08-30 09:02:03', 'timestamp is GMT+8, computed rather than read from the local clock')
+
+assert(alipaySignContent({ b: '2', a: '1', sign: 'x', blank: '', missing: null }) === 'a=1&b=2', 'the sign content sorts keys and drops sign, empty strings and nulls')
+assert(alipaySignContent({ sign_type: 'RSA2', a: '1' }) === 'a=1&sign_type=RSA2', 'a request signs sign_type as well')
+assert(alipaySignContent({ sign_type: 'RSA2', a: '1' }, ['sign', 'sign_type']) === 'a=1',
+  'an async notify excludes sign_type — getting these two rules backwards makes every callback fail to verify')
+assert(alipaySignContent({ subject: '入门版 Starter' }) === 'subject=入门版 Starter', 'the sign content is not URL-encoded; encoding it would break every signature')
+
+assert(alipayOutTradeNo(order.id) === 'a1b2c3d4000040008000000000000001' && !alipayOutTradeNo(order.id).includes('-'),
+  'out_trade_no accepts only letters, digits and underscores, so the UUID hyphens must go')
+assert(alipayOrderId(alipayOutTradeNo(order.id)) === order.id, 'the mapping must be reversible, or a paid callback cannot find its order')
+assert(alipayOrderId('LEGACY_REF_1') === 'LEGACY_REF_1' && alipayOrderId('') === null, 'anything that is not 32 hex digits passes through instead of becoming null')
+
+assert(alipayBytes('入门版专业版', 9) === '入门版', 'subject is capped in bytes, and a half-cut character would garble the cashier title')
+assert(alipayBytes('abc', 9) === 'abc', 'a short subject is left alone')
+
+const cnyOrder = { ...order, currency: 'CNY' }
+assert(alipayAmount(cnyOrder) === '19.99', 'total_amount is yuan, not the minor unit')
+let alipayThrew = false
+try { alipayAmount(order) } catch { alipayThrew = true }
+assert(alipayThrew, 'a USD order must throw rather than be charged the same number in yuan — a silent 86% undercharge that never errors')
+
+assert(alipayProduct({}, {}).method === 'alipay.trade.page.pay', 'a desktop browser gets 电脑网站支付')
+assert(alipayProduct({}, { 'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' }).method === 'alipay.trade.wap.pay',
+  'a phone gets 手机网站支付; page.pay there is a shrunken desktop cashier that cannot open the app')
+assert(alipayProduct({ product: 'wap' }, {}).method === 'alipay.trade.wap.pay', 'public_config.product must be able to pin the choice')
+
+const alipayParams = alipayRequestParams({ order: cnyOrder, artifact, siteUrl: site, now: new Date('2026-08-30T01:02:03Z') })
+assert(alipayParams.version === '1.0' && alipayParams.format === 'JSON' && alipayParams.charset === 'utf-8' && alipayParams.sign_type === 'RSA2',
+  'the v1.0 gateway rejects a request missing any one of the common parameters')
+assert(alipayParams.notify_url === `${site}/v1/callback/alipay`, 'the notify must reach our own endpoint')
+assert(alipayParams.return_url === `${site}/order?order_id=${order.id}&paid=1`, 'the buyer must land back on the order page')
+const alipayBiz = JSON.parse(alipayParams.biz_content)
+assert(alipayBiz.out_trade_no === alipayOutTradeNo(order.id) && alipayBiz.total_amount === '19.99', 'biz_content carries the order reference and the yuan amount')
+assert(alipayBiz.product_code === 'FAST_INSTANT_TRADE_PAY', 'product_code is what selects 电脑网站支付; the wrong one is refused by the gateway')
+assert(alipayBiz.subject === '入门版', 'the buyer must see the artifact name on the cashier page, not the SKU')
+assert(alipayBiz.timeout_express === '30m' && alipayBiz.quit_url === undefined, 'an unpaid order must close itself, and page.pay has no quit_url')
+const alipayWapBiz = JSON.parse(alipayRequestParams({ order: cnyOrder, artifact, siteUrl: site, config: { product: 'wap' } }).biz_content)
+assert(alipayWapBiz.product_code === 'QUICK_WAP_WAY' && alipayWapBiz.quit_url === `${site}/order?order_id=${order.id}`,
+  'wap.pay needs a quit_url, or tapping 返回 inside Alipay lands the buyer on a blank page')
+
+// page.pay 是一条签好名的 GET 跳转，不是服务端 POST——所以下单这一步不依赖网关可用。
+const alipayUrl = alipayCheckoutUrl(alipayParams, process.env.ALIPAY_PRIVATE_KEY)
+const alipayQuery = new URL(alipayUrl).searchParams
+assert(alipayUrl.startsWith(`${ALIPAY_GATEWAY}?`), 'the checkout URL is the gateway itself with the signed parameters attached')
+assert(alipayQuery.get('biz_content') === alipayParams.biz_content, 'biz_content must survive the URL encoding byte for byte')
+assert(alipayQuery.get('sign') === alipaySign(alipayParams, process.env.ALIPAY_PRIVATE_KEY), 'the URL must carry exactly the signature computed over the sorted parameters')
+assert(
+  nodeCrypto.createVerify('RSA-SHA256').update(alipaySignContent(alipayParams), 'utf8').verify(process.env.ALIPAY_PUBLIC_KEY, alipayQuery.get('sign'), 'base64'),
+  'the request signature must verify over the content that includes sign_type'
+)
+
+// 通知按 V1 规则签（剔除 sign 和 sign_type），这是支付宝异步通知真正用的那一条。
+const alipayNotifySign = (data) =>
+  nodeCrypto.createSign('RSA-SHA256').update(alipaySignContent(data, ['sign', 'sign_type']), 'utf8').sign(process.env.ALIPAY_PRIVATE_KEY, 'base64')
+const notify = {
+  notify_time: '2026-08-30 09:05:00', notify_type: 'trade_status_sync', notify_id: 'n_smoke_1',
+  app_id: '2021000000000001', auth_app_id: '2021000000000001', charset: 'utf-8', version: '1.0', sign_type: 'RSA2',
+  trade_no: '2026083022001400000000000001', out_trade_no: alipayOutTradeNo(order.id),
+  trade_status: 'TRADE_SUCCESS', total_amount: '19.99', receipt_amount: '19.99', buyer_id: '2088000000000001'
+}
+const signedNotify = (data) => ({ ...data, sign: alipayNotifySign(data) })
+
+const alipayPaid = await DRIVERS.alipay.verify({ payload: signedNotify(notify), headers: {}, config: {} })
+assert(alipayPaid.paid === true && alipayPaid.orderId === order.id, 'a signed TRADE_SUCCESS releases the order, and out_trade_no maps back to the UUID')
+assert(alipayPaid.ack.ok === 'success' && alipayPaid.ack.fail === 'failure',
+  'Alipay reads anything but the literal success as a failed notify and redelivers it 8 times over 24h')
+assert(alipayPaid.expect.amountMinor === 1999 && alipayPaid.expect.currency === 'CNY', 'total_amount is compared against the order row, so an underpayment cannot release it')
+assert(alipayPaid.providerOrderId === notify.trade_no, "the row must end up holding Alipay's own trade number, which is what the console searches on")
+
+assert((await DRIVERS.alipay.verify({ payload: signedNotify({ ...notify, trade_status: 'TRADE_FINISHED' }), config: {} })).paid === true,
+  'TRADE_FINISHED means the money arrived and can no longer be refunded — not that it failed')
+const alipayWaiting = await DRIVERS.alipay.verify({ payload: signedNotify({ ...notify, trade_status: 'WAIT_BUYER_PAY' }), config: {} })
+assert(alipayWaiting.paid === false && alipayWaiting.failed === false, 'a buyer who opened the cashier but has not paid must stay pending')
+assert((await DRIVERS.alipay.verify({ payload: signedNotify({ ...notify, trade_status: 'TRADE_CLOSED' }), config: {} })).failed === true,
+  'a closed trade must be marked failed rather than left pending forever')
+
+const alipayTampered = await DRIVERS.alipay.verify({ payload: { ...signedNotify(notify), total_amount: '0.01' }, config: {} })
+assert(alipayTampered.reject?.status === 401 && alipayTampered.ack.fail === 'failure', 'editing a signed field must fail verification, not lower the price')
+assert((await DRIVERS.alipay.verify({ payload: notify, config: {} })).reject?.status === 401, 'a notify carrying no signature at all must be refused')
+const alipayForeign = { ...notify, app_id: '2021000000000002', auth_app_id: '2021000000000002' }
+assert((await DRIVERS.alipay.verify({ payload: signedNotify(alipayForeign), config: {} })).reject?.status === 401,
+  "a correctly signed notify for another merchant's app must be refused — the signature proves who signed it, not who it was signed for")
+// 两条规则都收是有意的：异步通知用 V1，同步跳转用 V2，正文分不出来，而两者都必须是支付宝私钥签的。
+assert((await DRIVERS.alipay.verify({ payload: { ...notify, sign: alipaySign(notify, process.env.ALIPAY_PRIVATE_KEY) }, config: {} })).paid === true,
+  'a notify signed under the sync-return rule must still verify; both rules require Alipay to have signed it')
+const { trade_status: _dropped, ...alipayRefundNotify } = notify
+const alipayIgnored = await DRIVERS.alipay.verify({ payload: signedNotify({ ...alipayRefundNotify, notify_type: 'batch_refund_notify' }), config: {} })
+assert(alipayIgnored.ignore === true && alipayIgnored.ack.ok === 'success',
+  'a notify with no trade_status touches no order but must still be acknowledged, or Alipay redelivers it for a full day')
+
 assert(driverFor({ driver: 'stripe' }) === DRIVERS.stripe && driverFor({ driver: 'PayPal' }) === DRIVERS.paypal, 'the driver name in public_config must resolve case-insensitively')
-assert(driverFor({}) === null && driverFor(null) === null && driverFor({ driver: 'alipay' }) === null, 'the remaining eight providers must keep using the generic create_url path')
+assert(driverFor({ driver: 'Alipay' }) === DRIVERS.alipay, 'alipay resolves through the driver table now that it signs its own requests; on the generic path it could only ever get Invalid signature')
+assert(driverFor({}) === null && driverFor(null) === null && driverFor({ driver: 'wechat' }) === null, 'the remaining seven providers must keep using the generic create_url path')
 for (const [name, driver] of Object.entries(DRIVERS)) {
   assert(typeof driver.create === 'function' && typeof driver.verify === 'function', `${name} driver must be able to create a checkout and verify a callback`)
 }
