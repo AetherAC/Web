@@ -126,18 +126,12 @@ create table if not exists public.refund_requests (
 -- 一条能落库，这一点不能只靠接口先查一遍——两个请求会同时读到零行。
 --
 -- 已有数据里如果同一个订单有多条非终态记录（旧索引不可能允许，但手工改过库就有可能），
--- 建索引会失败，所以先把除最新一条以外的都标成拒绝。
+-- 建索引会失败，所以先把除最新一条以外的都标成拒绝。那次对账和新索引都写在下面 §10 那一段里，
+-- 不在这里：终态名单含 'failed'，而 status 在这一行还是 public.refund_status 枚举，那个枚举里没有
+-- 'failed'——写在这里的话，一个刚从旧版升上来的库会停在 `invalid input value for enum`。对账要用的
+-- decision_note 列同样是下面才加的。这里只留旧索引的清除，它必须早于 alter column type：
+-- 旧索引若带 status 谓词，改列类型会被它挡住。
 drop index if exists public.one_refund_per_order;
-update public.refund_requests set status='rejected',
-  decision_note = case when decision_note = '' then '系统对账：同一订单存在多条在途申请，保留最新一条' else decision_note end
-where id in (
-  select id from (
-    select id, row_number() over (partition by order_id order by created_at desc, id desc) as rank
-    from public.refund_requests where status not in ('rejected','completed','failed')
-  ) ranked where rank > 1
-);
-create unique index if not exists one_open_refund_per_order on public.refund_requests(order_id)
-  where status not in ('rejected','completed','failed');
 create index if not exists refund_requests_user_id_idx on public.refund_requests(user_id);
 create table if not exists public.installation_snapshots (
   id bigint generated always as identity primary key, captured_at timestamptz not null default now(),
@@ -208,6 +202,20 @@ alter table public.refund_requests drop constraint if exists refund_requests_ini
 alter table public.refund_requests add constraint refund_requests_initiator_role_check
   check (initiator_role in ('user','postsale','cs','admin'));
 create index if not exists refund_requests_status_idx on public.refund_requests(status,created_at desc);
+-- 一个订单同时只能有一条在途退款申请，但被拒或已结束之后要能重提（说明见上面 drop index 那段）。
+-- 部分唯一索引：终态（已拒绝/已完成/失败）不占位，其余状态占位。并发下的两次提交仍然只有一条能落库，
+-- 这一点不能只靠接口先查一遍——两个请求会同时读到零行。
+-- 建索引前先对账：同一个订单若有多条非终态记录，索引建不起来。
+update public.refund_requests set status='rejected',
+  decision_note = case when decision_note = '' then '系统对账：同一订单存在多条在途申请，保留最新一条' else decision_note end
+where id in (
+  select id from (
+    select id, row_number() over (partition by order_id order by created_at desc, id desc) as rank
+    from public.refund_requests where status not in ('rejected','completed','failed')
+  ) ranked where rank > 1
+);
+create unique index if not exists one_open_refund_per_order on public.refund_requests(order_id)
+  where status not in ('rejected','completed','failed');
 
 -- §12.5 的订单日志，同时也是 §13 状态机留下的痕迹。状态存 text 而不是 order_status，因为 §13 明确要求
 -- 记下「PAID → PAID」这种驳回后回到原状态的条目：日志记的是发生过什么，不是当前合法状态集，把它和枚举
