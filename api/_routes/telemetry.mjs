@@ -1,5 +1,5 @@
-import { bodyOf, send, serviceClient } from './_lib/server.mjs'
-import { mergeSample, parseSample } from './_lib/telemetry.mjs'
+import { bodyOf, send, serviceClient } from '../_lib/server.mjs'
+import { mergeSample, parseSample } from '../_lib/telemetry.mjs'
 import { createHash, timingSafeEqual } from 'node:crypto'
 
 /**

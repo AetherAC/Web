@@ -11,8 +11,8 @@
  * 落库，然后在某个用户的结算页上被 evaluateCondition 判为「不成立」——券永远用不了，而后台看着一切正常。
  */
 
-import { bodyOf, RANK, requireUser, send } from './_lib/server.mjs'
-import { describeAction, describeCondition, validateCoupon } from '../shared/coupons.mjs'
+import { bodyOf, RANK, requireUser, send } from '../_lib/server.mjs'
+import { describeAction, describeCondition, validateCoupon } from '../../shared/coupons.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

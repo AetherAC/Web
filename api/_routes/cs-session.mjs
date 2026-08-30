@@ -10,12 +10,12 @@
  * 而会话行里没有需要脱敏的列。
  */
 
-import { RANK, bodyOf, rankOf, requireUser, send } from './_lib/server.mjs'
-import { ADMIN_MODES, CHANNELS, sessionCapabilities } from '../shared/cs.mjs'
+import { RANK, bodyOf, rankOf, requireUser, send } from '../_lib/server.mjs'
+import { ADMIN_MODES, CHANNELS, sessionCapabilities } from '../../shared/cs.mjs'
 import {
   CS_SETTING_KEYS, assignAgent, closeSessionTimedOut, deliverAutoReply,
   insertMessage, logEvent, settingsOf, staffMayServe
-} from './_lib/cs.mjs'
+} from '../_lib/cs.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

@@ -9,9 +9,9 @@
  * 用户看到「立减 25」然后下单收到「立减 20」，而那种 bug 只会以工单的形式出现。
  */
 
-import { bodyOf, requireUser, send } from './_lib/server.mjs'
-import { CODE_SHAPE, resolveCoupon } from './_lib/coupons.mjs'
-import { formatMinor } from '../shared/coupons.mjs'
+import { bodyOf, requireUser, send } from '../_lib/server.mjs'
+import { CODE_SHAPE, resolveCoupon } from '../_lib/coupons.mjs'
+import { formatMinor } from '../../shared/coupons.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

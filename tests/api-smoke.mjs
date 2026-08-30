@@ -1,5 +1,5 @@
-import handler from '../api/github-progress.mjs'
-import usersHandler, { isBanned } from '../api/admin-users.mjs'
+import handler from '../api/_routes/github-progress.mjs'
+import usersHandler, { isBanned } from '../api/_routes/admin-users.mjs'
 import {
   DRIVERS,
   approvalLink,
@@ -24,15 +24,15 @@ import {
   toLocalInput
 } from '../docs/.vitepress/theme/recordForm.ts'
 import { preloadMarkdown, renderMarkdown, renderMarkdownInline } from '../docs/.vitepress/theme/markdown.ts'
-import cancelHandler, { cancelPendingOrder } from '../api/cancel-order.mjs'
+import cancelHandler, { cancelPendingOrder } from '../api/_routes/cancel-order.mjs'
 import { orderPath } from '../docs/.vitepress/theme/routes.ts'
-import telemetryHandler from '../api/telemetry.mjs'
+import telemetryHandler from '../api/_routes/telemetry.mjs'
 import {
   exportOrders, listOrders, maskEmail, orderDetail, toCsv, updateOrderStatus
-} from '../api/admin-orders.mjs'
+} from '../api/_routes/admin-orders.mjs'
 import { couponFieldsFor, redeemOrRollback } from '../api/_lib/coupons.mjs'
-import { quoteCoupon } from '../api/coupon.mjs'
-import { NEVER_WRITABLE, forValidation } from '../api/admin-coupons.mjs'
+import { quoteCoupon } from '../api/_routes/coupon.mjs'
+import { NEVER_WRITABLE, forValidation } from '../api/_routes/admin-coupons.mjs'
 import {
   LICENSE_STATUS,
   RUNNING_WINDOW_MS,
@@ -119,17 +119,17 @@ import {
   setting,
   settleApproval
 } from '../api/_lib/notify.mjs'
-import { orderNoOf, requestRefund } from '../api/refund-request.mjs'
-import { approveRefund } from '../api/refund-approve.mjs'
-import { rejectRefund } from '../api/refund-reject.mjs'
-import { transferRefund } from '../api/refund-transfer.mjs'
-import { executeRefund } from '../api/refund-execute.mjs'
+import { orderNoOf, requestRefund } from '../api/_routes/refund-request.mjs'
+import { approveRefund } from '../api/_routes/refund-approve.mjs'
+import { rejectRefund } from '../api/_routes/refund-reject.mjs'
+import { transferRefund } from '../api/_routes/refund-transfer.mjs'
+import { executeRefund } from '../api/_routes/refund-execute.mjs'
 import {
   archiveNotifications, inboxSettings, listNotifications, markRead, unreadCount
-} from '../api/notifications.mjs'
+} from '../api/_routes/notifications.mjs'
 // 从 server.mjs 转发出来的同一份表：断言转发没断，因为大部分调用方是从这里 import 的。
 import { GROUP_RANK as API_RANK, requireUser } from '../api/_lib/server.mjs'
-import syncHandler, { loginOf, resolveGroup } from '../api/sync-github-groups.mjs'
+import syncHandler, { loginOf, resolveGroup } from '../api/_routes/sync-github-groups.mjs'
 // §2/§3/§4 客服。全部起 sx 前缀的别名：这个文件是一个平铺作用域，284 个顶层声明里已经有
 // markRead（站内信那个）、csRow、csBlocked，同名会是一句 SyntaxError 而不是一次失败的断言。
 import {
@@ -150,24 +150,24 @@ import {
   claimSession as sxClaimSession, closeSession as sxCloseSession, openSession as sxOpenSession,
   reopenSession as sxReopenSession, setAdminMode as sxSetAdminMode, setPresence as sxSetPresence,
   sweepIdleSessions as sxSweep
-} from '../api/cs-session.mjs'
+} from '../api/_routes/cs-session.mjs'
 import {
   composerConfig as sxComposerConfig, editMessage as sxEditMessage,
   listMessages as sxListMessages, markRead as sxMarkRead, recallMessage as sxRecallMessage,
   sendMessage as sxSendMessage, typingGate as sxTypingGate
-} from '../api/cs-message.mjs'
+} from '../api/_routes/cs-message.mjs'
 import {
   chatCouponCode as sxCouponCode, listSessionOrders as sxSessionOrders,
   sendCoupon as sxSendCoupon, startRefund as sxStartRefund
-} from '../api/cs-actions.mjs'
+} from '../api/_routes/cs-actions.mjs'
 import {
   dashboard as sxDashboard, listAgents as sxListAgents, listAll as sxListAll,
   listMine as sxListMine, listQueue as sxListQueue
-} from '../api/cs-workbench.mjs'
+} from '../api/_routes/cs-workbench.mjs'
 import {
   NEVER_WRITABLE as SX_RULE_NEVER, createRule as sxCreateRule, deleteRule as sxDeleteRule,
   listRules as sxListRules, updateRule as sxUpdateRule, validateRule as sxValidateRule
-} from '../api/admin-auto-replies.mjs'
+} from '../api/_routes/admin-auto-replies.mjs'
 
 const originalRepository = process.env.GITHUB_REPOSITORY
 const originalToken = process.env.GITHUB_TOKEN
@@ -4549,4 +4549,51 @@ assert(!('trigger' in arBadFilter.calls.find(c => c.table === 'cs_auto_replies')
   '不认识的 trigger 值忽略，不原样拼进查询')
 
 console.log('CS auto-reply rules: OK')
+
+// ── /api 只有一个 Serverless Function：分发 ─────────────────────────────────────
+// Hobby 计划一次部署最多 12 个 Serverless Function。23 个接口各占一个函数的那一版：构建成功、部署失败
+// （exceeded_serverless_functions_per_deployment），线上悄悄停在上一版。`npm test` 全绿也照旧看不出来，
+// 因为本地 import 一个 .mjs 跟它在线上是不是一个函数无关。所以那条限制在这里写成断言。
+import { readdirSync } from 'node:fs'
+import dispatch, { ROUTE_NAMES, routeName } from '../api/index.mjs'
+
+const fnEntries = readdirSync(new URL('../api/', import.meta.url)).filter(n => !n.startsWith('_'))
+assert(fnEntries.length === 1 && fnEntries[0] === 'index.mjs',
+  `api/ 里只准有 index.mjs 一个函数入口，现在还有 ${fnEntries.join(', ')}——` +
+  '处理函数要放 api/_routes/（下划线开头的不会被当成函数入口，但照旧能 import）')
+
+const routeFiles = readdirSync(new URL('../api/_routes/', import.meta.url))
+  .filter(n => n.endsWith('.mjs')).map(n => n.slice(0, -4)).sort()
+assert(routeFiles.join(',') === [...ROUTE_NAMES].sort().join(','),
+  `分发表要和 api/_routes/ 一一对应，漏一个的表现是线上 404 而本地测试全绿：\n` +
+  `  目录 ${routeFiles.join(',')}\n  路由表 ${[...ROUTE_NAMES].sort().join(',')}`)
+
+// 路由名从哪来。?route= 是 vercel.json 那条重写传的；剥 pathname 是本地直接调 handler 时走的那条。
+assert(routeName({ query: { route: 'notifications' } }) === 'notifications', '?route= 直接就是路由名')
+assert(routeName({ query: { route: ['cs', 'session'] } }) === 'cs/session',
+  ':path* 匹配到多段时 Vercel 给的是数组，拼回来而不是 String() 出一个 "cs,session"')
+assert(routeName({ query: {}, url: '/api/notifications?x=1' }) === 'notifications', '退回 pathname，且不含查询串')
+assert(routeName({ url: '/api/notifications/' }) === 'notifications', '尾斜杠不算另一个接口')
+assert(routeName({ url: '/api/%73ync-github-groups' }) === 'sync-github-groups', 'pathname 要先解码')
+assert(routeName({ url: 'https://aetherac.abnt.it/api/telemetry' }) === 'telemetry', '绝对 URL 也认')
+
+// 分发本身：认识的路由要真的走到那个文件的 default，不认识的给 404 而不是 500。
+let dispatched = 0
+const spyRes = { status(code) { dispatched = code; return this }, json() {}, setHeader() {}, send() {} }
+await dispatch({ query: { route: 'nope-not-a-route' } }, spyRes)
+assert(dispatched === 404, '不认识的接口给 404')
+dispatched = 0
+await dispatch({ method: 'GET', headers: {}, query: { route: 'notifications' } }, spyRes)
+assert(dispatched === 401, '认识的接口要真的被调起来——未登录的 /api/notifications 是 401，不是 404')
+
+// 重写规则。少了这两条，/api/* 全站 404；顺序也重要：Vercel 不会连锁重写，支付回调那条必须自己指到
+// index，指到 /api/payment-callback 的话它落到一个已经不存在的函数上。
+const vercelConfig = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url), 'utf8'))
+const rw = vercelConfig.rewrites.map(r => `${r.source} -> ${r.destination}`)
+assert(rw.includes('/api/:path* -> /api/index?route=:path*'), `/api/:path* 的重写不见了：${rw.join(' | ')}`)
+assert(rw.includes('/v1/callback/:provider -> /api/index?route=payment-callback&provider=:provider'),
+  `支付回调的重写要直接指到 index（对外 URL 一个字都不能改，平台那边填的是 /v1/callback/…）：${rw.join(' | ')}`)
+
+console.log('API dispatcher: OK')
+
 

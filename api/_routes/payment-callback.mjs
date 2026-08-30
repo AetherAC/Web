@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
-import { bodyOf, send, serviceClient } from './_lib/server.mjs'
-import { driverFor } from './_lib/payments.mjs'
+import { bodyOf, send, serviceClient } from '../_lib/server.mjs'
+import { driverFor } from '../_lib/payments.mjs'
 const safeEqual = (a, b) => { try { const x=Buffer.from(a||''); const y=Buffer.from(b||''); return x.length===y.length && crypto.timingSafeEqual(x,y) } catch { return false } }
 export default async function handler(req, res) {
   if (req.method !== 'POST') return send(res, 405, { error: 'Method not allowed' })

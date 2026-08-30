@@ -1,4 +1,4 @@
-import { bodyOf, RANK, rankOf, requireUser, send, serviceClient } from './_lib/server.mjs'
+import { bodyOf, RANK, rankOf, requireUser, send, serviceClient } from '../_lib/server.mjs'
 
 /**
  * §6 GitHub 团队 → 用户组映射的执行端。

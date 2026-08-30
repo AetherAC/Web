@@ -1,5 +1,5 @@
-import { RANK, requireUser, send, serviceClient } from './_lib/server.mjs'
-import { RUNNING_WINDOW_MS, summarise } from './_lib/telemetry.mjs'
+import { RANK, requireUser, send, serviceClient } from '../_lib/server.mjs'
+import { RUNNING_WINDOW_MS, summarise } from '../_lib/telemetry.mjs'
 
 /** How stale the newest rollup may be before another is appended. */
 const ROLLUP_INTERVAL_MS = 60 * 60 * 1000

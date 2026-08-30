@@ -10,14 +10,14 @@
  * 那就等于没有撤回。
  */
 
-import { RANK, bodyOf, rankOf, requireUser, send } from './_lib/server.mjs'
+import { RANK, bodyOf, rankOf, requireUser, send } from '../_lib/server.mjs'
 import {
   MESSAGE_MAX_CHARS, prepareMessage, presentMessage, sessionCapabilities, uploadLimits
-} from '../shared/cs.mjs'
+} from '../../shared/cs.mjs'
 import {
   CS_SETTING_KEYS, clientConfig, deliverAutoReply, insertMessage, logEvent,
   settingsOf, touchSession, verifyAttachments
-} from './_lib/cs.mjs'
+} from '../_lib/cs.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

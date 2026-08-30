@@ -16,10 +16,10 @@
 
 import {
   broadcastScopesFor, canSeeNotification, presentationFor
-} from '../shared/notifications.mjs'
-import { bodyOf, requireUser, send } from './_lib/server.mjs'
-import { isUuid } from './_lib/refunds.mjs'
-import { setting } from './_lib/notify.mjs'
+} from '../../shared/notifications.mjs'
+import { bodyOf, requireUser, send } from '../_lib/server.mjs'
+import { isUuid } from '../_lib/refunds.mjs'
+import { setting } from '../_lib/notify.mjs'
 
 const MAX_PAGE = 100
 

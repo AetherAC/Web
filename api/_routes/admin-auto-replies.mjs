@@ -8,8 +8,8 @@
  * 订单支付成功三条完全不同的路径上被调用。
  */
 
-import { RANK, bodyOf, requireUser, send } from './_lib/server.mjs'
-import { AUTO_REPLY_TRIGGERS, MATCH_MODES, MESSAGE_FORMATS, sanitizeHtml } from '../shared/cs.mjs'
+import { RANK, bodyOf, requireUser, send } from '../_lib/server.mjs'
+import { AUTO_REPLY_TRIGGERS, MATCH_MODES, MESSAGE_FORMATS, sanitizeHtml } from '../../shared/cs.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const CHANNEL_VALUES = ['presale', 'postsale', 'both']

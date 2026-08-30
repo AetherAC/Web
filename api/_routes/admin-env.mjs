@@ -1,4 +1,4 @@
-import { bodyOf, RANK, requireUser, send } from './_lib/server.mjs'
+import { bodyOf, RANK, requireUser, send } from '../_lib/server.mjs'
 const bootstrap = () => {
   const token = process.env.VERCEL_API_TOKEN
   const project = process.env.VERCEL_PROJECT_ID

@@ -9,7 +9,8 @@
     { "source": "/order/:order_id", "destination": "/order?order_id=:order_id" }
   ],
   "rewrites": [
-    { "source": "/v1/callback/:provider", "destination": "/api/payment-callback?provider=:provider" }
+    { "source": "/v1/callback/:provider", "destination": "/api/index?route=payment-callback&provider=:provider" },
+    { "source": "/api/:path*", "destination": "/api/index?route=:path*" }
   ],
   "headers": [
     {

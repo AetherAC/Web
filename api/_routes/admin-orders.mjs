@@ -10,11 +10,11 @@
  * orders 的 UPDATE 等于允许买家 PATCH 自己那行的 amount_minor。
  */
 
-import { bodyOf, RANK, requireUser, send } from './_lib/server.mjs'
-import { logOrderStatus, setting } from './_lib/notify.mjs'
+import { bodyOf, RANK, requireUser, send } from '../_lib/server.mjs'
+import { logOrderStatus, setting } from '../_lib/notify.mjs'
 import {
   assertTransition, ORDER_STATUSES, ORDER_STATUS_LABEL, ORDER_TRANSITIONS
-} from '../shared/orders.mjs'
+} from '../../shared/orders.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

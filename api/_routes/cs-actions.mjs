@@ -11,11 +11,11 @@
  *     而抄错的后果是给另一笔单退了钱。
  */
 
-import { RANK, bodyOf, rankOf, requireUser, send } from './_lib/server.mjs'
-import { sessionCapabilities } from '../shared/cs.mjs'
-import { describeAction, formatMinor, validateCoupon } from '../shared/coupons.mjs'
+import { RANK, bodyOf, rankOf, requireUser, send } from '../_lib/server.mjs'
+import { sessionCapabilities } from '../../shared/cs.mjs'
+import { describeAction, formatMinor, validateCoupon } from '../../shared/coupons.mjs'
 import { forValidation } from './admin-coupons.mjs'
-import { insertMessage, logEvent, touchSession } from './_lib/cs.mjs'
+import { insertMessage, logEvent, touchSession } from '../_lib/cs.mjs'
 import { requestRefund } from './refund-request.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i

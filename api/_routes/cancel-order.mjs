@@ -7,7 +7,7 @@
 //
 // `auth.db` is the service client and bypasses RLS, so the `.eq('user_id', …)` below *is* the
 // authorization check. It is not decoration.
-import { bodyOf, requireUser, send } from './_lib/server.mjs'
+import { bodyOf, requireUser, send } from '../_lib/server.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 

@@ -7,9 +7,9 @@
  * 会话列表里带上用户的显示名。那需要读 auth.users，而浏览器读不到——这是这个接口存在的另一个理由。
  */
 
-import { RANK, bodyOf, requireUser, send } from './_lib/server.mjs'
-import { CHANNELS, isHeartbeatStale, sessionMetrics, servesChannel } from '../shared/cs.mjs'
-import { CS_SETTING_KEYS, settingsOf } from './_lib/cs.mjs'
+import { RANK, bodyOf, requireUser, send } from '../_lib/server.mjs'
+import { CHANNELS, isHeartbeatStale, sessionMetrics, servesChannel } from '../../shared/cs.mjs'
+import { CS_SETTING_KEYS, settingsOf } from '../_lib/cs.mjs'
 
 const SESSION_COLUMNS = 'id,channel,user_id,order_id,agent_id,status,subject,admin_mode,admin_id,' +
   'first_response_seconds,timed_out,last_user_message_at,last_agent_message_at,last_activity_at,' +

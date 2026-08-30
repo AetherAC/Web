@@ -1,4 +1,4 @@
-import { bodyOf, RANK, requireUser, send } from './_lib/server.mjs'
+import { bodyOf, RANK, requireUser, send } from '../_lib/server.mjs'
 
 // Ordered by §6's priority, lowest first, because the admin UI renders this array as-is.
 const GROUPS = ['default', 'read', 'coworker', 'presale', 'postsale', 'cs', 'admin']
