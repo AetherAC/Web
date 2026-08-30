@@ -27,6 +27,12 @@ export const SENDER_ROLES = ['user', 'agent', 'admin', 'system', 'auto']
 export const MESSAGE_FORMATS = ['plain', 'markdown', 'bbcode', 'html']
 export const AUTO_REPLY_TRIGGERS = ['keyword', 'order_paid', 'session_open']
 export const MATCH_MODES = ['contains', 'exact', 'starts_with', 'ends_with']
+/** 自动回复可以配「两个渠道都发」，而一个会话只能属于一个渠道，所以这里比 CHANNELS 多一项。 */
+export const AUTO_REPLY_CHANNELS = ['presale', 'postsale', 'both']
+export const AUTO_REPLY_KEYWORD_MAX = 50
+export const AUTO_REPLY_KEYWORD_CHARS = 100
+export const AUTO_REPLY_BODY_MAX = 4000
+export const AUTO_REPLY_PRIORITY_RANGE = [-1000, 1000]
 
 /**
  * §2.2：哪个组服务哪个渠道。必须和 SQL 的 private.serves_channel() 逐字对应——
@@ -333,6 +339,104 @@ export function pickAutoReply(rules, { trigger, channel, text, alreadySentRuleId
     String(a.created_at || '').localeCompare(String(b.created_at || '')) ||
     String(a.id).localeCompare(String(b.id)))
   return hit[0]
+}
+
+/**
+ * §3 校验并归一化一条自动回复规则。
+ *
+ * 在 shared/ 而不是在接口文件里，是因为后台的规则编辑器也要它。抄一份到前端的代价不是「两处要改」，
+ * 而是抄的那份宽一档时，界面判合法、接口回 400，填的人看到的是一个点了报错却不说哪错的保存按钮。
+ * 接口照旧会再校验一次——这一份是省一次往返，不是替代它。
+ *
+ * 关键词规则必须有关键词：一条 trigger='keyword' 且 keywords 为空的规则，在 matchesKeyword 里
+ * 永远不匹配，于是它安静地什么都不做。配的人会以为自己配好了，而唯一的症状是「自动回复没生效」。
+ */
+export function validateRule(input, { partial = false } = {}) {
+  const out = {}
+
+  if (input.name !== undefined) out.name = String(input.name).trim().slice(0, 120)
+  if (input.enabled !== undefined) out.enabled = Boolean(input.enabled)
+
+  if (input.trigger !== undefined) {
+    if (!AUTO_REPLY_TRIGGERS.includes(String(input.trigger))) {
+      return { ok: false, error: `trigger 只能是 ${AUTO_REPLY_TRIGGERS.join('/')}` }
+    }
+    out.trigger = String(input.trigger)
+  } else if (!partial) {
+    return { ok: false, error: 'trigger 必填' }
+  }
+
+  if (input.channel !== undefined) {
+    if (!AUTO_REPLY_CHANNELS.includes(String(input.channel))) {
+      return { ok: false, error: `channel 只能是 ${AUTO_REPLY_CHANNELS.join('/')}` }
+    }
+    out.channel = String(input.channel)
+  }
+
+  if (input.keywords !== undefined) {
+    if (!Array.isArray(input.keywords)) return { ok: false, error: 'keywords 必须是数组' }
+    // 去重并去掉空串：空串在 contains 模式下匹配任何文本，等于让这条规则对每句话都触发。
+    const seen = new Set()
+    for (const k of input.keywords) {
+      const word = String(k ?? '').trim()
+      if (!word) continue
+      if (word.length > AUTO_REPLY_KEYWORD_CHARS) {
+        return { ok: false, error: `单个关键词不能超过 ${AUTO_REPLY_KEYWORD_CHARS} 字` }
+      }
+      seen.add(word)
+    }
+    if (seen.size > AUTO_REPLY_KEYWORD_MAX) {
+      return { ok: false, error: `关键词最多 ${AUTO_REPLY_KEYWORD_MAX} 个` }
+    }
+    out.keywords = [...seen]
+  }
+
+  if (input.match_mode !== undefined) {
+    if (!MATCH_MODES.includes(String(input.match_mode))) {
+      return { ok: false, error: `match_mode 只能是 ${MATCH_MODES.join('/')}` }
+    }
+    out.match_mode = String(input.match_mode)
+  }
+
+  if (input.format !== undefined) {
+    if (!MESSAGE_FORMATS.includes(String(input.format))) {
+      return { ok: false, error: `format 只能是 ${MESSAGE_FORMATS.join('/')}` }
+    }
+    out.format = String(input.format)
+  }
+
+  if (input.body !== undefined) {
+    const body = String(input.body)
+    if (body.length > AUTO_REPLY_BODY_MAX) {
+      return { ok: false, error: `回复内容不能超过 ${AUTO_REPLY_BODY_MAX} 字` }
+    }
+    // 存进来就清洗，和用户发的消息同一套规则。规则的正文由管理员写，但「管理员不会写恶意 HTML」
+    // 不是一个能依赖的前提——被盗的管理员账号第一件能做的事就是往每个新会话里投一段脚本。
+    out.body = (out.format || input.format) === 'html' ? sanitizeHtml(body) : body
+  }
+
+  if (input.once_per_session !== undefined) out.once_per_session = Boolean(input.once_per_session)
+
+  if (input.priority !== undefined) {
+    const [lo, hi] = AUTO_REPLY_PRIORITY_RANGE
+    const n = Number(input.priority)
+    if (!Number.isInteger(n) || n < lo || n > hi) {
+      return { ok: false, error: `priority 必须是 ${lo}..${hi} 的整数` }
+    }
+    out.priority = n
+  }
+
+  // 「关键词触发必须有关键词」这条跨字段规则在这里只对新建生效。改的时候请求体不一定带这两个字段，
+  // 判断要拿现有行补齐，那部分在 updateRule 里——放在这里的话它只能看见请求体的一半。
+  if (!partial) {
+    if (out.trigger === 'keyword' && !out.keywords?.length) {
+      return { ok: false, error: '关键词触发必须至少配一个关键词' }
+    }
+    if (!out.body?.trim()) return { ok: false, error: '回复内容不能为空' }
+  }
+  if (Object.keys(out).length === 0) return { ok: false, error: '没有可更新的字段' }
+
+  return { ok: true, value: out }
 }
 
 /**

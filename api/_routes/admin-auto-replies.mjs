@@ -9,10 +9,13 @@
  */
 
 import { RANK, bodyOf, requireUser, send } from '../_lib/server.mjs'
-import { AUTO_REPLY_TRIGGERS, MATCH_MODES, MESSAGE_FORMATS, sanitizeHtml } from '../../shared/cs.mjs'
+import { AUTO_REPLY_TRIGGERS, validateRule } from '../../shared/cs.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const CHANNEL_VALUES = ['presale', 'postsale', 'both']
+
+// 校验搬到了 shared/cs.mjs：后台的规则编辑器要用同一份，否则界面判合法而接口回 400。
+// 这里照旧导出，测试和别处的 import 路径不用改。
+export { validateRule }
 
 // 这些列由服务端决定，不接受请求里的值。created_by 尤其重要：允许改的话，一条规则可以被伪造成
 // 别人建的，而那正是出问题时第一个要查的字段。
@@ -20,93 +23,6 @@ export const NEVER_WRITABLE = ['id', 'created_by', 'created_at', 'updated_at']
 
 const RULE_COLUMNS = 'id,name,enabled,trigger,channel,keywords,match_mode,body,format,' +
   'once_per_session,priority,created_by,created_at,updated_at'
-
-/**
- * 校验并归一化一条规则。
- *
- * 关键词规则必须有关键词：一条 trigger='keyword' 且 keywords 为空的规则，在 matchesKeyword 里
- * 永远不匹配，于是它安静地什么都不做。配的人会以为自己配好了，而唯一的症状是「自动回复没生效」。
- */
-export function validateRule(input, { partial = false } = {}) {
-  const out = {}
-
-  if (input.name !== undefined) out.name = String(input.name).trim().slice(0, 120)
-  if (input.enabled !== undefined) out.enabled = Boolean(input.enabled)
-
-  if (input.trigger !== undefined) {
-    if (!AUTO_REPLY_TRIGGERS.includes(String(input.trigger))) {
-      return { ok: false, error: `trigger 只能是 ${AUTO_REPLY_TRIGGERS.join('/')}` }
-    }
-    out.trigger = String(input.trigger)
-  } else if (!partial) {
-    return { ok: false, error: 'trigger 必填' }
-  }
-
-  if (input.channel !== undefined) {
-    if (!CHANNEL_VALUES.includes(String(input.channel))) {
-      return { ok: false, error: `channel 只能是 ${CHANNEL_VALUES.join('/')}` }
-    }
-    out.channel = String(input.channel)
-  }
-
-  if (input.keywords !== undefined) {
-    if (!Array.isArray(input.keywords)) return { ok: false, error: 'keywords 必须是数组' }
-    // 去重并去掉空串：空串在 contains 模式下匹配任何文本，等于让这条规则对每句话都触发。
-    const seen = new Set()
-    for (const k of input.keywords) {
-      const word = String(k ?? '').trim()
-      if (!word) continue
-      if (word.length > 100) return { ok: false, error: '单个关键词不能超过 100 字' }
-      seen.add(word)
-    }
-    if (seen.size > 50) return { ok: false, error: '关键词最多 50 个' }
-    out.keywords = [...seen]
-  }
-
-  if (input.match_mode !== undefined) {
-    if (!MATCH_MODES.includes(String(input.match_mode))) {
-      return { ok: false, error: `match_mode 只能是 ${MATCH_MODES.join('/')}` }
-    }
-    out.match_mode = String(input.match_mode)
-  }
-
-  if (input.format !== undefined) {
-    if (!MESSAGE_FORMATS.includes(String(input.format))) {
-      return { ok: false, error: `format 只能是 ${MESSAGE_FORMATS.join('/')}` }
-    }
-    out.format = String(input.format)
-  }
-
-  if (input.body !== undefined) {
-    const body = String(input.body)
-    if (body.length > 4000) return { ok: false, error: '回复内容不能超过 4000 字' }
-    // 存进来就清洗，和用户发的消息同一套规则。规则的正文由管理员写，但「管理员不会写恶意 HTML」
-    // 不是一个能依赖的前提——被盗的管理员账号第一件能做的事就是往每个新会话里投一段脚本。
-    out.body = (out.format || input.format) === 'html' ? sanitizeHtml(body) : body
-  }
-
-  if (input.once_per_session !== undefined) out.once_per_session = Boolean(input.once_per_session)
-
-  if (input.priority !== undefined) {
-    const n = Number(input.priority)
-    if (!Number.isInteger(n) || n < -1000 || n > 1000) {
-      return { ok: false, error: 'priority 必须是 -1000..1000 的整数' }
-    }
-    out.priority = n
-  }
-
-  // 「关键词触发必须有关键词」这条跨字段规则在这里只对新建生效。改的时候请求体不一定带这两个字段，
-  // 判断要拿现有行补齐，那部分在 updateRule 里——放在这里的话它只能看见请求体的一半。
-  if (!partial) {
-    if (out.trigger === 'keyword' && !out.keywords?.length) {
-      return { ok: false, error: '关键词触发必须至少配一个关键词' }
-    }
-    if (!out.body?.trim()) return { ok: false, error: '回复内容不能为空' }
-  }
-  if (Object.keys(out).length === 0) return { ok: false, error: '没有可更新的字段' }
-
-  return { ok: true, value: out }
-}
 
 export async function listRules(db, input = {}) {
   let query = db.from('cs_auto_replies').select(RULE_COLUMNS)

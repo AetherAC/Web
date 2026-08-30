@@ -474,3 +474,37 @@ button { color: inherit; }
 .coupon-preview>p b{color:var(--fluent)}
 .coupon-del{border-color:rgba(240,109,109,.4)!important;color:#ef9999!important}
 @media(max-width:1080px){.coupon-grid{grid-template-columns:1fr}.coupon-row{grid-template-columns:1fr}}
+
+/* --- §3 自动回复 -----------------------------------------------------------------------------
+   复用优惠券那一套表单样式（.coupon-form / .coupon-row / .coupon-preview），只加四样这一页独有的
+   东西：字段用 fieldset 包起来好一次性禁用（客服只读）、关键词去重后的回显、正文预览容器，以及
+   试算的三种结论。结论用颜色区分是有必要的——「会发」和「被别的规则压掉」在文字上只差一句话，
+   而后者是这一页存在的理由。 */
+.ar-fields{display:flex;flex-direction:column;gap:14px;margin:0;padding:0;border:0;min-width:0}
+.ar-fields[disabled]{opacity:.62}
+.ar-inline-checks{gap:9px!important}
+.ar-inline-checks .check-row{display:flex;align-items:center;gap:7px;color:#c4d6cd;font-size:12.5px}
+.ar-inline-checks input{width:auto;padding:0}
+.ar-chips{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:0;color:#6e8279;font-size:11px}
+.ar-chips code{padding:2px 7px;border-radius:5px;background:rgba(219,255,238,.09);color:#8ef0d0;font-size:11.5px}
+.ar-preview{border-color:rgba(219,255,238,.18);background:rgba(219,255,238,.04)}
+.ar-preview h3 svg{color:#9ec8ba}
+.ar-body{margin:0 0 10px;padding:12px 14px;border-radius:9px;background:#090f0d;color:#dbe9e3;font-size:13px;line-height:1.8;overflow-wrap:anywhere}
+.ar-body>:first-child{margin-top:0}
+.ar-body>:last-child{margin-bottom:0}
+.ar-body p{margin:0 0 8px}
+.ar-body a{color:var(--fluent)}
+.ar-body code{padding:1px 5px;border-radius:4px;background:rgba(219,255,238,.08);font-size:12px}
+.ar-body blockquote{margin:8px 0;padding:2px 0 2px 12px;border-left:2px solid #3c5349;color:#a9bfb6}
+.ar-body img{max-width:100%;border-radius:7px}
+.ar-body ol,.ar-body ul{margin:0 0 8px;padding-left:22px}
+.ar-probe .coupon-row{margin-bottom:11px}
+.ar-probe input[readonly]{opacity:.65}
+.ar-verdict{display:flex;align-items:flex-start;gap:8px;margin:0 0 9px;padding:11px 13px;border-radius:9px;font-size:12.5px;line-height:1.75}
+.ar-verdict svg{flex:none;margin-top:3px}
+.ar-verdict-hit{background:rgba(96,225,189,.1);color:#a8e8d4}
+.ar-verdict-hit svg{color:var(--fluent)}
+.ar-verdict-shadow{background:rgba(233,186,109,.12);color:#e3c894}
+.ar-verdict-shadow svg{color:#d8ac63}
+.ar-verdict-off{background:rgba(240,109,109,.1);color:#e5a7a7}
+.ar-verdict-off svg{color:#ef9999}

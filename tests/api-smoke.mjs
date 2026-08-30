@@ -140,7 +140,8 @@ import {
   pickAgent as sxPick, pickAutoReply as sxPickReply, prepareMessage as sxPrepare,
   presentMessage as sxPresent, sanitizeHtml as sxClean, servesChannel as sxServes,
   sessionCapabilities as sxCaps, sessionMetrics as sxSessionMetrics,
-  timeoutTextKeys as sxTimeoutKeys, uploadLimits as sxLimits
+  timeoutTextKeys as sxTimeoutKeys, uploadLimits as sxLimits,
+  validateRule as sxSharedValidateRule
 } from '../shared/cs.mjs'
 import {
   CS_SETTING_KEYS as SX_SETTING_KEYS, clientConfig as sxClientConfig,
@@ -4433,6 +4434,10 @@ assert(arUnknown.ok && !('evil' in arUnknown.value) && !('created_by' in arUnkno
 
 // 新建时 trigger 必填。缺它的规则不知道什么时候该发，落库之后是一条永不触发的死规则。
 assert(sxValidateRule({ body: '你好' }).ok === false, 'trigger 必填')
+// 后台的规则编辑器（AdminAutoReplies.vue）从 shared/cs.mjs 拿这个函数，接口从这里拿。必须是同一个：
+// 抄一份到前端，宽一档的那份会让界面判合法而接口回 400，填的人只看到一个点了报错却不说哪错的保存按钮。
+assert(sxValidateRule === sxSharedValidateRule,
+  'validateRule 只有一份，在 shared/cs.mjs；接口这边是 re-export')
 assert(sxValidateRule({ trigger: 'nope', body: '你好' }).ok === false, 'trigger 只能是三种之一')
 assert(sxValidateRule({ trigger: 'session_open', body: '你好' }).ok === true, '会话开启触发不需要关键词')
 // 关键词触发必须有关键词：一条 keywords 为空的 keyword 规则在 matchesKeyword 里永远不匹配，
