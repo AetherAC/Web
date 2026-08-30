@@ -110,3 +110,44 @@ export const renderMarkdown = (source?: string | null): string => render(source,
  * driven from the same instance so a link is sanitised identically either way.
  */
 export const renderMarkdownInline = (source?: string | null): string => render(source, true)
+
+/**
+ * §4 的四种正文格式，一处实现。客服消息（§4）和站内信（§9）都要它。
+ *
+ * bbcode 那一档带着两条协议白名单（[url] 和 [img] 只收 http(s) 和站内相对路径）。抄成两份的代价是
+ * 某天只有一份被补上，而漏掉的那份不报错，只是多一个可点的 javascript: 链接——所以这里只有一份。
+ */
+export const escapeText = (source?: string | null): string =>
+  escapeHtml(String(source ?? '')).replace(/\r\n|\r|\n/g, '<br>')
+
+/**
+ * §4.3 BBCode。先转义再替换标记：反过来的话 [b]<script>[/b] 里的标签会活下来。
+ * 只认需求里列的那几个标记，认不出的原样留着——留着一个 [xyz] 比吞掉用户的文字好。
+ */
+export function renderBbcode(source?: string | null): string {
+  let out = escapeHtml(String(source ?? ''))
+  out = out.replace(/\[b\]([\s\S]*?)\[\/b\]/gi, '<b>$1</b>')
+    .replace(/\[i\]([\s\S]*?)\[\/i\]/gi, '<i>$1</i>')
+    .replace(/\[u\]([\s\S]*?)\[\/u\]/gi, '<u>$1</u>')
+    .replace(/\[s\]([\s\S]*?)\[\/s\]/gi, '<s>$1</s>')
+    .replace(/\[code\]([\s\S]*?)\[\/code\]/gi, '<code>$1</code>')
+    .replace(/\[quote\]([\s\S]*?)\[\/quote\]/gi, '<blockquote>$1</blockquote>')
+    .replace(/\[color=(#[0-9a-f]{3,6}|[a-z]{3,20})\]([\s\S]*?)\[\/color\]/gi, '<span style="color:$1">$2</span>')
+    // url 的目标要过一遍协议白名单：[url=javascript:...] 否则是一个可点的洞。
+    .replace(/\[url=(https?:\/\/[^\]\s"']+|\/[^\]\s"']*)\]([\s\S]*?)\[\/url\]/gi,
+      '<a href="$1" target="_blank" rel="noopener noreferrer">$2</a>')
+    .replace(/\[img\](https?:\/\/[^\]\s"']+)\[\/img\]/gi, '<img src="$1" alt="">')
+  return out.replace(/\r\n|\r|\n/g, '<br>')
+}
+
+/**
+ * 按 format 渲染一段正文。html 那一档原样交出去：正文在入库前已经过 shared/cs.mjs 的 sanitizeHtml
+ * 白名单，而这里的 markdown-it 是 html:false 构造的，喂给它只会把标签转义成字面量。
+ */
+export function renderRichBody(body?: string | null, format?: string | null): string {
+  if (format === 'html') return String(body ?? '')
+  if (format === 'plain') return escapeText(body)
+  if (format === 'bbcode') return renderBbcode(body)
+  return renderMarkdown(body)
+}
+

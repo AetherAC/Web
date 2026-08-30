@@ -10,6 +10,7 @@ import BuyPage from './BuyPage.vue'
 import MePage from './MePage.vue'
 import OrderPage from './OrderPage.vue'
 import CsPage from './CsPage.vue'
+import InboxPage from './InboxPage.vue'
 import './style.css'
 
 export default {
@@ -28,5 +29,6 @@ export default {
     app.component('MePage', MePage)
     app.component('OrderPage', OrderPage)
     app.component('CsPage', CsPage)
+    app.component('InboxPage', InboxPage)
   }
 }

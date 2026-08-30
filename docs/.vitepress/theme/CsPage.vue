@@ -92,8 +92,10 @@ async function load() {
     }
     const data = await csApi(`/api/cs-workbench?${params}`)
     sessions.value = data.sessions || []
-    // 当前打开的会话不在新列表里了（被别人接走、或者筛掉了）就收起右侧。
-    if (active.value && !sessions.value.some(s => s.id === active.value)) active.value = null
+    // 当前打开的会话不在新列表里了（被别人接走、或者筛掉了）就收起右侧。站内信点进来的那条例外：
+    // 它本来就常常不在「我的」标签里（已关闭、或者分给别人），一收就等于那个链接只能看 20 秒。
+    if (active.value && active.value !== deepLinked.value &&
+      !sessions.value.some(s => s.id === active.value)) active.value = null
   } catch (e: any) {
     message.value = e.message
   } finally {
@@ -107,6 +109,9 @@ async function pick(row: any) {
   orders.value = []
   await thread.attach(row.id)
 }
+
+/** 站内信深链进来的那条会话 id。见 openFromQuery 与 load() 里那条例外。 */
+const deepLinked = ref('')
 
 /** §2.12 接入。抢不到（别人先点了）时服务端回 409，刷一次列表就看得到是谁接的。 */
 async function claim(row: any) {
@@ -206,13 +211,32 @@ const secs = (n: number | null) => (n === null || n === undefined ? '—' : n < 
 
 async function selectTab(id: Tab) { tab.value = id; active.value = null; await load() }
 
-watch(() => auth.ready.value, ready => {
+watch(() => auth.ready.value, async ready => {
   if (!ready) return
   if (!auth.user.value) { auth.requireUser('/cs'); return }
   if (!auth.isStaff.value) return
   presence.start()
-  load()
+  await load()
+  await openFromQuery()
 }, { immediate: true })
+
+/**
+ * §9.4 站内信里的「打开会话」落在这里：/cs?session=<uuid>。
+ *
+ * 不要求那条会话在刚载入的列表里——通知可能指向一条已经关闭的、或者分给别人的会话，而这两种都不在
+ * 默认的「我的」标签下。attach 走的是 cs-thread 接口，能不能看仍然由 RLS 说话；列表里没有的那条，
+ * 侧栏标题会退回 thread.session 上的 user_id 前八位。
+ */
+async function openFromQuery() {
+  if (typeof window === 'undefined') return
+  const id = new URLSearchParams(location.search).get('session')
+  if (!id || active.value === id) return
+  deepLinked.value = id
+  active.value = id
+  panel.value = ''
+  orders.value = []
+  try { await thread.attach(id) } catch (e: any) { message.value = e.message; active.value = null }
+}
 
 // 列表要跟着新会话动。轮询而不是订阅：cs_sessions 的 RLS 让客服只看得到分给自己的行，
 // 待接入队列里那些 agent_id 为 null 的行推不过来，所以队列这一侧只能问。

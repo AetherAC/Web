@@ -8,7 +8,7 @@
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { CornerUpLeft, Download, Eye, Image as ImageIcon, Paperclip, Pencil, Send, Undo2, X } from 'lucide-vue-next'
-import { renderMarkdown } from './markdown'
+import { renderRichBody } from './markdown'
 import { csTime, formatBytes, mutable, type CsMessage } from './cs'
 import { useAuth } from './auth'
 
@@ -51,39 +51,12 @@ const roleName = (m: CsMessage) => {
 }
 
 /**
- * §4 的四种格式。html 那一档直接 v-html：正文在服务端已经过 sanitizeHtml 的白名单，
- * 而 markdown-it 是 html:false 构造的，喂给它会把标签转义成字面量。
+ * §4 的四种格式。判定和四个渲染器都在 theme/markdown.ts 里，这里只多一条撤回的早退：
+ * 撤回后的正文一个字都不能渲染，而 §9 的站内信没有撤回这回事，所以那一条留在组件里。
  */
 function bodyHtml(m: CsMessage) {
   if (m.recalled) return ''
-  if (m.format === 'html') return m.body
-  if (m.format === 'plain') return escapeText(m.body)
-  if (m.format === 'bbcode') return bbcode(m.body)
-  return renderMarkdown(m.body)
-}
-
-const escapeText = (s: string) => String(s ?? '')
-  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  .replace(/\n/g, '<br>')
-
-/**
- * §4.3 BBCode。先转义再替换标记：反过来的话 [b]<script>[/b] 里的标签会活下来。
- * 只认需求里列的那几个标记，认不出的原样留着——留着一个 [xyz] 比吞掉用户的文字好。
- */
-function bbcode(src: string) {
-  let out = escapeText(src)
-  out = out.replace(/\[b\]([\s\S]*?)\[\/b\]/gi, '<b>$1</b>')
-    .replace(/\[i\]([\s\S]*?)\[\/i\]/gi, '<i>$1</i>')
-    .replace(/\[u\]([\s\S]*?)\[\/u\]/gi, '<u>$1</u>')
-    .replace(/\[s\]([\s\S]*?)\[\/s\]/gi, '<s>$1</s>')
-    .replace(/\[code\]([\s\S]*?)\[\/code\]/gi, '<code>$1</code>')
-    .replace(/\[quote\]([\s\S]*?)\[\/quote\]/gi, '<blockquote>$1</blockquote>')
-    .replace(/\[color=(#[0-9a-f]{3,6}|[a-z]{3,20})\]([\s\S]*?)\[\/color\]/gi, '<span style="color:$1">$2</span>')
-    // url 的目标要过一遍协议白名单：[url=javascript:...] 否则是一个可点的洞。
-    .replace(/\[url=(https?:\/\/[^\]\s"']+|\/[^\]\s"']*)\]([\s\S]*?)\[\/url\]/gi,
-      '<a href="$1" target="_blank" rel="noopener noreferrer">$2</a>')
-    .replace(/\[img\](https?:\/\/[^\]\s"']+)\[\/img\]/gi, '<img src="$1" alt="">')
-  return out.replace(/\n/g, '<br>')
+  return renderRichBody(m.body, m.format)
 }
 
 /** 附件的签名 URL 是异步取的，取到之后填进这个 map，模板里按 path 取。 */
