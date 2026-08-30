@@ -3,23 +3,26 @@
  *
  * 为什么这些动作走接口而不是让浏览器直接写 cs_sessions：RLS 能决定「你能不能看见这一行」，
  * 不能决定「你只能改这几列」。放开 UPDATE 给客服，就等于允许一个客服把 agent_id 改成别人、
- * 把 admin_mode 改成 none 把管理员踢出去、把 first_response_seconds 抹掉让自己的看板变好看。
- * 这里由服务端决定每个动作改哪几列。
+ * 把 admin_id 抹掉把管理员踢出去、把 first_response_seconds 抹掉让自己的看板变好看，
+ * 或者给自己刷一个满分评价。这里由服务端决定每个动作改哪几列。
  *
  * 读取仍然走浏览器直连（cs_sessions_read 那条策略 + Realtime 订阅），因为 §7 要求实时，
  * 而会话行里没有需要脱敏的列。
  */
 
 import { RANK, bodyOf, rankOf, requireUser, send } from '../_lib/server.mjs'
-import { ADMIN_MODES, CHANNELS, sessionCapabilities } from '../../shared/cs.mjs'
 import {
-  CS_SETTING_KEYS, assignAgent, closeSessionTimedOut, deliverAutoReply,
+  ADMIN_MODES, ADMIN_MODE_LABEL, CHANNELS, normalizeRating, RATING_RANGE, sessionCapabilities
+} from '../../shared/cs.mjs'
+import {
+  CS_SETTING_KEYS, assignAgent, closeSessionTimedOut, decorateSession, deliverAutoReply,
   insertMessage, logEvent, settingsOf, staffMayServe
 } from '../_lib/cs.mjs'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const SESSION_COLUMNS = 'id,channel,user_id,order_id,agent_id,status,subject,admin_mode,admin_id,' +
+  'rating,rating_comment,rated_at,' +
   'first_response_seconds,timed_out,last_user_message_at,last_agent_message_at,last_activity_at,' +
   'reopened_count,opened_at,closed_at,closed_by,close_reason,created_at,updated_at'
 
@@ -27,6 +30,24 @@ async function loadSession(db, id) {
   const { data, error } = await db.from('cs_sessions').select(SESSION_COLUMNS).eq('id', id).maybeSingle()
   if (error) throw new Error(`读取会话失败：${error.message}`)
   return data || null
+}
+
+/**
+ * 每一条「返回一个会话」的出口都走这里。
+ *
+ * 两件事必须同时发生：补显示名（用户要看到接待自己的客服叫什么，客服要看到用户叫什么，而两边的浏览器
+ * 都被 profiles_read 挡在外面，见 _lib/cs.mjs 的 displayNames），以及算一遍 capabilities。漏掉其中一处的
+ * 表现很具体——点完「接入」之后对面的称呼忽然退回「客服」，要等下一次拉取才恢复。
+ */
+async function sessionReply(db, auth, session, status = 200, extra = {}) {
+  return {
+    status,
+    body: {
+      ...extra,
+      session: await decorateSession(db, session, { staff: rankOf(auth.group) >= RANK.STAFF }),
+      capabilities: sessionCapabilities(session, auth)
+    }
+  }
 }
 
 /**
@@ -60,7 +81,7 @@ export async function openSession(db, auth, input) {
     ? existingQuery.eq('order_id', orderId) : existingQuery.is('order_id', null)).maybeSingle()
   if (existErr) throw new Error(`读取已有会话失败：${existErr.message}`)
   if (existing) {
-    return { status: 200, body: { session: existing, created: false, capabilities: sessionCapabilities(existing, auth) } }
+    return sessionReply(db, auth, existing, 200, { created: false })
   }
 
   const settings = await settingsOf(db, CS_SETTING_KEYS)
@@ -78,7 +99,7 @@ export async function openSession(db, auth, input) {
     const retryQuery = db.from('cs_sessions').select(SESSION_COLUMNS)
       .eq('user_id', auth.userId).eq('channel', channel).eq('status', 'open')
     const { data: winner } = await (orderId ? retryQuery.eq('order_id', orderId) : retryQuery.is('order_id', null)).maybeSingle()
-    if (winner) return { status: 200, body: { session: winner, created: false, capabilities: sessionCapabilities(winner, auth) } }
+    if (winner) return sessionReply(db, auth, winner, 200, { created: false })
   }
   if (error) throw new Error(`创建会话失败：${error.message}`)
 
@@ -103,7 +124,7 @@ export async function openSession(db, auth, input) {
     })
   }
 
-  return { status: 201, body: { session, created: true, capabilities: sessionCapabilities(session, auth) } }
+  return sessionReply(db, auth, session, 201, { created: true })
 }
 
 /**
@@ -120,10 +141,9 @@ export async function claimSession(db, auth, sessionId) {
     return { status: 403, body: { error: '当前用户组不服务该渠道' } }
   }
   if (session.status !== 'open') return { status: 409, body: { error: '会话已关闭' } }
-  // blind 模式下这个会话由管理员接管，不该再出现在任何人的队列里。
-  if (session.admin_mode === 'blind' && rankOf(auth.group) < RANK.ADMIN) {
-    return { status: 403, body: { error: '该会话已由管理员接管' } }
-  }
+  // 这里曾经有一条「blind 模式下会话由管理员接管，别人不许接」。§2.10 简化成两种模式之后 blind 是默认值，
+  // 那条判断会让每一个新会话都不许接——队列里看得见却点不动。介入现在只决定管理员署谁的名（见
+  // shared/cs.mjs 的 ADMIN_MODES），不再是「接管」，所以接入这件事和它无关。
 
   // 并发上限在这里判。判在分配时（assignAgent）管的是自动分配，主动接入绕过那条路径，
   // 少了这一处，一个客服可以手动把自己接到二十个会话上。
@@ -149,13 +169,13 @@ export async function claimSession(db, auth, sessionId) {
     const fresh = await loadSession(db, sessionId)
     // 自己已经是这个会话的客服：重复点击，当成成功。
     if (fresh?.agent_id === auth.userId) {
-      return { status: 200, body: { session: fresh, capabilities: sessionCapabilities(fresh, auth) } }
+      return sessionReply(db, auth, fresh)
     }
     return { status: 409, body: { error: '会话已被其他客服接入' } }
   }
 
   await logEvent(db, sessionId, 'claimed', auth, { previous_agent: null })
-  return { status: 200, body: { session: claimed, capabilities: sessionCapabilities(claimed, auth) } }
+  return sessionReply(db, auth, claimed)
 }
 
 /** §2.5：关闭会话。用户、接待客服、管理员都能关。 */
@@ -177,12 +197,18 @@ export async function closeSession(db, auth, sessionId, reason) {
   if (!closed) return { status: 409, body: { error: '会话已经是关闭状态' } }
 
   await logEvent(db, sessionId, 'closed', auth, { reason: String(reason || '') })
+  // 谁关的，就署谁的身份。管理员在「管理员介入」下关会话要说「管理员已结束」——他这一路发言用的都是
+  // 管理员名义，最后一句忽然变成「客服已结束」会让用户以为刚才说话的是两个人。反过来，「正常介入」
+  // 下他借的是接待客服的名义，那就仍然说客服，否则介入本身在这一句里暴露了。
+  const ghostWriting = session.admin_mode === 'normal' && Boolean(session.agent_id)
+  const closer = caps.is_owner ? '用户'
+    : (caps.is_admin && !caps.is_agent && !ghostWriting) ? '管理员' : '客服'
   await insertMessage(db, closed, {
     senderRole: 'system',
-    body: caps.is_owner ? '用户已结束本次会话。' : '客服已结束本次会话。',
+    body: `${closer}已结束本次会话。`,
     format: 'plain'
   })
-  return { status: 200, body: { session: closed } }
+  return sessionReply(db, auth, closed)
 }
 
 /**
@@ -201,7 +227,7 @@ export async function reopenSession(db, auth, sessionId) {
   const caps = sessionCapabilities(session, auth)
   if (!caps.can_reopen) return { status: 403, body: { error: '无权重开该会话' } }
   if (session.status === 'open') {
-    return { status: 200, body: { session, capabilities: sessionCapabilities(session, auth) } }
+    return sessionReply(db, auth, session)
   }
 
   // 同一个用户在同一个渠道上不能有第二个开着的会话。重开之前先看有没有——有的话把那个还回去，
@@ -241,14 +267,17 @@ export async function reopenSession(db, auth, sessionId) {
   await logEvent(db, sessionId, 'reopened', auth, {
     agent_id: agentId, same_agent: agentId === session.agent_id
   })
-  return { status: 200, body: { session: reopened, capabilities: sessionCapabilities(reopened, auth) } }
+  return sessionReply(db, auth, reopened)
 }
 
 /**
  * §2.10：管理员切换介入模式。
  *
- * 三种模式的差别在 private.can_see_session / can_post_session 里生效，这里只负责改字段和留痕。
- * 切到 none 时把 admin_id 清掉，否则一个退出了的管理员会一直显示在会话上。
+ * 两种模式的差别只有一处：管理员发言时署谁的名（见 shared/cs.mjs 的 ADMIN_MODES 与 cs-message 的
+ * speakAsAgent）。可见性不再受它影响，private.can_see_session 里已经没有 admin_mode 了。
+ *
+ * admin_id 一律写成切换的人，不再有「清空」的分支：blind 是默认值，把它当成「没人介入」的话，
+ * 每个新会话看起来都有一个管理员在旁边。真正的「有没有人介入」由 admin_id 是否为空表达。
  */
 export async function setAdminMode(db, auth, sessionId, mode) {
   if (!UUID.test(String(sessionId || ''))) return { status: 400, body: { error: 'session_id 必须是 UUID' } }
@@ -262,20 +291,68 @@ export async function setAdminMode(db, auth, sessionId, mode) {
 
   const now = new Date().toISOString()
   const { data: updated, error } = await db.from('cs_sessions')
-    .update({
-      admin_mode: mode,
-      admin_id: mode === 'none' ? null : auth.userId,
-      updated_at: now
-    }).eq('id', sessionId).select(SESSION_COLUMNS).maybeSingle()
+    .update({ admin_mode: mode, admin_id: auth.userId, updated_at: now })
+    .eq('id', sessionId).select(SESSION_COLUMNS).maybeSingle()
   if (error) throw new Error(`切换介入模式失败：${error.message}`)
 
   await logEvent(db, sessionId, 'admin_mode', auth, { from: session.admin_mode, to: mode })
-  // 介入本身对用户不可见（§2.10）：用户不该知道现在是管理员在替客服说话。
+  // 介入本身对用户不可见（§2.10）：用户不该知道现在是管理员在替客服说话。留痕给客服和审计看。
+  //
+  // senderRole 是 'system' 而不是 'admin'：这条留痕不是谁「说」的话，它是会话状态的一次变更。写成 admin
+  // 加上 sender_id=管理员自己的话，管理员自己打开这个会话时会看到一条署名「我」的气泡——而那句话的内容
+  // 是在讲他自己刚做的操作。系统提示这一栏才是它该在的位置。
   await insertMessage(db, session, {
-    senderId: auth.userId, senderRole: 'admin',
-    body: `管理员将介入模式切换为 ${mode}。`, format: 'plain', visibleToUser: false
+    senderRole: 'system',
+    body: `管理员将介入模式切换为「${ADMIN_MODE_LABEL[mode] || mode}」。`,
+    format: 'plain', visibleToUser: false
   })
-  return { status: 200, body: { session: updated } }
+  return sessionReply(db, auth, updated)
+}
+
+/**
+ * §2.14：会话结束后用户给这次服务打分（0~5）和留一句话。
+ *
+ * 三条限制，每条都在 update 的 where 里而不是只在前面判一次：只有会话本人（eq user_id）、只有已关闭的
+ * 会话（eq status）、只能打一次（is rated_at null）。前面那三个 if 只是为了给出人话的错误信息；真正
+ * 拦住并发重复提交的是那三个条件——两次点击撞在一起时，第二次拿不到行。
+ *
+ * 为什么允许 0 分：0 和「没评价」是两件事，前者是一个明确的差评。rated_at 才是「评过没有」的判据，
+ * 用 rating 是否为空来判会让 0 分永远可以被覆盖掉。
+ *
+ * 分数不进 cs_session_events 的 detail 之外的任何统计表：§2.13 的看板要按客服聚合平均分时直接读
+ * cs_sessions.rating，多存一份就多一处会和它对不上的地方。
+ */
+export async function rateSession(db, auth, input) {
+  const sessionId = String(input?.session_id || '')
+  if (!UUID.test(sessionId)) return { status: 400, body: { error: 'session_id 必须是 UUID' } }
+  const rating = normalizeRating(input?.rating)
+  if (rating === null) {
+    return { status: 400, body: { error: `评分必须是 ${RATING_RANGE[0]}~${RATING_RANGE[1]} 的整数` } }
+  }
+  const comment = String(input?.comment ?? '').slice(0, 500)
+
+  const session = await loadSession(db, sessionId)
+  if (!session) return { status: 404, body: { error: '会话不存在' } }
+  if (session.user_id !== auth.userId) return { status: 403, body: { error: '只有会话本人可以评价' } }
+  if (session.status !== 'closed') return { status: 409, body: { error: '会话结束后才能评价' } }
+  if (session.rated_at) return { status: 409, body: { error: '这次会话已经评价过了' } }
+
+  const now = new Date().toISOString()
+  const { data: rated, error } = await db.from('cs_sessions')
+    .update({ rating, rating_comment: comment, rated_at: now, updated_at: now })
+    .eq('id', sessionId).eq('user_id', auth.userId).eq('status', 'closed').is('rated_at', null)
+    .select(SESSION_COLUMNS).maybeSingle()
+  if (error) throw new Error(`提交评价失败：${error.message}`)
+  if (!rated) return { status: 409, body: { error: '会话状态已变化，请刷新后重试' } }
+
+  await logEvent(db, sessionId, 'rated', auth, { rating, has_comment: Boolean(comment) })
+  // 评价写成对用户不可见的一条记录：客服该知道自己被打了几分，但用户不需要在自己的聊天记录里
+  // 再看到一遍刚填的东西——那条消息在他眼里只会像一次莫名的回声。
+  await insertMessage(db, rated, {
+    senderRole: 'system', visibleToUser: false, format: 'plain',
+    body: `用户对本次会话评分 ${rating} 分${comment ? `，留言：${comment}` : ''}。`
+  })
+  return sessionReply(db, auth, rated)
 }
 
 /** §2.3：客服上下线与心跳。手动切换和自动离线走同一个入口。 */
@@ -342,6 +419,7 @@ export default async function handler(req, res) {
       close: () => closeSession(auth.db, caller, input.session_id, input.reason),
       reopen: () => reopenSession(auth.db, caller, input.session_id),
       admin_mode: () => setAdminMode(auth.db, caller, input.session_id, input.admin_mode),
+      rate: () => rateSession(auth.db, caller, input),
       presence: () => setPresence(auth.db, caller, input),
       sweep: () => sweepIdleSessions(auth.db, caller, {})
     }

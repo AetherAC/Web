@@ -275,6 +275,19 @@ button { color: inherit; }
 .cs-start{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:13px;flex:1;padding:26px;color:#7f968d;text-align:center}
 .cs-start p{margin:0;font-size:13px;line-height:1.7}
 
+/* §2.14 会话结束后的打分。0 分是一颗都不点亮的合法选项，所以它是一个独立按钮而不是「零颗星」。 */
+.cs-rate{display:flex;flex-direction:column;gap:9px;padding:13px 16px;border-top:1px solid var(--fluent-stroke);background:var(--fluent-layer)}
+.cs-rate p{margin:0;color:#a9c2b8;font-size:12.5px;font-weight:650}
+.cs-rate input{padding:7px 10px;border:1px solid var(--fluent-stroke);border-radius:8px;background:rgba(0,0,0,.22);color:#dff5ec;font-size:12.5px}
+.cs-rate button.fluent-primary{align-self:flex-start;padding:6px 14px;font-size:12.5px}
+.cs-stars{display:flex;align-items:center;gap:4px}
+.cs-stars button{display:grid;place-items:center;padding:3px;border:0;border-radius:6px;background:0 0;color:#4d5f57;cursor:pointer;transition:color .15s}
+.cs-stars button:hover{color:#e8c37a}
+.cs-stars button.on{color:#e8c37a}
+.cs-stars .cs-zero{margin-left:7px;padding:3px 9px;border:1px solid var(--fluent-stroke);color:#8aa39a;font-size:11.5px}
+.cs-stars .cs-zero.on{border-color:rgba(255,107,107,.5);background:rgba(255,107,107,.14);color:#ffa8a8}
+.cs-rated{display:flex;align-items:center;gap:5px;margin:0;padding:11px 16px;border-top:1px solid var(--fluent-stroke);color:#e8c37a;font-size:12px}
+
 .cs-thread{display:flex;flex-direction:column;flex:1;min-height:0}
 .cs-scroll{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;min-height:0}
 .cs-hint,.cs-error{margin:0;color:#71857b;font-size:12px;text-align:center}
@@ -353,6 +366,8 @@ button { color: inherit; }
 .cs-tag{padding:1px 6px;border-radius:6px;background:rgba(219,255,238,.09);color:#a9c2b8;font-size:10px;font-style:normal;font-weight:650}
 .cs-tag.unread{background:rgba(255,107,107,.16);color:#ffa8a8}
 .cs-tag.mode{background:rgba(232,195,122,.15);color:#e8c37a}
+.cs-tag.rating{background:rgba(139,214,255,.14);color:#8bd6ff}
+.cs-rating-view{display:flex;align-items:center;gap:6px;margin:0;padding:9px 17px;border-bottom:1px solid var(--fluent-stroke);color:#8bd6ff;font-size:11.5px}
 .cs-claim{padding:5px 12px;font-size:12px;white-space:nowrap}
 .cs-detail{display:flex;flex-direction:column;border:1px solid var(--fluent-stroke);border-radius:14px;background:var(--fluent-card);height:min(72vh,720px);min-height:0;overflow:hidden}
 .cs-detail-head{display:flex;align-items:flex-start;gap:12px;padding:15px 17px;border-bottom:1px solid var(--fluent-stroke);background:var(--fluent-layer)}
@@ -372,8 +387,19 @@ button { color: inherit; }
 .cs-action-form .field{flex:1;min-width:150px}
 .cs-action-form button{padding:7px 14px;font-size:12.5px}
 .cs-action-form small{flex-basis:100%;color:#6e8279;font-size:10.5px;line-height:1.6}
+/* 窄屏下这两个面板里的字会压到输入框上。
+   .field 本身是一个高度写死 46px、不换行的 flex 行——那在登录页成立，因为那里的标签只有「邮箱」两个字；
+   这里的标签是「退款金额（留空为全额）」，比输入框还长，于是标签和输入框在同一行里互相盖住。
+   改成高度随内容长、放不下就换行：宽屏时仍然是一行 46px（min-height 顶着），窄到输入框剩不下 120px
+   时标签自己占一行。只改 .cs-action-form 里的那几个，登录页的 .field 不动。 */
+.cs-action-form .field{height:auto;min-height:46px;flex-wrap:wrap;padding:7px 13px}
+.cs-action-form .field>span{min-width:0;font-size:12px;line-height:1.5;word-break:break-word}
+.cs-action-form .field input{flex:1 1 120px;min-width:0}
+/* 三个动作面板都是 toggle，按下去的那个要看得出来，否则「再点一次收起」这件事只能靠试。 */
+.cs-detail-actions button.on{border-color:rgba(96,225,189,.5);background:rgba(48,131,108,.22);color:#8ef0d0}
 .cs-orders{max-height:190px;overflow-y:auto;padding:11px 17px;border-bottom:1px solid var(--fluent-stroke)}
 .cs-orders .order-row{text-decoration:none}
+.cs-orders .order-row>div{min-width:0;padding:9px 0}
 @media(max-width:980px){.cs-workbench{grid-template-columns:1fr}.cs-detail{height:min(66vh,620px)}}
 @media(max-width:600px){.cs-widget{right:12px;bottom:12px}.cs-panel{width:calc(100vw - 24px);height:calc(100vh - 100px)}}
 

@@ -9,7 +9,7 @@
  * 未登录时只显示一个入口按钮，点了跳登录。不预先建会话：cs_sessions 上的 user_id 是必填的。
  */
 import { computed, onMounted, ref, watch } from 'vue'
-import { Headset, MessageCircle, Minus, RefreshCw, X } from 'lucide-vue-next'
+import { Headset, MessageCircle, Minus, RefreshCw, Star, X } from 'lucide-vue-next'
 import CsThread from './CsThread.vue'
 import { useAuth, supabase } from './auth'
 import { csApi, useCsThread, type CsChannel } from './cs'
@@ -41,14 +41,33 @@ async function start() {
   starting.value = true
   notice.value = ''
   try {
-    const data = await thread.open(channel.value, orderId())
-    if (!data.session.agent_id) notice.value = '正在为你接入客服，请稍候'
+    await thread.open(channel.value, orderId())
   } catch (e: any) {
     notice.value = e.message
   } finally {
     starting.value = false
   }
 }
+
+/**
+ * 「正在为你接入客服」这句话（item 3）。
+ *
+ * 做成 computed 而不是往 notice 里写一次：写进去的那一份没有人负责撤掉，于是客服接进来之后这句话
+ * 还挂在页面顶上，用户一边和客服说话一边看着「正在为你接入」。改成从会话状态推出来之后，
+ * cs_sessions 的 Realtime 推送（agent_id 被写上）会让它自己消失。
+ */
+const waiting = computed(() => {
+  const s = thread.session.value
+  return Boolean(s) && !s?.agent_id && !thread.closed.value
+})
+
+/** 面板标题。接入之后要显示是谁在接（item 4）——名字由接口带回来，浏览器自己查不到。 */
+const agentTitle = computed(() => {
+  const s = thread.session.value
+  if (!s) return '在线客服'
+  if (!s.agent_id) return '正在为你接入'
+  return `${s.agent_name || '客服'}为你服务`
+})
 
 async function toggle() {
   openPanel.value = !openPanel.value
@@ -84,6 +103,34 @@ async function reopen() {
     await thread.refresh()
   } catch (e: any) { notice.value = e.message }
 }
+
+/**
+ * §2.14 会话结束后打分。
+ *
+ * 只能打一次，而「打过没有」的判据是 rated_at 而不是 rating——0 分是一个合法的差评，
+ * 按 rating 判会让它可以被改成 5 分。这里 can_rate 由服务端算好（sessionCapabilities），
+ * 前端不自己推：推错的方向是给用户一个点下去必然 409 的按钮。
+ */
+const score = ref<number | null>(null)
+const ratingComment = ref('')
+const rating = ref(false)
+const canRate = computed(() => Boolean(thread.capabilities.value?.can_rate))
+
+async function submitRating() {
+  if (score.value === null || !thread.session.value) return
+  rating.value = true
+  notice.value = ''
+  try {
+    await thread.rate(score.value, ratingComment.value)
+    notice.value = '谢谢你的评价'
+    score.value = null
+    ratingComment.value = ''
+  } catch (e: any) { notice.value = e.message } finally { rating.value = false }
+}
+
+// 换一条会话（关掉重开、或者在 /order 之间切）时把没提交的打分清掉，
+// 否则上一条会话打的星星会留在下一条的面板上。
+watch(() => thread.session.value?.id, () => { score.value = null; ratingComment.value = '' })
 
 /** 面板收起时来的消息记成红点。展开时不记——那时用户正在看。 */
 watch(() => thread.messages.value.length, (now, before) => {
@@ -122,7 +169,7 @@ onMounted(() => { if (auth.ready.value) probe() })
       <header class="cs-panel-head">
         <div>
           <p class="eyebrow">{{ channelLabel }}</p>
-          <h3>{{ thread.session.value?.agent_id ? '客服已接入' : '在线客服' }}</h3>
+          <h3>{{ agentTitle }}</h3>
         </div>
         <button title="刷新" @click="thread.refresh()"><RefreshCw :size="16" /></button>
         <button v-if="thread.session.value && !thread.closed.value" title="关闭会话" @click="closeSession">
@@ -131,6 +178,7 @@ onMounted(() => { if (auth.ready.value) probe() })
         <button title="收起" @click="openPanel = false"><Minus :size="16" /></button>
       </header>
 
+      <p v-if="waiting" class="cs-notice">正在为你接入客服，请稍候</p>
       <p v-if="notice" class="cs-notice">{{ notice }}</p>
 
       <div v-if="!thread.session.value" class="cs-start">
@@ -147,6 +195,26 @@ onMounted(() => { if (auth.ready.value) probe() })
           <button class="fluent-secondary" @click="reopen">重新发起</button>
         </template>
       </CsThread>
+
+      <!-- §2.14 打分。会话关了才出现，提交过就换成结果。 -->
+      <form v-if="canRate" class="cs-rate" @submit.prevent="submitRating">
+        <p>这次服务怎么样？</p>
+        <div class="cs-stars">
+          <button v-for="n in [1, 2, 3, 4, 5]" :key="n" type="button"
+            :class="{ on: score !== null && n <= score }" :title="`${n} 分`" @click="score = n">
+            <Star :size="18" />
+          </button>
+          <!-- 0 分单独一个按钮：星星画不出「零颗星」，而 0 和「没评价」是两件不同的事。 -->
+          <button type="button" class="cs-zero" :class="{ on: score === 0 }" @click="score = 0">0 分</button>
+        </div>
+        <input v-model="ratingComment" maxlength="500" placeholder="想说的话（可选）">
+        <button class="fluent-primary" :disabled="score === null || rating">
+          {{ rating ? '提交中…' : '提交评价' }}
+        </button>
+      </form>
+      <p v-else-if="thread.session.value?.rated_at" class="cs-rated">
+        <Star :size="14" />已评价 {{ thread.session.value.rating }} / 5
+      </p>
     </section>
   </transition>
 

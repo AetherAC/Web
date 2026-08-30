@@ -1,3 +1,7 @@
+-- 这个文件建完表和策略就结束了，定时任务不在里面：跑完它之后还要单独跑一次 supabase/cron.sql，
+-- 否则会话超时关闭、心跳失联下线、站内信自动归档、§10.5 的退款审批升级这四件事永远不会发生——而建库
+-- 本身看起来完全成功。分成两个文件的理由写在 cron.sql 开头（那里第一句 create extension pg_cron 在
+-- 装不上的实例上会失败，写在这里会把下面几百行表结构一起回滚）。
 create extension if not exists pgcrypto;
 create schema if not exists private;
 drop table if exists public.site_admins cascade;
@@ -333,10 +337,15 @@ create table if not exists public.cs_sessions (
   agent_id uuid references auth.users(id) on delete set null,
   status text not null default 'open' check (status in ('open','closed')),
   subject text not null default '',
-  -- §2.10 管理员介入的三种模式。none = 没有管理员在看。normal 是管理员以自己的身份进来一起说话；
-  -- readonly 把客服降为只读（能看不能发）；blind 让客服彻底看不见这个会话的后续，由管理员接管。
-  admin_mode text not null default 'none' check (admin_mode in ('none','normal','readonly','blind')),
+  -- §2.10 管理员介入。只剩两种，而且都不改变谁看得见什么——它只决定管理员说的话署谁的名：
+  -- normal 署接待客服的名（真作者进 cs_messages.authored_by），blind 署管理员自己的名。
+  -- blind 是默认值，所以它不能再有「客服看不见这个会话」的含义：那会让每个新会话在待接入队列里就是隐形的。
+  -- 可见性判断见下面的 private.can_see_session / private.can_post_session，那两个函数里已经没有 admin_mode。
+  admin_mode text not null default 'blind' check (admin_mode in ('normal','blind')),
   admin_id uuid references auth.users(id) on delete set null,
+  -- 会话结束后用户给客服打的分（0~5）。rated_at 非空即已评过，只能评一次。
+  rating smallint check (rating is null or (rating >= 0 and rating <= 5)),
+  rating_comment text not null default '', rated_at timestamptz,
   -- §2.13 的两个率，落在会话行上而不是每次去 messages 里算：看板要按天聚合，扫消息表太贵。
   first_response_seconds integer, timed_out boolean not null default false,
   last_user_message_at timestamptz, last_agent_message_at timestamptz,
@@ -354,6 +363,20 @@ create index if not exists cs_sessions_agent_idx on public.cs_sessions(agent_id,
 create index if not exists cs_sessions_queue_idx on public.cs_sessions(channel,created_at) where status='open' and agent_id is null;
 create index if not exists cs_sessions_order_idx on public.cs_sessions(order_id) where order_id is not null;
 create index if not exists cs_sessions_user_idx on public.cs_sessions(user_id,created_at desc);
+-- 上面那段 DDL 只在建表时生效，已经存在的库要靠这几行迁移过来。旧的 none / readonly 一律折成 blind：
+-- none 的语义（还没人介入）现在由 admin_id 为空表达，readonly 整个取消了。
+alter table public.cs_sessions add column if not exists rating smallint;
+alter table public.cs_sessions add column if not exists rating_comment text not null default '';
+alter table public.cs_sessions add column if not exists rated_at timestamptz;
+alter table public.cs_sessions drop constraint if exists cs_sessions_rating_check;
+alter table public.cs_sessions add constraint cs_sessions_rating_check
+  check (rating is null or (rating >= 0 and rating <= 5));
+alter table public.cs_sessions alter column admin_mode drop default;
+alter table public.cs_sessions drop constraint if exists cs_sessions_admin_mode_check;
+update public.cs_sessions set admin_mode='blind' where admin_mode in ('none','readonly');
+alter table public.cs_sessions alter column admin_mode set default 'blind';
+alter table public.cs_sessions add constraint cs_sessions_admin_mode_check
+  check (admin_mode in ('normal','blind'));
 
 -- §2.11 撤回与编辑，以及为什么必须拆成两张表。
 --
@@ -377,7 +400,7 @@ create table if not exists public.cs_messages (
   auto_reply boolean not null default false, auto_reply_rule_id uuid,
   recalled boolean not null default false, recalled_at timestamptz,
   edited_at timestamptz, edit_count integer not null default 0,
-  -- §2.10 blind 模式下管理员以客服身份发言：sender_id 写客服，真作者记在这里。用户看不出差别，审计看得出。
+  -- §2.10 normal 模式下管理员以客服身份发言：sender_id 写客服，真作者记在这里。用户看不出差别，审计看得出。
   authored_by uuid references auth.users(id) on delete set null,
   -- 介入本身的记录（谁进来了、切了哪个模式）不给用户看，所以要能逐条控制对用户的可见性。
   visible_to_user boolean not null default true,
@@ -541,22 +564,24 @@ language sql stable security definer set search_path = public, pg_temp as $$
     when 'presale' then ch = 'presale' when 'postsale' then ch = 'postsale'
     else false end
 $$;
--- 会话可见性。§2.10 的 blind 模式在这里生效：管理员接管后原客服连会话都看不见。这是「客服彻底看不见」
--- 唯一说得通的实现处——只做在界面上的话，客服打开控制台就能把全部消息读回来。
+-- 会话可见性。这里没有 admin_mode 是有意的：§2.10 的介入只决定管理员署谁的名，不再遮挡任何人（见
+-- cs_sessions.admin_mode 的注释——blind 成了默认值之后再遮挡，新会话在待接入队列里就全是隐形的）。
+-- 这个函数是可见性唯一说得通的实现处：只做在界面上的话，客服打开控制台就能把全部消息读回来。
 create or replace function private.can_see_session(sid uuid) returns boolean
 language sql stable security definer set search_path = public, pg_temp as $$
   select exists(select 1 from public.cs_sessions s where s.id = sid and (
     s.user_id = (select auth.uid()) or (select private.is_admin())
-    or (s.agent_id = (select auth.uid()) and s.admin_mode <> 'blind')
+    or s.agent_id = (select auth.uid())
     -- 待分配的会话要让有资格的客服看见，否则工作台里没有可接的单。
-    or (s.agent_id is null and s.admin_mode <> 'blind' and (select private.serves_channel(s.channel)))))
+    or (s.agent_id is null and (select private.serves_channel(s.channel)))))
 $$;
--- 能不能发言，比可见更严：readonly 下客服只读（§2.10），已关闭的会话谁都不能再发（§2.5，重开是另一个动作）。
+-- 能不能发言，比可见更严：已关闭的会话谁都不能再发（§2.5，重开是另一个动作），而且旁观的客服
+-- （会话还没分配给他）也不能替接待客服说话。
 create or replace function private.can_post_session(sid uuid) returns boolean
 language sql stable security definer set search_path = public, pg_temp as $$
   select exists(select 1 from public.cs_sessions s where s.id = sid and s.status = 'open' and (
     s.user_id = (select auth.uid()) or (select private.is_admin())
-    or (s.agent_id = (select auth.uid()) and s.admin_mode not in ('blind','readonly'))))
+    or s.agent_id = (select auth.uid())))
 $$;
 -- 安全的 uuid 转换。存储策略要从对象路径里取会话 id，而 `'foo'::uuid` 是抛异常而不是返回 null——
 -- 直接裸转的话，用户传一个路径不合规的文件拿到的是一句 SQL 报错而不是一次干净的拒绝，
@@ -917,6 +942,43 @@ grant insert,update on public.notification_receipts to authenticated;
 grant insert(user_id,online,last_heartbeat,status_note) on public.cs_agents to authenticated;
 grant update(online,last_heartbeat,status_note) on public.cs_agents to authenticated;
 -- 故意不给的：cs_sessions、cs_messages、cs_message_revisions、cs_session_events、order_status_log、refund_audit_log、coupon_redemptions 都没有 insert/update。它们只由 service client 写（见上面 cs_* 策略那段注释），日志和审计流水更是只能追加不能改——能改的审计日志不叫审计日志。
+
+-- --- Realtime 发布 --------------------------------------------------------------------------------
+-- 客服那套东西的「实时」全靠 postgres_changes：用户端挂件订阅自己那条会话（cs.ts 的 subscribe），
+-- 工作台订阅整张 cs_sessions（CsPage.vue 的 subscribeList），会话被关掉时两端都要立刻知道。
+--
+-- 而订阅的前提是这两张表在 supabase_realtime 这个发布里。这件事以前只在 Supabase 控制台上点过——
+-- 也就是说它不在这个文件里，于是任何一次「照 schema.sql 重建一个环境」都会得到一套安静的实时功能：
+-- 订阅本身成功（频道状态是 SUBSCRIBED），只是永远收不到行。没有报错，表现是「客服延迟很高」。
+--
+-- 写成 do 块而不是裸的 alter publication：
+--   - 已经在发布里的表再 add 一次是 42710 错误，那会让整个文件在重跑时断在这里。
+--   - 发布本身可能不存在（自建 Postgres、或者被删过），那时候 alter 是 42704。存在与否分开判。
+-- 权限也留一句：Realtime 的 RLS 判定走 authenticated 这个角色，它读不到行就等于没有推送；上面那句
+-- `grant select on all tables in schema public to authenticated` 已经给了，这里只是说明为什么不能收掉。
+do $$
+begin
+  if not exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    raise notice 'supabase_realtime 发布不存在，跳过：这套部署上的实时推送需要另行配置';
+    return;
+  end if;
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'cs_sessions'
+  ) then
+    alter publication supabase_realtime add table public.cs_sessions;
+  end if;
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'cs_messages'
+  ) then
+    alter publication supabase_realtime add table public.cs_messages;
+  end if;
+end $$;
+-- 撤回和编辑推的是 UPDATE。默认的 replica identity 只带主键，够用——两端收到推送后一律回接口重新取
+-- （cs.ts 里 refresh()，工作台里 scheduleReload()），从来不直接用推来的那一行：推来的是原始数据库行，
+-- 里面有撤回后的空壳和 visible_to_user=false 的内部消息，直接渲染就是把内部消息发给用户看。
+-- 所以这里不设 replica identity full——那只会让 WAL 里多出一份不会被人读的旧行。
 
 insert into public.payment_providers(id,display_name,secret_env_names,instructions,sort_order) values
 ('moonpay','MoonPay',array['MOONPAY_API_KEY','MOONPAY_SECRET_KEY','MOONPAY_WEBHOOK_SECRET'],'1. Create a MoonPay business account and obtain API/signing keys. 2. Add the listed secrets in Environment. 3. Configure checkout_url_template for the MoonPay widget, including order_id and callback_url. 4. Register /v1/callback/moonpay and set webhook_signature_header/webhook_secret_env. 5. Test in sandbox before enabling.',10),

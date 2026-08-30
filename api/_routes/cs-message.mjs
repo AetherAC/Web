@@ -15,7 +15,7 @@ import {
   MESSAGE_MAX_CHARS, prepareMessage, presentMessage, sessionCapabilities, uploadLimits
 } from '../../shared/cs.mjs'
 import {
-  CS_SETTING_KEYS, clientConfig, deliverAutoReply, insertMessage, logEvent,
+  CS_SETTING_KEYS, clientConfig, decorateSession, deliverAutoReply, insertMessage, logEvent,
   settingsOf, touchSession, verifyAttachments
 } from '../_lib/cs.mjs'
 
@@ -28,9 +28,13 @@ const MUTABLE_WINDOW_MS = 2 * 60 * 1000
 const MESSAGE_COLUMNS = 'id,session_id,sender_id,sender_role,body,format,attachments,auto_reply,' +
   'auto_reply_rule_id,authored_by,visible_to_user,recalled,recalled_at,edited_at,edit_count,created_at'
 
+// rating/rated_at 在这里看着与消息无关，但 sessionCapabilities 用 rated_at 判 can_rate，
+// 而这个接口的响应里带着 capabilities——不取的话，用户关掉会话后打开对话框看到的是「还能评价」，
+// 点下去才被 409 顶回来。
 async function loadSession(db, id) {
   const { data, error } = await db.from('cs_sessions')
-    .select('id,channel,user_id,order_id,agent_id,status,admin_mode,admin_id,first_response_seconds,opened_at,created_at')
+    .select('id,channel,user_id,order_id,agent_id,status,admin_mode,admin_id,' +
+      'rating,rating_comment,rated_at,first_response_seconds,opened_at,created_at')
     .eq('id', id).maybeSingle()
   if (error) throw new Error(`读取会话失败：${error.message}`)
   return data || null
@@ -72,15 +76,21 @@ export async function listMessages(db, auth, input) {
 
   const messages = (rows || []).map(row => presentMessage(
     row, auth, revisions ? revisions.filter(r => r.message_id === row.id) : null))
-  return { status: 200, body: { session, capabilities: caps, messages } }
+  // 这个接口是两侧唯一每次都会拉的东西（Realtime 推送之后前端也回到这里），所以显示名挂在它的响应上：
+  // 用户要看到接待自己的客服叫什么，客服要看到用户叫什么，而两边的浏览器都被 profiles_read 挡在外面。
+  const decorated = await decorateSession(db, session, { staff: rankOf(auth.group) >= RANK.STAFF })
+  return { status: 200, body: { session: decorated, capabilities: caps, messages } }
 }
 
 /**
  * §2/§4：发一条消息。
  *
- * 客服身份的判定要注意一处：管理员在 normal 或 readonly 模式下介入时，消息以接待客服的名义发出
- * （§2.10「客服正常可见」意味着客服看到的对话要连贯），真实作者记在 authored_by 上。blind 模式下
- * 客服看不到这个会话，那时消息以管理员自己的名义发，因为没有「让客服显得在说话」的必要。
+ * 客服身份的判定要注意一处：管理员在「正常介入」（normal）下发言时，消息以接待客服的名义发出，
+ * 真实作者记在 authored_by 上——用户看到的对话要从头到尾是同一个人在回。「管理员介入」（blind）
+ * 下他署自己的名，因为那时介入本身就是要让用户知道换了人。
+ *
+ * 两种模式都不影响谁能看见这个会话（§2.10 简化之后可见性和 admin_mode 无关），所以下面只有署名一处
+ * 在读 admin_mode。
  */
 export async function sendMessage(db, auth, input) {
   const sessionId = String(input?.session_id || '')
@@ -112,8 +122,11 @@ export async function sendMessage(db, auth, input) {
 
   const staff = rankOf(auth.group) >= RANK.STAFF
   const asAdmin = caps.is_admin && !caps.is_owner
-  // 管理员用接待客服的身份说话，除了 blind（那时客服根本看不见这个会话）。
-  const speakAsAgent = asAdmin && session.agent_id && session.admin_mode !== 'blind'
+  // 「正常介入」时管理员借接待客服的身份说话；「管理员介入」（blind）时署自己的名。
+  // 没有接待客服可借的时候（会话还在队列里）也只能署自己的名。
+  // 写成 === 'normal' 而不是 !== 'blind'：两种模式之外的任何值（旧库里遗留的 none/readonly）
+  // 都该退到「署自己的名」这一侧，而不是悄悄借用客服的身份。
+  const speakAsAgent = asAdmin && Boolean(session.agent_id) && session.admin_mode === 'normal'
   const senderRole = caps.is_owner ? 'user' : (speakAsAgent ? 'agent' : (asAdmin ? 'admin' : 'agent'))
   const senderId = speakAsAgent ? session.agent_id : auth.userId
 
@@ -290,7 +303,7 @@ export async function markRead(db, auth, input) {
 /**
  * §7 打字状态。不落库——存一张表意味着每次按键一次写入，而这个信号的寿命是两秒。
  * 走 Realtime 的 broadcast 通道（前端直接 send），这里只回一次能不能发的判定，
- * 免得前端自己去解 admin_mode 的三种模式。
+ * 免得前端自己去算一遍「谁在这个会话里能说话」。
  */
 export async function typingGate(db, auth, input) {
   const sessionId = String(input?.session_id || '')

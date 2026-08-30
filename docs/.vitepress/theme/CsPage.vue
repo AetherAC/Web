@@ -7,13 +7,14 @@
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  BarChart3, CircleDot, Coins, Eye, EyeOff, Gift, Inbox, ListChecks, Radio,
-  RefreshCw, ShieldAlert, Undo2, Users, Wallet, X
+  BarChart3, CircleDot, Coins, EyeOff, Gift, Inbox, ListChecks, Radio,
+  RefreshCw, ShieldAlert, Star, Users, Wallet, X
 } from 'lucide-vue-next'
 import SiteHeader from './SiteHeader.vue'
 import CsThread from './CsThread.vue'
-import { useAuth } from './auth'
+import { supabase, useAuth } from './auth'
 import { csApi, csTime, useCsPresence, useCsThread } from './cs'
+import { ADMIN_MODES, ADMIN_MODE_LABEL } from '../../../shared/cs.mjs'
 import { orderPath } from './routes'
 
 const auth = useAuth()
@@ -31,8 +32,8 @@ const active = ref<string | null>(null)
 const message = ref('')
 const loading = ref(false)
 const includeClosed = ref(false)
-const filters = ref<{ channel: string; status: string; unassigned: boolean }>(
-  { channel: '', status: 'open', unassigned: false })
+const filters = ref<{ channel: string; status: string; unassigned: boolean; excludeMine: boolean }>(
+  { channel: '', status: 'open', unassigned: false, excludeMine: false })
 
 /** 侧栏的动作面板：券、退款、订单。三者都在 cs-actions 上。 */
 const orders = ref<any[]>([])
@@ -53,15 +54,28 @@ const tabs = computed(() => [
 ])
 
 const CHANNEL_LABEL: Record<string, string> = { presale: '售前', postsale: '售后' }
-const MODE_LABEL: Record<string, string> = {
-  none: '无介入', normal: '正常介入', readonly: '只读介入', blind: '隐身介入'
-}
+// 介入模式的中文名从 shared/cs.mjs 来，不在这里再抄一份：抄一份的下场就是上一版——那里已经只剩
+// normal/blind 两种，这里还画着四个按钮，其中两个点下去必然被接口 400。
+const MODE_LABEL: Record<string, string> = ADMIN_MODE_LABEL
 
 const current = computed(() => sessions.value.find(s => s.id === active.value) || null)
 const caps = computed(() => thread.capabilities.value)
-const readonly = computed(() =>
-  // §2.10 只读介入：管理员看得到、发不了。用户和客服都不受影响。
-  !!caps.value?.is_admin && !caps.value?.is_agent && thread.session.value?.admin_mode === 'readonly')
+// §2.10 的介入现在只决定管理员署谁的名，不再有「只读」这一档，所以工作台里也没有「看得到发不了」
+// 这个状态了。介入过的痕迹看 admin_id：blind 是每个会话的默认值，按 admin_mode 判会给每一行都挂上标签。
+const intervened = computed(() => Boolean(thread.session.value?.admin_id))
+
+/**
+ * 介入模式那一排按钮出不出来。
+ *
+ * 三个条件缺一不可：
+ *   - 是管理员。介入是 §2.10 的管理员动作，客服看到这排按钮只会点出 403。
+ *   - 停在「全部会话」页。「待接入」和「我的会话」这两页是管理员当客服用的——在那里他是接待人本身，
+ *     介入的对象是别人的会话，不是自己正在接的这条。
+ *   - 这条会话不在自己手上。分给自己的会话里「以谁的名义说话」没有第二种答案：署名只能是他自己，
+ *     切 normal/blind 不改变任何东西，留着按钮反而让人以为切过去会有区别。
+ */
+const canIntervene = computed(() => auth.isAdmin.value && tab.value === 'all' &&
+  Boolean(thread.session.value) && thread.session.value.agent_id !== auth.user.value?.id)
 
 async function load() {
   loading.value = true
@@ -89,6 +103,10 @@ async function load() {
       if (filters.value.channel) params.set('channel', filters.value.channel)
       if (filters.value.status) params.set('status', filters.value.status)
       if (filters.value.unassigned) params.set('unassigned', '1')
+      // 「排除我的」。自己手上的会话在「我的会话」页已经有一份，管理员翻这一页找的是别人的。
+      // 服务端用 or(agent_id.is.null, agent_id.neq.我) 实现（见 cs-workbench 的 listAll）：单个 neq
+      // 会把 agent_id 为空的待接入会话一起筛掉，而那些恰好是这一页最需要看到的。
+      if (filters.value.excludeMine) params.set('exclude_mine', '1')
     }
     const data = await csApi(`/api/cs-workbench?${params}`)
     sessions.value = data.sessions || []
@@ -140,7 +158,7 @@ async function close(row: any) {
   } catch (e: any) { message.value = e.message }
 }
 
-/** §2.10 三种介入模式。切到 blind 时客服那侧的列表里这条会话会消失。 */
+/** §2.10 两种介入模式。切换只改管理员发言时署谁的名，不影响客服能不能看到这条会话。 */
 async function setMode(mode: string) {
   if (!thread.session.value) return
   try {
@@ -191,10 +209,18 @@ async function startRefund() {
   } catch (e: any) { message.value = e.message }
 }
 
-/** §5 会话侧栏里的订单信息。 */
-async function loadOrders() {
+/**
+ * §5 会话侧栏里的订单信息。
+ *
+ * 和优惠券、退款一样是个 toggle：三个按钮长在同一排、面板长在同一个位置，其中两个能点第二次收起、
+ * 第三个不能，那不是三个按钮而是两种按钮。再点一次就收起，收起时不再请求。
+ */
+async function toggleOrders() {
   if (!thread.session.value) return
+  if (panel.value === 'orders') { panel.value = ''; return }
   panel.value = 'orders'
+  // 已经取过就不再取：切走再切回来时那份数据没有过期的理由，而每次都取的表现是面板闪一下空白。
+  if (orders.value.length) return
   try {
     const data = await csApi('/api/cs-actions', {
       method: 'POST',
@@ -218,6 +244,9 @@ watch(() => auth.ready.value, async ready => {
   presence.start()
   await load()
   await openFromQuery()
+  // 订阅放在登录确认之后：Realtime 带的是当前的 access token，没登录时订上去的频道会被 RLS 拒掉，
+  // 而被拒的频道不会自己重试。
+  subscribeList()
 }, { immediate: true })
 
 /**
@@ -238,11 +267,73 @@ async function openFromQuery() {
   try { await thread.attach(id) } catch (e: any) { message.value = e.message; active.value = null }
 }
 
-// 列表要跟着新会话动。轮询而不是订阅：cs_sessions 的 RLS 让客服只看得到分给自己的行，
-// 待接入队列里那些 agent_id 为 null 的行推不过来，所以队列这一侧只能问。
-let timer: any = null
-onMounted(() => { timer = setInterval(() => { if (!loading.value) load() }, 20000) })
-onUnmounted(() => { if (timer) clearInterval(timer) })
+/**
+ * 列表的新鲜度（item 2：客服服务延迟太高）。
+ *
+ * 原来是一个 20 秒的定时器。它的代价不只是「慢半拍」：一条新会话平均要等十秒才出现在队列里，
+ * 而那十秒一秒不少地记进 §2.13 的首响统计——看板上的响应时间里有一段是工作台自己造的。
+ *
+ * 原来那句注释说「cs_sessions 的 RLS 让客服只看得到分给自己的行，待接入队列里 agent_id 为 null 的
+ * 行推不过来」——那是错的。private.can_see_session 里明写着：
+ *
+ *     or (s.agent_id is null and (select private.serves_channel(s.channel)))
+ *
+ * 待接入的行本来就对有资格的客服可见，所以它们同样推得过来。改成推送为主、轮询兜底：
+ *   - 兜底轮询留着，但放慢到 60 秒，而且只在页面可见时跑。推送会漏（断线重连之间的空窗），
+ *     而漏掉的表现是队列里少一条会话、页面上没有任何提示。
+ *   - 标签页切回来先刷一次：后台标签的定时器会被浏览器压到分钟级，回来时看到的可能是几分钟前的列表。
+ */
+let listChannel: any = null
+let reloadTimer: any = null
+let pollTimer: any = null
+
+/**
+ * 把一串推送合并成一次刷新。
+ *
+ * 关一条会话会同时推 cs_sessions 的 UPDATE 和 cs_messages 的 INSERT（那条系统消息），接一条会话也是两条。
+ * 每条都直接 load() 的话，一个动作打两次接口，而两次的结果一样。
+ */
+function scheduleReload(delay = 500) {
+  if (reloadTimer) return
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null
+    if (!loading.value) load()
+  }, delay)
+}
+
+/**
+ * 订阅列表相关的行变化。
+ *
+ * 只订阅、不把推来的行拼进 sessions——推过来的是原始数据库行，没有 user_name、没有 last_message，
+ * 也没有经过 decorate；拼进去的结果是列表里出现一条没有称呼的会话。推送只当「该刷新了」的信号。
+ */
+function subscribeList() {
+  if (!supabase || listChannel) return
+  listChannel = supabase.channel('cs:workbench')
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'cs_sessions' }, () => scheduleReload())
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cs_messages' }, () => scheduleReload())
+    .subscribe()
+}
+
+function onVisibility() {
+  if (typeof document === 'undefined' || document.visibilityState !== 'visible') return
+  scheduleReload(0)
+}
+
+onMounted(() => {
+  pollTimer = setInterval(() => {
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+    if (!loading.value) load()
+  }, 60000)
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+})
+
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
+  if (reloadTimer) clearTimeout(reloadTimer)
+  if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
+  if (listChannel && supabase) { supabase.removeChannel(listChannel); listChannel = null }
+})
 </script>
 <template>
 <div class="fluent-page admin-page">
@@ -375,6 +466,8 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
                   <option value="open">进行中</option><option value="closed">已关闭</option><option value="">全部</option>
                 </select>
                 <label class="check-label"><input v-model="filters.unassigned" type="checkbox" @change="load">仅无人接</label>
+                <!-- 「排除我的」：自己手上那些在「我的会话」页已经有一份，这一页找的是别人的。 -->
+                <label class="check-label"><input v-model="filters.excludeMine" type="checkbox" @change="load">排除我的</label>
               </template>
             </span>
           </div>
@@ -390,7 +483,8 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
                 {{ row.user_name || row.user_id.slice(0, 8) }}
                 <em class="cs-tag">{{ CHANNEL_LABEL[row.channel] || row.channel }}</em>
                 <em v-if="row.unread_from_user" class="cs-tag unread">{{ row.unread_from_user }} 条未读</em>
-                <em v-if="row.admin_mode && row.admin_mode !== 'none'" class="cs-tag mode">{{ MODE_LABEL[row.admin_mode] }}</em>
+                <em v-if="row.admin_id" class="cs-tag mode">{{ MODE_LABEL[row.admin_mode] || row.admin_mode }}</em>
+                <em v-if="row.rated_at" class="cs-tag rating">{{ row.rating }} 分</em>
               </b>
               <small>
                 {{ row.last_message?.body || '（还没有消息）' }}
@@ -425,26 +519,36 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
               </h2>
             </div>
             <div class="cs-detail-actions">
-              <button title="订单信息" @click="loadOrders"><Wallet :size="17" /></button>
-              <button title="发优惠券" @click="panel = panel === 'coupon' ? '' : 'coupon'"><Gift :size="17" /></button>
+              <button title="订单信息" :class="{ on: panel === 'orders' }" @click="toggleOrders"><Wallet :size="17" /></button>
+              <button title="发优惠券" :class="{ on: panel === 'coupon' }"
+                @click="panel = panel === 'coupon' ? '' : 'coupon'"><Gift :size="17" /></button>
               <button v-if="thread.session.value.order_id || auth.isAdmin.value" title="发起退款"
+                :class="{ on: panel === 'refund' }"
                 @click="panel = panel === 'refund' ? '' : 'refund'"><Coins :size="17" /></button>
             </div>
           </header>
 
-          <!-- §2.10 管理员介入模式 -->
-          <div v-if="auth.isAdmin.value" class="cs-modes">
+          <!-- §2.10 管理员介入模式。只在「全部会话」里、且这条会话不在自己手上时才出现，见 canIntervene。 -->
+          <div v-if="canIntervene" class="cs-modes">
             <span>介入模式</span>
-            <button v-for="m in ['none', 'normal', 'readonly', 'blind']" :key="m"
-              :class="{ on: thread.session.value.admin_mode === m }" @click="setMode(m)">
-              <component :is="m === 'blind' ? EyeOff : m === 'readonly' ? Eye : m === 'none' ? Undo2 : Radio" :size="15" />
+            <button v-for="m in ADMIN_MODES" :key="m"
+              :class="{ on: intervened && thread.session.value.admin_mode === m }" @click="setMode(m)">
+              <component :is="m === 'blind' ? EyeOff : Radio" :size="15" />
               {{ MODE_LABEL[m] }}
             </button>
             <small>
-              正常介入：以接待客服的名义发言，客服看得到。只读：只看不发。
-              隐身：客服看不到这条会话，消息以管理员名义发出。
+              两种模式都不影响谁看得见这条会话，差别只有一处：正常介入时你说的话署接待客服的名，
+              用户看到的还是同一个人在回；管理员介入时署你自己的名。真实作者两种情况下都记在审计里。
+              <template v-if="!intervened">还没有人介入过这条会话。</template>
             </small>
           </div>
+
+          <!-- §2.14 用户给这次服务打的分。只在会话关闭且用户评过之后才有。 -->
+          <p v-if="thread.session.value.rated_at" class="cs-rating-view">
+            <Star :size="15" />
+            用户评分 {{ thread.session.value.rating }} / 5
+            <template v-if="thread.session.value.rating_comment">· {{ thread.session.value.rating_comment }}</template>
+          </p>
 
           <form v-if="panel === 'coupon'" class="cs-action-form" @submit.prevent="sendCoupon">
             <label class="field"><span>券模板 ID</span>
@@ -476,7 +580,7 @@ onUnmounted(() => { if (timer) clearInterval(timer) })
             </a>
           </div>
 
-          <CsThread :thread="thread" staff :readonly="readonly" placeholder="回复用户…" />
+          <CsThread :thread="thread" staff placeholder="回复用户…" />
         </section>
         <div v-else-if="sessions.length" class="fluent-empty cs-detail-empty">
           <Inbox :size="28" /><h2>选择一条会话</h2>

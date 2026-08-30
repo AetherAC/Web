@@ -7,7 +7,9 @@
  * 仍然显示原文——那正是 §2.11 要防的。
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { CornerUpLeft, Download, Eye, Image as ImageIcon, Paperclip, Pencil, Send, Undo2, X } from 'lucide-vue-next'
+import {
+  CornerUpLeft, Download, Eye, Image as ImageIcon, Paperclip, Pencil, Send, Undo2, X
+} from 'lucide-vue-next'
 import { renderRichBody } from './markdown'
 import { csTime, formatBytes, mutable, type CsMessage } from './cs'
 import { useAuth } from './auth'
@@ -17,8 +19,6 @@ const props = defineProps<{
   /** staff 侧多出撤回原文、编辑历史、内部消息这些东西。 */
   staff?: boolean
   placeholder?: string
-  /** readonly 模式下管理员只看不发（§2.10）。 */
-  readonly?: boolean
 }>()
 
 const auth = useAuth()
@@ -34,19 +34,49 @@ const imageInput = ref<HTMLInputElement | null>(null)
 const messages = computed<CsMessage[]>(() => props.thread.messages.value)
 const config = computed(() => props.thread.config.value)
 const session = computed(() => props.thread.session.value)
-const canPost = computed(() => props.thread.canPost.value && !props.readonly)
+const canPost = computed(() => props.thread.canPost.value)
 const myId = computed(() => auth.user.value?.id)
+/** 看这条会话的人站在哪一侧。用户端只有一种，客服端包括接待客服和在旁边看的管理员。 */
+const ownerSide = computed(() => !!props.thread.isOwner.value)
 
-/** 自己发的靠右。管理员以客服名义发的那条，客服看到的也是「自己发的」——那是 §2.10 的本意。 */
-const isMine = (m: CsMessage) => !!myId.value && m.sender_id === myId.value
+/**
+ * 靠右显示的是「我这一侧」发的，而不是「我这个账号」发的。
+ *
+ * 按 sender_id 比对会漏掉两种消息，而它们都该在右边：自动回复挂在接待客服名下（还没分配到人时
+ * sender_id 干脆是空的），以及管理员在会话里说的话——客服那一侧的对话框里，那些都是「我们这边发出去的」。
+ * 漏掉的表现是客服看着自己那条自动回复站在对面说话。
+ *
+ * 站哪一侧和署谁的名是两件事，所以称呼由 roleName 单独算：管理员的消息在客服那侧靠右，但标的是「管理员」。
+ */
+const isMine = (m: CsMessage) => (ownerSide.value
+  ? m.sender_role === 'user'
+  : m.sender_role === 'agent' || m.sender_role === 'admin' || m.sender_role === 'auto')
+const isMyAccount = (m: CsMessage) => !!myId.value && m.sender_id === myId.value
 const isSystem = (m: CsMessage) => m.sender_role === 'system'
 
 const ROLE_LABEL: Record<string, string> = {
-  user: '我', agent: '客服', admin: '管理员', system: '系统', auto: '自动回复'
+  user: '用户', agent: '客服', admin: '管理员', system: '系统', auto: '自动回复'
 }
+
+/**
+ * 气泡上的称呼。
+ *
+ * 「我」只出现在真的是自己那个账号发的消息上。ROLE_LABEL.user 原来是「我」，于是客服打开对话时，
+ * 用户说的每一句都标着「我」——两个人的话看起来都是同一个人说的。
+ *
+ * 名字优先用接口带回来的 agent_name / user_name：浏览器查不到对面叫什么（profiles_read 只让人读自己
+ * 那一行），所以那两个字段是唯一来源，取不到时退回身份名。
+ */
 const roleName = (m: CsMessage) => {
-  if (isMine(m)) return '我'
   if (m.auto_reply) return '自动回复'
+  if (m.sender_role === 'user') return ownerSide.value ? '我' : (session.value?.user_name || '用户')
+  if (m.sender_role === 'admin') return isMyAccount(m) ? '我' : '管理员'
+  if (m.sender_role === 'agent') {
+    // 管理员在「正常介入」下代发的那条，sender_id 是接待客服自己——客服看到的就该是「我」（§2.10 的本意），
+    // 旁边的「代发」标记只给 staff 看。
+    if (!ownerSide.value && isMyAccount(m)) return '我'
+    return session.value?.agent_name || '客服'
+  }
   return ROLE_LABEL[m.sender_role] || m.sender_role
 }
 
@@ -59,15 +89,23 @@ function bodyHtml(m: CsMessage) {
   return renderRichBody(m.body, m.format)
 }
 
-/** 附件的签名 URL 是异步取的，取到之后填进这个 map，模板里按 path 取。 */
-async function ensureUrl(path: string) {
-  if (urls.value[path]) return
-  const url = await props.thread.signedUrl(path, 600)
-  if (url) urls.value = { ...urls.value, [path]: url }
+/**
+ * 附件的签名 URL。一批一起签，见 cs.ts 的 signedUrls。
+ *
+ * 逐个签的话，一条带十张图的消息是十次往返，而每张图都要等自己那次回来才开始下载——看起来就是
+ * 「图片加载很慢」。已经签过的不再签（cs.ts 那层还有一层缓存），撤回的消息不签：它的附件已经搬走了。
+ */
+async function ensureUrls(list: CsMessage[]) {
+  const paths = list
+    .flatMap(m => (m.recalled ? [] : (m.attachments || []).map(a => a.path)))
+    .filter(p => p && !urls.value[p])
+  if (!paths.length) return
+  const map = await props.thread.signedUrls(paths, 900)
+  if (Object.keys(map).length) urls.value = { ...urls.value, ...map }
 }
 
 watch(messages, list => {
-  for (const m of list) for (const a of m.attachments || []) ensureUrl(a.path)
+  ensureUrls(list)
   scrollDown()
 }, { deep: false })
 
@@ -78,7 +116,11 @@ function scrollDown() {
   })
 }
 
-onMounted(scrollDown)
+onMounted(() => {
+  // 组件挂载时列表可能已经有内容（工作台切回一条读过的会话），那时上面那个 watch 不会触发。
+  ensureUrls(messages.value)
+  scrollDown()
+})
 
 async function submit() {
   const text = draft.value
@@ -151,7 +193,7 @@ const timeoutHint = computed(() => {
           </header>
 
           <p v-if="m.recalled" class="cs-recalled">
-            {{ isMine(m) ? '你撤回了一条消息' : '对方撤回了一条消息' }}
+            {{ isMyAccount(m) ? '你撤回了一条消息' : '对方撤回了一条消息' }}
           </p>
           <div v-else-if="editing === m.id" class="cs-edit">
             <textarea v-model="editDraft" rows="3"></textarea>
@@ -165,7 +207,7 @@ const timeoutHint = computed(() => {
           <div v-if="m.attachments?.length && !m.recalled" class="cs-attachments">
             <template v-for="a in m.attachments" :key="a.path">
               <a v-if="a.kind === 'image'" class="cs-image" :href="urls[a.path]" target="_blank" rel="noopener">
-                <img v-if="urls[a.path]" :src="urls[a.path]" :alt="a.name">
+                <img v-if="urls[a.path]" :src="urls[a.path]" :alt="a.name" loading="lazy" decoding="async">
                 <span v-else>图片载入中…</span>
               </a>
               <video v-else-if="a.kind === 'video' && urls[a.path]" :src="urls[a.path]" controls preload="metadata"></video>
@@ -220,10 +262,10 @@ const timeoutHint = computed(() => {
     <span>{{ session?.timed_out ? '会话因超时已自动关闭' : '会话已关闭' }}</span>
     <slot name="closed-action" />
   </div>
-  <div v-else-if="!canPost" class="cs-closed">
-    <span>{{ readonly ? '只读介入：你可以看到对话，但不能发言' : '当前无法在此会话中发言' }}</span>
+  <div v-if="!thread.closed.value && !canPost" class="cs-closed">
+    <span>当前无法在此会话中发言</span>
   </div>
-  <form v-else class="cs-composer" @submit.prevent="submit">
+  <form v-else-if="!thread.closed.value" class="cs-composer" @submit.prevent="submit">
     <textarea v-model="draft" :maxlength="config.message_max_chars"
       :placeholder="placeholder || '输入消息，Enter 发送，Shift+Enter 换行'"
       rows="2" @keydown="keydown" @focus="config.typing_trigger === 'focus' && thread.notifyTyping()"></textarea>

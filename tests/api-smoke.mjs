@@ -73,6 +73,7 @@ import {
   AMOUNT_OPERATORS,
   CONDITION_TYPES,
   SKU_OPERATORS,
+  ZERO_DECIMAL_CURRENCIES,
   applyActions,
   checkAvailability,
   describeAction,
@@ -151,10 +152,12 @@ import syncHandler, { loginOf, resolveGroup } from '../api/_routes/sync-github-g
 // §2/§3/§4 客服。全部起 sx 前缀的别名：这个文件是一个平铺作用域，284 个顶层声明里已经有
 // markRead（站内信那个）、csRow、csBlocked，同名会是一句 SyntaxError 而不是一次失败的断言。
 import {
-  ADMIN_MODES as sxAdminModes, CHANNELS as sxChannels, MESSAGE_FORMATS as sxFormats,
+  ADMIN_MODES as sxAdminModes, CHANNELS as sxChannels, DEFAULT_ADMIN_MODE as sxDefaultMode,
+  MESSAGE_FORMATS as sxFormats, RATING_RANGE as sxRatingRange,
   attachmentKindOf as sxKindOf, attachmentPath as sxAttachPath,
   checkAttachmentSize as sxSize, dispatchPriority as sxDispatch, isHeartbeatStale as sxStale,
   isSessionIdle as sxIdle, matchesKeyword as sxMatch, normalizeAttachments as sxAttach,
+  normalizeRating as sxNormalizeRating,
   pickAgent as sxPick, pickAutoReply as sxPickReply, prepareMessage as sxPrepare,
   presentMessage as sxPresent, sanitizeHtml as sxClean, servesChannel as sxServes,
   sessionCapabilities as sxCaps, sessionMetrics as sxSessionMetrics,
@@ -167,7 +170,8 @@ import {
 } from '../api/_lib/cs.mjs'
 import {
   claimSession as sxClaimSession, closeSession as sxCloseSession, openSession as sxOpenSession,
-  reopenSession as sxReopenSession, setAdminMode as sxSetAdminMode, setPresence as sxSetPresence,
+  rateSession as sxRateSession, reopenSession as sxReopenSession,
+  setAdminMode as sxSetAdminMode, setPresence as sxSetPresence,
   sweepIdleSessions as sxSweep
 } from '../api/_routes/cs-session.mjs'
 import {
@@ -3427,7 +3431,8 @@ console.log('Coupons: OK')
 
   // §2.13 首响时间。这是 sessionTouchFor 存在的主要理由：自动回复不能计入首响。
   const sxSession = { id: 's1', channel: 'presale', user_id: 'u1', agent_id: 'a1', status: 'open',
-    admin_mode: 'none', first_response_seconds: null, opened_at: '2026-08-29T00:00:00.000Z' }
+    admin_mode: 'blind', rating: null, rated_at: null,
+    first_response_seconds: null, opened_at: '2026-08-29T00:00:00.000Z' }
   const sxAt = new Date('2026-08-29T00:00:30.000Z')
   const sxAuto = sxTouch(sxSession, { sender_role: 'agent', auto_reply: true }, sxAt)
   assert(sxAuto.first_response_seconds === undefined,
@@ -3466,39 +3471,70 @@ console.log('Coupons: OK')
   assert(sxSessionMetrics([]).reply_rate === 0, '空集合不能除零')
   assert(sxSessionMetrics([]).median_first_response_seconds === null, '空集合的中位数是 null，不是 0')
 
-  // §2.10 三种介入模式，必须和 SQL 里的两个门函数一致。
+  // §2.10 两种介入模式。这里要钉住的不是「模式做了什么」，而是「模式什么都不做」——介入只决定
+  // 管理员署谁的名（那部分在 sendMessage 的断言里），可见性一律与它无关。理由是 blind 现在是列默认值：
+  // 只要 can_see 还看 admin_mode，每一个新会话在待接入队列里就是隐形的，谁也接不了。
   const sxAdminViewer = { userId: 'admin-1', group: 'admin' }
   const sxAgentViewer = { userId: 'a1', group: 'presale' }
   const sxUserViewer = { userId: 'u1', group: 'default' }
   const sxOther = { userId: 'a2', group: 'presale' }
 
-  const sxCapsNone = sxCaps(sxSession, sxAgentViewer)
-  assert(sxCapsNone.can_see && sxCapsNone.can_post, 'none 模式下接待客服能看能发')
-  const sxReadonly = sxCaps({ ...sxSession, admin_mode: 'readonly' }, sxAgentViewer)
-  assert(sxReadonly.can_see && !sxReadonly.can_post, 'readonly：客服能看不能发')
-  const sxBlind = sxCaps({ ...sxSession, admin_mode: 'blind' }, sxAgentViewer)
-  assert(!sxBlind.can_see && !sxBlind.can_post, 'blind：客服彻底看不见')
-  assert(sxCaps({ ...sxSession, admin_mode: 'blind' }, sxAdminViewer).can_post, 'blind 下管理员仍能发')
-  assert(sxCaps({ ...sxSession, admin_mode: 'blind' }, sxUserViewer).can_post,
-    'blind 是对客服隐身，不是把用户也踢出自己的会话')
+  assert(sxAdminModes.join(',') === 'normal,blind', '§2.10 简化后只剩 normal 和 blind 两种介入模式')
+  assert(sxDefaultMode === 'blind' && sxAdminModes.includes(sxDefaultMode),
+    '默认是 blind——这正是任何基于 admin_mode 的遮挡都会遮住全部会话的原因')
+  assert(/default 'blind'/.test(schemaSql), 'schema.sql 的列默认值要和 DEFAULT_ADMIN_MODE 一致')
+  for (const mode of sxAdminModes) {
+    const modeSession = { ...sxSession, admin_mode: mode }
+    const sxModeAgent = sxCaps(modeSession, sxAgentViewer)
+    assert(sxModeAgent.can_see && sxModeAgent.can_post, `${mode}：接待客服照样能看能发`)
+    assert(sxCaps(modeSession, sxAdminViewer).can_post, `${mode}：管理员能发`)
+    assert(sxCaps(modeSession, sxUserViewer).can_post, `${mode}：用户在自己的会话里能发`)
+    assert(sxCaps({ ...modeSession, agent_id: null }, sxOther).can_claim,
+      `${mode}：未接入的会话同渠道客服都能接——按 admin_mode 拦一档就是一个永远空着的队列`)
+    assert(sxCaps({ ...modeSession, agent_id: null }, sxOther).can_see,
+      `${mode}：能接就必须能看，否则队列里是一行点得动但打不开的会话`)
+  }
   assert(!sxCaps(sxSession, sxOther).can_see, '别的客服看不到已被接走的会话')
-  assert(sxCaps({ ...sxSession, agent_id: null }, sxOther).can_claim, '未接入的会话同渠道客服可以接')
-  assert(!sxCaps({ ...sxSession, agent_id: null, admin_mode: 'blind' }, sxOther).can_claim,
-    'blind 的会话不该出现在任何人的队列里')
   assert(!sxCaps({ ...sxSession, status: 'closed' }, sxUserViewer).can_post, '关闭的会话不能发言')
   assert(sxCaps({ ...sxSession, status: 'closed' }, sxUserViewer).can_reopen, '关闭的会话用户能重开')
   assert(!sxCaps(sxSession, sxUserViewer).can_see_revisions,
     '用户看不到撤回原文和编辑历史——这是 §2.11 的全部内容')
   assert(sxCaps(sxSession, sxAgentViewer).can_see_revisions, '客服看得到')
 
+  // §2.14 打分的资格。三条都在 can_rate 里，因为界面要按它决定画不画那五颗星。
+  assert(!sxCaps(sxSession, sxUserViewer).can_rate, '会话还开着不能评价')
+  const sxClosedForUser = { ...sxSession, status: 'closed' }
+  assert(sxCaps(sxClosedForUser, sxUserViewer).can_rate, '关闭之后用户能评价')
+  assert(!sxCaps(sxClosedForUser, sxAgentViewer).can_rate, '客服不能给自己打分')
+  assert(!sxCaps(sxClosedForUser, sxAdminViewer).can_rate, '管理员也不行——这是用户对服务的评价')
+  assert(!sxCaps({ ...sxClosedForUser, rated_at: '2026-08-29T00:01:00.000Z', rating: 0 }, sxUserViewer).can_rate,
+    '评过就不能再评。判据是 rated_at 而不是 rating——按 rating 判会让一个 0 分的差评永远可以被改成 5 分')
+
+  // normalizeRating：0 是合法的差评，null/空串/超范围都不是。
+  assert(sxRatingRange[0] === 0 && sxRatingRange[1] === 5, '§2.14 的分数范围是 0~5')
+  assert(sxNormalizeRating(0) === 0, '0 分要活着走出来——落到假值分支就等于「没评价」')
+  assert(sxNormalizeRating(5) === 5 && sxNormalizeRating('3') === 3, '字符串数字也认')
+  assert(sxNormalizeRating(4.4) === 4 && sxNormalizeRating(4.6) === 5, '小数四舍五入')
+  // 这一串里 null / '' / [] / false 是同一个陷阱的四种写法：Number() 把它们全变成 0，而 0 是合法的差评。
+  // 混过去的后果不是一次报错，是一条 rated_at 已经写上、内容是「0 分」的记录，用户再也改不动。
+  for (const bad of [-1, 6, 'x', null, undefined, '', '   ', NaN, Infinity, -Infinity, true, false, [], {}]) {
+    assert(sxNormalizeRating(bad) === null, `${JSON.stringify(bad) ?? String(bad)} 不该被当成一个分数`)
+  }
+
   // 和 SQL 逐条对齐。这两个门函数是 RLS 的实现，JS 那边判松了就是接口放行而数据库拦住（前端报错），
   // 判紧了就是接口拦住而数据库放行（功能不可用）。两种都是 bug，所以要钉住同一份语义。
   const sxSeeSql = schemaSql.match(/create or replace function private\.can_see_session[\s\S]*?\$;/)[0]
   const sxPostSql = schemaSql.match(/create or replace function private\.can_post_session[\s\S]*?\$;/)[0]
-  assert(/admin_mode <> 'blind'/.test(sxSeeSql), 'can_see_session 里排除了 blind')
+  // 这两条是反向断言：admin_mode 一旦重新出现在门函数里，浏览器那侧的可见性就和 sessionCapabilities
+  // 分道扬镳了，而症状是「工作台列表里有这条会话，点开是一句 RLS 拒绝」。
+  assert(!/admin_mode/.test(sxSeeSql), 'can_see_session 里不能再有 admin_mode——blind 是默认值，遮一档就是遮全部')
+  assert(!/admin_mode/.test(sxPostSql), 'can_post_session 里不能再有 admin_mode')
   assert(/serves_channel/.test(sxSeeSql), 'can_see_session 用 serves_channel 判队列可见性')
   assert(/status = 'open'/.test(sxPostSql), 'can_post_session 要求会话是开着的')
-  assert(/not in \('blind','readonly'\)/.test(sxPostSql), 'can_post_session 里 readonly 和 blind 都不能发')
+  // 迁移那一段：已经存在的库里还躺着 none/readonly，不折成 blind 的话 CHECK 加不上去。
+  assert(/update public\.cs_sessions set admin_mode='blind' where admin_mode in \('none','readonly'\)/.test(schemaSql),
+    'schema.sql 要把旧的 none/readonly 折成 blind，否则新 CHECK 在有数据的库上直接失败')
+  assert(/check \(admin_mode in \('normal','blind'\)\)/.test(schemaSql), 'CHECK 要和 ADMIN_MODES 一致')
 
   // §2.11 撤回的呈现。撤回原文不在 cs_messages 行里——它被搬去 cs_message_revisions 了。
   const sxRecalled = { id: 'm1', body: '', recalled: true, sender_role: 'user', authored_by: 'admin-1' }
@@ -3599,7 +3635,9 @@ console.log('CS logic: OK')
   const sxMid = '55555555-5555-5555-5555-555555555555'
   const sxOpen = {
     id: sxSid, channel: 'presale', user_id: sxUid, order_id: null, agent_id: sxAid,
-    status: 'open', admin_mode: 'none', first_response_seconds: null, timed_out: false,
+    // admin_mode 的默认值是 blind（§2.10 简化之后），这条 fixture 跟着列默认值走：写 'none' 的话，
+    // 它测的是一个数据库里不可能存在的状态，而真正会出问题的那个状态（blind）反而没人测。
+    status: 'open', admin_mode: 'blind', first_response_seconds: null, timed_out: false,
     reopened_count: 0, opened_at: '2026-08-29T00:00:00.000Z', created_at: '2026-08-29T00:00:00.000Z'
   }
   const sxAsUser = { userId: sxUid, group: 'default' }
@@ -3673,12 +3711,12 @@ console.log('CS logic: OK')
 
   // §2.12 接入：必须带 is('agent_id', null)。两个客服同时点接入时只有一个能拿到行——
   // 先查再更新的写法会让两个人接到同一个会话，然后互相看着对方的回复。
-  const sxClaimDb = (load, cap) => recorder({
+  const sxClaimDb = (load, cap, row = null) => recorder({
     cs_sessions: entry => {
-      if (entry.op === 'update') return { data: { ...sxOpen, agent_id: 'me' }, error: null }
+      if (entry.op === 'update') return { data: { ...(row || sxOpen), agent_id: 'me' }, error: null }
       // 负载走 head+count，结果在 count 上而不是 data 上。
       if (entry.selectOpts?.count === 'exact') return { count: load, data: null, error: null }
-      return { data: { ...sxOpen, agent_id: null }, error: null }
+      return { data: { ...(row || sxOpen), agent_id: null }, error: null }
     },
     cs_agents: { data: { max_concurrent: cap }, error: null },
     cs_session_events: { data: null, error: null },
@@ -3707,11 +3745,12 @@ console.log('CS logic: OK')
     recorder({ cs_sessions: { data: { ...sxOpen, channel: 'postsale', agent_id: null }, error: null } }),
     { userId: 'me', group: 'presale' }, sxSid)
   assert(sxWrongChannel.status === 403, '售前客服不能接售后会话')
-  // blind 模式的会话已被管理员接管，不该还能被客服接走。
+  // blind 会话照样能接。这一条曾经反着写（「已被管理员接管，客服接不了」），§2.10 简化之后 blind 是列
+  // 默认值，于是那条规则的含义变成了「任何会话都接不了」——队列里每一行都点不动。
   const sxClaimBlind = await sxClaimSession(
-    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'blind', agent_id: null }, error: null } }),
+    sxClaimDb(1, null, { ...sxOpen, admin_mode: 'blind', agent_id: null }),
     { userId: 'me', group: 'presale' }, sxSid)
-  assert(sxClaimBlind.status === 403, 'blind 会话客服接不了')
+  assert(sxClaimBlind.status === 200, 'blind 是默认值，按它拦一档就是把整个待接入队列锁死')
 
   // §2.5 关闭：必须带 status='open'。少了它，一次重复点击会把 closed_at 覆盖成第二次点击的时间，
   // 而那条时间被 §2.13 用来算时长。
@@ -3803,33 +3842,102 @@ console.log('CS logic: OK')
   assert(sxModeByAgent.status === 403, '客服不能自己切介入模式')
   const sxBadMode = await sxSetAdminMode(recorder(), sxAsAdmin, sxSid, 'invisible')
   assert(sxBadMode.status === 400, '不认识的模式要拒绝，不能落库让 check 去报约束名')
+  // 旧的两种模式名现在也必须被拒。留着它们就是留着一条把 none/readonly 写回库里的路，
+  // 而那两个值过不了新的 CHECK——报出来的是一句约束名，不是人话。
+  for (const gone of ['none', 'readonly']) {
+    const sxGone = await sxSetAdminMode(recorder(), sxAsAdmin, sxSid, gone)
+    assert(sxGone.status === 400, `${gone} 已经不是一个模式了`)
+  }
   const sxDbMode = recorder({
     cs_sessions: entry => entry.op === 'update'
-      ? { data: { ...sxOpen, admin_mode: 'blind' }, error: null } : { data: sxOpen, error: null },
+      ? { data: { ...sxOpen, admin_mode: 'normal' }, error: null } : { data: sxOpen, error: null },
     cs_messages: { data: { id: sxMid, sender_role: 'admin' }, error: null },
     cs_session_events: { data: null, error: null }
   })
-  const sxMode = await sxSetAdminMode(sxDbMode, sxAsAdmin, sxSid, 'blind')
+  const sxMode = await sxSetAdminMode(sxDbMode, sxAsAdmin, sxSid, 'normal')
   assert(sxMode.status === 200, '管理员可以切')
   const sxModeUpd = sxDbMode.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
   assert(sxModeUpd.payload.admin_id === 'admin-1', '记下是哪个管理员在介入')
   const sxModeMsg = sxDbMode.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
   assert(sxModeMsg.payload.visible_to_user === false,
     '介入本身对用户不可见——可见就等于告诉用户「现在是管理员在替客服说话」')
+  assert(sxModeMsg.payload.sender_role === 'system',
+    '留痕是状态变更而不是发言：写成 admin 的话，管理员自己打开会话会看到一条署名「我」、内容是「我刚切了模式」的气泡')
   const sxModeEvt = sxDbMode.calls.find(c => c.table === 'cs_session_events' && c.op === 'insert')
-  assert(sxModeEvt.payload.detail?.from === 'none' && sxModeEvt.payload.detail?.to === 'blind',
-    '事件里记下从哪个模式切到哪个——只记「切过」查不出当时用户看不见的是哪一段')
+  assert(sxModeEvt.payload.detail?.from === 'blind' && sxModeEvt.payload.detail?.to === 'normal',
+    '事件里记下从哪个模式切到哪个——只记「切过」查不出当时用户看到的是谁的名字')
 
-  const sxDbModeNone = recorder({
+  // 切回 blind。这里曾经断言「切回 none 要把 admin_id 清掉」，而 §2.10 简化之后 blind 就是列默认值：
+  // 清掉 admin_id 会让「这条会话有没有人介入过」这个唯一的判据在一次切换里丢掉。
+  const sxDbModeBack = recorder({
     cs_sessions: entry => entry.op === 'update'
-      ? { data: sxOpen, error: null } : { data: { ...sxOpen, admin_mode: 'blind' }, error: null },
+      ? { data: sxOpen, error: null } : { data: { ...sxOpen, admin_mode: 'normal' }, error: null },
     cs_messages: { data: { id: sxMid }, error: null },
     cs_session_events: { data: null, error: null }
   })
-  const sxModeNone = await sxSetAdminMode(sxDbModeNone, sxAsAdmin, sxSid, 'none')
-  assert(sxModeNone.status === 200, '可以切回 none')
-  assert(sxDbModeNone.calls.find(c => c.op === 'update').payload.admin_id === null,
-    '切回 none 要把 admin_id 清掉，否则一个退出了的管理员一直显示在会话上')
+  const sxModeBack = await sxSetAdminMode(sxDbModeBack, sxAsAdmin, sxSid, 'blind')
+  assert(sxModeBack.status === 200, '可以切回 blind')
+  assert(sxDbModeBack.calls.find(c => c.op === 'update').payload.admin_id === 'admin-1',
+    'admin_id 一律写成切换的人，不清空：它是「有没有人介入过」的唯一判据，而 admin_mode 每一行都有值')
+
+  // --- §2.14 打分 --------------------------------------------------------------------------------
+  // 状态码的四档要分得开：400 是这个分数本身不合法，403 是不是你的会话，409 是「现在还不能评」或
+  // 「已经评过」。全都答同一个码的话，前端只能显示一句「提交失败」，而用户唯一能自己解决的那种
+  // （会话还没关，先关了再评）恰好被埋在里面。
+  const sxRatedRow = { ...sxWasClosed, rating: 4, rating_comment: '还行', rated_at: '2026-08-29T01:00:00.000Z' }
+  const sxRateDb = (row = sxWasClosed) => recorder({
+    cs_sessions: entry => entry.op === 'update' ? { data: sxRatedRow, error: null } : { data: row, error: null },
+    cs_messages: { data: { id: sxMid, sender_role: 'system' }, error: null },
+    cs_session_events: { data: null, error: null },
+    user_profiles: { data: null, error: null }
+  })
+
+  const sxRateBad = await sxRateSession(sxRateDb(), sxAsUser, { session_id: sxSid, rating: 9 })
+  assert(sxRateBad.status === 400 && /0~5/.test(sxRateBad.body.error),
+    '越界的分数答 400，并把合法范围说出来')
+  const sxRateNull = await sxRateSession(sxRateDb(), sxAsUser, { session_id: sxSid, rating: null })
+  assert(sxRateNull.status === 400,
+    '{rating: null} 也是 400——它不能被 Number() 折成 0，那会变成一条改不回来的差评')
+  const sxRateNoSess = await sxRateSession(sxRateDb(), sxAsUser, { session_id: 'not-a-uuid', rating: 5 })
+  assert(sxRateNoSess.status === 400, 'session_id 不是 UUID 时先 400，不去查库')
+
+  const sxRateStranger = await sxRateSession(sxRateDb(), { userId: 'nobody', group: 'default' },
+    { session_id: sxSid, rating: 5 })
+  assert(sxRateStranger.status === 403, '只有会话本人能评价——客服和管理员都不能替他评')
+  const sxRateAgentSelf = await sxRateSession(sxRateDb(), sxAsAgent, { session_id: sxSid, rating: 5 })
+  assert(sxRateAgentSelf.status === 403, '接待客服不能给自己打分')
+
+  const sxRateOpen = await sxRateSession(sxRateDb(sxOpen), sxAsUser, { session_id: sxSid, rating: 5 })
+  assert(sxRateOpen.status === 409 && /结束后/.test(sxRateOpen.body.error),
+    '会话还开着时答 409 并说明「结束后才能评」——这是用户自己能解决的那一种')
+  const sxRateTwice = await sxRateSession(sxRateDb(sxRatedRow), sxAsUser, { session_id: sxSid, rating: 5 })
+  assert(sxRateTwice.status === 409 && /已经评价过/.test(sxRateTwice.body.error), '评过就不能再评')
+
+  const sxDbRate = sxRateDb()
+  const sxRated = await sxRateSession(sxDbRate, sxAsUser, { session_id: sxSid, rating: 0, comment: '  太慢了  ' })
+  assert(sxRated.status === 200, '关闭的会话本人可以评价')
+  const sxRateUpd = sxDbRate.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
+  assert(sxRateUpd.payload.rating === 0, '0 分要原样落库——它是一个明确的差评，不是「没评价」')
+  assert(sxRateUpd.payload.rated_at, 'rated_at 必须写上：它是「评过没有」的唯一判据')
+  // 三个条件缺一个就是一条并发重复提交的路：两次点击撞在一起时，第二次必须拿不到行。
+  assert(sxRateUpd.filters.user_id === sxUid, "update 要带 eq('user_id')")
+  assert(sxRateUpd.filters.status === 'closed', "update 要带 eq('status','closed')")
+  assert(sxRateUpd.is && 'rated_at' in sxRateUpd.is,
+    "update 要带 is('rated_at', null)：前面那个 if 只是为了给人话的错误信息，真正拦住重复提交的是这一条")
+  const sxRateMsg = sxDbRate.calls.find(c => c.table === 'cs_messages' && c.op === 'insert')
+  assert(sxRateMsg.payload.sender_role === 'system' && sxRateMsg.payload.visible_to_user === false,
+    '评价留痕给客服看，对用户不可见——他刚填完的东西再回显一遍只像一次莫名的回声')
+  assert(/0 分/.test(sxRateMsg.payload.body) && /太慢了/.test(sxRateMsg.payload.body),
+    '留痕里带上分数和留言，客服才知道自己被打了几分、为什么')
+  const sxRateEvt = sxDbRate.calls.find(c => c.table === 'cs_session_events' && c.op === 'insert')
+  assert(sxRateEvt.payload.kind === 'rated' && sxRateEvt.payload.detail?.rating === 0,
+    '事件是 rated，detail 里带分数——§2.13 的看板按客服聚合平均分时直接读 cs_sessions.rating，这里只留审计')
+
+  // 留言超长要截断而不是拒绝：用户写长了不是错误，而 500 是列宽以外的一个礼貌上限。
+  const sxDbRateLong = sxRateDb()
+  await sxRateSession(sxDbRateLong, sxAsUser, { session_id: sxSid, rating: 3, comment: 'x'.repeat(900) })
+  assert(sxDbRateLong.calls.find(c => c.table === 'cs_sessions' && c.op === 'update')
+    .payload.rating_comment.length === 500, '留言截到 500 字，不是答一句 400')
 
   // §2.3 上下线。心跳和手动开关不能混成一个动作：一次心跳把手动设为离线的客服拉回在线，
   // 于是他刚点了「离线」就又开始收会话。
@@ -3880,14 +3988,19 @@ console.log('CS logic: OK')
   assert(sxSendClosed.status === 409 && /已关闭/.test(sxSendClosed.body.error),
     '关闭的会话答 409 并说明原因——那是用户能自己解决的（重开），和没权限不同')
 
-  const sxSendReadonly = await sxSendMessage(
-    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'readonly' }, error: null }, site_settings: sxSettings() }),
-    sxAsAgent, { session_id: sxSid, body: 'hi' })
-  assert(sxSendReadonly.status === 403, 'readonly 模式下客服不能发言')
-  const sxSendBlind = await sxSendMessage(
-    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'blind' }, error: null }, site_settings: sxSettings() }),
-    sxAsAgent, { session_id: sxSid, body: 'hi' })
-  assert(sxSendBlind.status === 403, 'blind 模式下客服连发言都不行')
+  // 两种介入模式下接待客服都照样能发言。这两条曾经反着写（readonly / blind 下客服发不出话），
+  // §2.10 简化之后 blind 是列默认值——那两条断言活着的意思是「客服永远发不出话」。
+  for (const mode of sxAdminModes) {
+    const sxSendMode = await sxSendMessage(
+      recorder({
+        cs_sessions: { data: { ...sxOpen, admin_mode: mode }, error: null },
+        cs_messages: { data: { id: sxMid, sender_role: 'agent' }, error: null },
+        cs_auto_replies: { data: [], error: null },
+        site_settings: sxSettings()
+      }),
+      sxAsAgent, { session_id: sxSid, body: 'hi' })
+    assert(sxSendMode.status === 201, `${mode} 下接待客服照样能发言——介入只决定管理员署谁的名`)
+  }
   const sxSendStranger = await sxSendMessage(
     recorder({ cs_sessions: { data: sxOpen, error: null }, site_settings: sxSettings() }),
     { userId: 'nobody', group: 'presale' }, { session_id: sxSid, body: 'hi' })
@@ -4243,10 +4356,17 @@ console.log('CS logic: OK')
     recorder({ cs_sessions: { data: sxOpen, error: null } }),
     { userId: 'nobody', group: 'presale' }, { session_id: sxSid })
   assert(sxListStranger.status === 403, '已有客服的会话，别的客服读不到')
-  const sxListBlind = await sxListMessages(
-    recorder({ cs_sessions: { data: { ...sxOpen, admin_mode: 'blind' }, error: null }, cs_messages: { data: [], error: null } }),
-    sxAsAgent, { session_id: sxSid })
-  assert(sxListBlind.status === 403, 'blind 模式下接待客服也读不到——这就是「完全看不见」的意思')
+  // 介入模式不影响谁读得到。这条曾经断言 blind 下接待客服读不到（「完全看不见」），
+  // 而 blind 现在是列默认值——那等于说接待客服读不到任何会话。
+  for (const mode of sxAdminModes) {
+    const sxListMode = await sxListMessages(
+      recorder({
+        cs_sessions: { data: { ...sxOpen, admin_mode: mode }, error: null },
+        cs_messages: { data: [], error: null }
+      }),
+      sxAsAgent, { session_id: sxSid })
+    assert(sxListMode.status === 200, `${mode} 下接待客服照样读得到自己的会话`)
+  }
 
   // limit 要在服务端夹住。不夹的话 ?limit=999999 是一个能把整个会话历史一次拉走的调用，
   // 而消息表是这个库里增长最快的一张。
@@ -4311,7 +4431,8 @@ const syMid = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 const syRid = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
 const syPost = {
   id: sySid, channel: 'postsale', user_id: syUid, order_id: syOid, agent_id: syAid,
-  status: 'open', admin_mode: 'none', first_response_seconds: null,
+  // admin_mode 只剩 normal/blind 两种（§2.10 简化之后 CHECK 也只认这两个），fixture 跟着列默认值走。
+  status: 'open', admin_mode: 'blind', first_response_seconds: null,
   opened_at: '2026-08-29T00:00:00.000Z', created_at: '2026-08-29T00:00:00.000Z'
 }
 const syAgent = { userId: syAid, group: 'postsale' }
@@ -4625,7 +4746,7 @@ const swCs = { userId: swAid, group: 'cs', rank: rankOf('cs') }
 const swAdmin = { userId: 'admin-2', group: 'admin', rank: rankOf('admin') }
 const swRow = {
   id: swSid, channel: 'presale', user_id: swUid, agent_id: null, status: 'open',
-  admin_mode: 'none', first_response_seconds: 12, timed_out: false,
+  admin_mode: 'blind', first_response_seconds: 12, timed_out: false,
   last_activity_at: '2026-08-29T00:05:00.000Z', created_at: '2026-08-29T00:00:00.000Z'
 }
 // decorate 会在同一张 cs_messages 上做两次不同的查询：最后一条消息、以及未读计数。按次序数会数错，
@@ -4638,7 +4759,7 @@ const swDecorated = (rows, opts = {}) => ({
     : { data: opts.messages ?? [], error: null }
 })
 
-// 队列：只给自己服务的渠道，只给还没人接的，且排除 blind。
+// 队列：只给自己服务的渠道，只给还没人接的。
 let swDb = recorder(swDecorated([swRow]))
 let swOut = await sxListQueue(swDb, swPresale)
 assert(swOut.status === 200, '售前能看队列')
@@ -4648,8 +4769,10 @@ assert(swQ.is && 'agent_id' in swQ.is && swQ.is.agent_id === null,
   "待接入靠 is('agent_id', null)：写成 eq 的话 PostGREST 匹配不到任何行，队列永远是空的")
 assert(swQ.in?.channel?.length === 1 && swQ.in.channel[0] === 'presale',
   '售前只看到售前的队列——否则他会看到一堆自己点不动的会话')
-assert(swQ.neq?.admin_mode === 'blind',
-  '排除 blind：那些已被管理员暗中接管，出现在队列里就会被客服接走，而管理员正在以客服身份说话')
+// 反向断言。这里曾经是 neq('admin_mode','blind')（「排除已被管理员暗中接管的」），而 §2.10 简化之后
+// blind 是列默认值：那个条件会把每一个新会话都当成已接管，队列于是永远是空的，谁也接不到人。
+assert(!swQ.neq || !('admin_mode' in swQ.neq),
+  '队列不能按 admin_mode 排除任何行——blind 是默认值，排一档就是排全部')
 assert(swQ.order?.ascending === true, '队列按建立时间正序：等得最久的排在前面')
 assert(swQ.limit === 100, '队列有上限')
 
@@ -5024,5 +5147,138 @@ assert(rw.includes('/v1/callback/:provider -> /api/index?route=payment-callback&
   `支付回调的重写要直接指到 index（对外 URL 一个字都不能改，平台那边填的是 /v1/callback/…）：${rw.join(' | ')}`)
 
 console.log('API dispatcher: OK')
+
+// --- §2.9/§9.8/§10.5 的定时任务：supabase/cron.sql 和 JS 那份实现对着钉 -------------------------
+// cron.sql 的文件开头承诺过这一段。那四件事（会话超时关闭、心跳失联下线、站内信归档、退款审批升级）
+// 是用 SQL 又写了一遍的，代价是超时文案和通知正文在 JS 和 SQL 各有一份。分叉不会报错——症状是同一笔
+// 退款在收件箱里出现两种金额写法，或者「配置改了但没生效」。SQL 在本地跑不到，能钉住的只有它的文本。
+const cronSql = readFileSync(new URL('../supabase/cron.sql', import.meta.url), 'utf8')
+// 对齐用的多余空格在断言里没有意义，先压平；SQL 字面量里的单空格不受影响。
+const cronFlat = cronSql.replace(/\s+/g, ' ')
+
+// 分成两个文件本身就是个不变量：create extension 一旦挪进 schema.sql，在装不上 pg_cron 的实例上会把
+// 后面几百行表结构一起回滚——一个可选的定时任务把整个建库脚本拖下水。
+assert(cronSql.includes('create extension if not exists pg_cron'), 'cron.sql 要自己装 pg_cron')
+// 只认行首的语句，不认注释里提到的那句——schema.sql 的开头正解释着为什么它不装。
+assert(!/^create extension[^;]*pg_cron/m.test(schemaSql),
+  'schema.sql 不能装 pg_cron：那一句失败会回滚整个建库脚本')
+assert(schemaSql.includes('supabase/cron.sql'),
+  'schema.sql 要写明 cron.sql 得单独再跑一次，否则定时任务永远不会存在，而建库看起来完全成功')
+
+// 四个 job：排了班、调的函数在同一个文件里定义过、并且重跑时会先被 unschedule。少了最后一条，重复执行
+// 这个文件会在 pg_cron 1.4 之前留下两份同名任务，每分钟的清理于是跑两遍。
+const unschedule = cronFlat.match(/cron\.unschedule\(jobname\)[^;]*;/)[0]
+for (const [job, fn] of [
+  ['cs-close-idle-sessions', 'private.cs_close_idle_sessions'],
+  ['cs-offline-stale-agents', 'private.cs_offline_stale_agents'],
+  ['refunds-escalate-pending', 'private.refunds_escalate_pending'],
+  ['notifications-auto-archive', 'private.notifications_auto_archive']
+]) {
+  assert(cronFlat.includes(`cron.schedule('${job}',`), `${job} 没有排班`)
+  assert(cronFlat.includes(`$$select ${fn}()$$`), `${job} 要调 ${fn}()`)
+  assert(cronFlat.includes(`create or replace function ${fn}(`), `${fn} 排了班但没有定义`)
+  assert(unschedule.includes(`'${job}'`), `${job} 不在 unschedule 名单里，重跑这个文件会排出两份`)
+}
+
+// 零小数位币种逐字一致，否则 1000 日元在超时提醒里显示成 10 日元，而原通知（JS 那份）显示 1000。
+const cronZero = cronSql.match(/when c in \(([^)]*)\)/)[1].split(',').map(s => s.trim().replace(/'/g, ''))
+assert(cronZero.join(',') === ZERO_DECIMAL_CURRENCIES.join(','),
+  `cron.sql 的零小数位名单和 shared/coupons.mjs 不一致：${cronZero.join(',')}`)
+assert(cronFlat.includes("to_char(coalesce(p_minor, 0)::numeric / 100, 'FM999999999990.00')"),
+  '其余币种要除 100 保留两位')
+// 那段 SQL 要产出和这两行一样的文本：
+assert(formatMinor(1000, 'JPY') === '1000 JPY' && formatMinor(1000, 'USD') === '10.00 USD',
+  'formatMinor 的两个分支就是 private.format_minor 要复刻的东西')
+
+// §2.9 的四个超时文案键。SQL 里写死的字符串要和 timeoutTextKeys() 拼出来的一致，少一个键的症状是超时后
+// 一方收到兜底文案，而管理员在 §14 里填的那句从此不生效。
+for (const ch of sxChannels) {
+  const keys = sxTimeoutKeys(ch)
+  assert(cronFlat.includes(`private.setting_text('${keys.user}'`), `cron.sql 要读 ${keys.user}`)
+  assert(cronFlat.includes(`private.setting_text('${keys.agent}'`), `cron.sql 要读 ${keys.agent}`)
+}
+
+// cron.sql 读到的每一个 §14 键都要在 seed 里有默认值。读一个不存在的键时 setting_num 会安静地退回
+// fallback，表现是「配置页改了没反应」，而这类错在库里查不出来——因为那一行根本不存在。
+const cronKeys = [...new Set(
+  [...cronSql.matchAll(/private\.setting_(?:num|text)\('([a-z0-9_]+)'/g)].map(m => m[1]))]
+assert(cronKeys.length >= 10, `cron.sql 读的配置键太少，正则大概没匹配上：${cronKeys.length}`)
+for (const key of cronKeys) {
+  assert(schemaSql.includes(`('${key}','{"value"`), `§14 的 seed 里缺 ${key} 的默认值`)
+}
+
+// 阈值 0 一律是「关掉这个功能」，不是「立刻执行」。四个任务各要有自己的那道闸——少一道，管理员把配置
+// 改成 0 的那一次会在下一分钟关掉全站会话、或者把所有站内信一口气归档。
+for (const guard of ['if v_presale <= 0 and v_postsale <= 0 then return 0; end if;',
+                     'if v_seconds <= 0 then return 0; end if;',
+                     'if v_days <= 0 then return 0; end if;',
+                     'if v_timeout <= 0 then return 0; end if;']) {
+  assert(cronFlat.includes(guard), `cron.sql 缺一道「0 = 关闭」的闸：${guard}`)
+}
+
+// 两处「再判一次」：外层 select 是快照，那一瞬间用户或管理员可能已经动过同一行。拿不到行就跳过，否则
+// 会对一个刚被手动关闭的会话再发一遍超时文案。
+assert(cronFlat.includes("where id = s.id and status = 'open'"), '关会话要重新断言 status=open')
+assert(cronFlat.includes("where id = r.id and status = 'pending'"), '升级要重新断言 status=pending')
+assert((cronFlat.match(/if not found then continue; end if;/g) || []).length === 2,
+  '两处都要在拿不到行时跳过，而不是继续发通知')
+
+// §10.5 的通知正文。shared/notifications.mjs 的 refundEscalationNotification 到今天仍然没有 JS 调用方，
+// cron.sql 才是它的实现，所以这里用哨兵值把 JS 模板还原成 format() 的 %s 形式再逐字比对。
+const SENT = { no: '{{NO}}', amt: '{{AMT}}', hrs: '{{HRS}}' }
+const escNotif = refundEscalationNotification(
+  { refundId: 'r-escNotif', orderNo: SENT.no, amountText: SENT.amt, hours: SENT.hrs })
+const asFormat = s => s.replace(/\{\{(?:NO|AMT|HRS)\}\}/g, '%s')
+assert(cronFlat.includes(`format('${asFormat(escNotif.title)}', v_hours, v_no)`),
+  `升级通知的标题要和 refundEscalationNotification 一致：${asFormat(escNotif.title)}`)
+assert(cronFlat.includes(`format('${asFormat(escNotif.body)}', v_no, v_amount, v_hours)`),
+  `升级通知的正文要和 refundEscalationNotification 一致：${asFormat(escNotif.body)}`)
+assert(cronFlat.includes(`'${escNotif.kind}', '${escNotif.scope}', null,`), '升级通知是发给全体管理员的审批请求')
+// pinned/highlighted 在 JS 侧是 presentationFor() 算出来的，SQL 是自己的插入口，所以必须写死成 true。
+// 落成 schema 默认的 false，表现是一条等着人批的退款躺在列表中间，而不是任何报错。
+const escPres = presentationFor(escNotif)
+assert(escPres.pinned && escPres.highlighted, 'presentationFor 认为超时升级该置顶高亮')
+assert(cronFlat.includes(`'${escNotif.state}', true, true, r.id,`),
+  'cron.sql 要显式写 pinned=true, highlighted=true')
+assert(cronFlat.includes(
+  `'type', '${escNotif.actions[0].type}', 'label', '${escNotif.actions[0].label.replace(SENT.amt, '')}' || v_amount`),
+  '批准按钮的文案要带金额')
+assert(escNotif.actions.length === 2
+  && cronFlat.includes(`'type', '${escNotif.actions[1].type}', 'label', '${escNotif.actions[1].label}'`),
+  '催办只有批准和拒绝两个按钮：转交在原通知上已经有了')
+
+// §10.8 的审计。第一次升级写 escalate，之后的重复提醒写 remind；AdminRefunds.vue 的 ACTION_LABEL 要认识
+// 这两个字面量，否则审批历史里直接显示英文单词。
+assert(cronFlat.includes("case when v_first then 'escalate' else 'remind' end"),
+  'cron.sql 要区分首次升级和重复提醒')
+const adminRefundsVue = readFileSync(
+  new URL('../docs/.vitepress/theme/AdminRefunds.vue', import.meta.url), 'utf8')
+for (const action of ['escalate', 'remind']) {
+  assert(new RegExp(`^\\s+${action}: '[^']+'`, 'm').test(adminRefundsVue),
+    `AdminRefunds.vue 的 ACTION_LABEL 里缺 ${action} 的中文`)
+}
+// 系统写入的形状：没有操作人、组名留空。AdminRefunds.vue 的 personName(null) 靠这个显示「系统」，
+// 而不是显示成一个查不到的用户——那两种情况的处置办法完全不同。
+assert(cronFlat.includes("values (r.id, null, '', case when v_first"),
+  '审计行的 actor_id 要为空、actor_group 要留空')
+// 状态确实没变，所以审计行不写 from_status/to_status：写成 pending→pending 会让审计看起来发生过一次迁移。
+assert(cronFlat.includes(
+  'insert into public.refund_audit_log (refund_id, actor_id, actor_group, action, amount_minor, note)'),
+  '审计行只写这六列——出现 from_status/to_status 就等于宣称状态迁移过')
+
+// 待处理的站内信一条都不自动归档（两步都要跳过），否则 §9.6 的强制置顶多了一个会随时间自动触发的后门。
+assert((cronFlat.match(/state is distinct from 'pending'/g) || []).length === 2,
+  '自动归档的两步都要跳过 state=pending')
+assert(!cronFlat.includes('set read_at'),
+  '归档不等于读过：顺手写 read_at 会让「我从没看过这条」变成一句假话')
+
+// §14 的 audit_log_retention_days 故意没有对应任务（理由写在 cron.sql 末尾）。真要加，得先定义订单状态机
+// 的终态——一笔还开着的退款，审计流水比它自己先被删掉的话，事后没有任何东西能解释那笔钱去哪了。
+assert(!cronFlat.includes("setting_num('audit_log_retention_days'"),
+  '删审计流水的任务不能顺手加进来：不可逆，且要先有终态判断')
+assert(cronSql.includes('audit_log_retention_days'), 'cron.sql 要写明这个空缺是有意留的')
+
+console.log('cron.sql: OK')
+
 
 

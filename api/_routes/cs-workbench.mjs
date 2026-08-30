@@ -12,8 +12,17 @@ import { CHANNELS, isHeartbeatStale, sessionMetrics, servesChannel } from '../..
 import { CS_SETTING_KEYS, settingsOf } from '../_lib/cs.mjs'
 
 const SESSION_COLUMNS = 'id,channel,user_id,order_id,agent_id,status,subject,admin_mode,admin_id,' +
+  'rating,rating_comment,rated_at,' +
   'first_response_seconds,timed_out,last_user_message_at,last_agent_message_at,last_activity_at,' +
   'reopened_count,opened_at,closed_at,close_reason,created_at'
+
+/**
+ * 从 query string 里读一个布尔。
+ *
+ * GET 过来的值全是字符串，而 `if (input.flag)` 对 'false' 也是真的——一个关着的「排除我的」复选框
+ * 反而会把筛选打开。这个函数只认三种写法为真。
+ */
+const flag = value => value === true || value === 'true' || value === '1'
 
 /**
  * 给一批会话补上用户名和最后一条消息。
@@ -27,7 +36,7 @@ async function decorate(db, sessions) {
   const sessionIds = sessions.map(s => s.id)
 
   const [{ data: profiles }, { data: messages }, { data: unread }] = await Promise.all([
-    db.from('user_profiles').select('user_id,display_name,group_name').in('user_id', userIds),
+    db.from('user_profiles').select('user_id,display_name,email,group_name').in('user_id', userIds),
     db.from('cs_messages').select('session_id,body,sender_role,recalled,created_at')
       .in('session_id', sessionIds).order('created_at', { ascending: false }).limit(sessionIds.length * 4),
     db.from('cs_messages').select('session_id')
@@ -35,7 +44,13 @@ async function decorate(db, sessions) {
   ])
 
   const nameOf = {}
-  for (const p of profiles || []) nameOf[p.user_id] = p.display_name || ''
+  // display_name 为空时退到邮箱前缀，和 _lib/cs.mjs 的 displayNames 同一套规则。空串会让工作台的
+  // 列表里出现一排没有称呼的会话，而客服要靠这一列区分「刚才那个人」和「另一个人」。
+  // 只取 @ 前面那段：整封邮箱是联系方式，列表里不需要。
+  for (const p of profiles || []) {
+    nameOf[p.user_id] = String(p.display_name || '').trim() ||
+      String(p.email || '').split('@')[0].trim()
+  }
   const groupOf = {}
   for (const p of profiles || []) groupOf[p.user_id] = p.group_name || 'default'
 
@@ -62,7 +77,10 @@ async function decorate(db, sessions) {
  * §2.4 第一页：待接入的队列。
  *
  * 只给自己服务的渠道。admin 看全部（他能接任何会话），presale 只看售前——否则一个售前客服会看到
- * 一堆自己点不动的会话。blind 的排除掉：那些已经由管理员接管。
+ * 一堆自己点不动的会话。
+ *
+ * 这里曾经排除 admin_mode='blind' 的会话（「已由管理员接管」）。§2.10 简化成两种模式之后 blind 是默认值，
+ * 那个条件会让队列永远是空的——每一个新会话都被当成已接管。介入现在只决定管理员署谁的名，和排队无关。
  */
 export async function listQueue(db, auth) {
   const channels = CHANNELS.filter(c => servesChannel(auth.group, c))
@@ -70,7 +88,6 @@ export async function listQueue(db, auth) {
 
   const { data, error } = await db.from('cs_sessions').select(SESSION_COLUMNS)
     .eq('status', 'open').is('agent_id', null).in('channel', channels)
-    .neq('admin_mode', 'blind')
     .order('created_at', { ascending: true }).limit(100)
   if (error) throw new Error(`读取队列失败：${error.message}`)
   return { status: 200, body: { sessions: await decorate(db, data) } }
@@ -78,9 +95,8 @@ export async function listQueue(db, auth) {
 
 /** §2.4 第二页：我手上的会话。 */
 export async function listMine(db, auth, input = {}) {
-  const includeClosed = Boolean(input.include_closed)
   let query = db.from('cs_sessions').select(SESSION_COLUMNS).eq('agent_id', auth.userId)
-  if (!includeClosed) query = query.eq('status', 'open')
+  if (!flag(input.include_closed)) query = query.eq('status', 'open')
   const { data, error } = await query.order('last_activity_at', { ascending: false }).limit(100)
   if (error) throw new Error(`读取我的会话失败：${error.message}`)
   return { status: 200, body: { sessions: await decorate(db, data) } }
@@ -93,7 +109,13 @@ export async function listAll(db, auth, input = {}) {
   if (input.channel && CHANNELS.includes(String(input.channel))) query = query.eq('channel', String(input.channel))
   if (input.status === 'open' || input.status === 'closed') query = query.eq('status', String(input.status))
   if (input.agent_id) query = query.eq('agent_id', String(input.agent_id))
-  if (input.unassigned) query = query.is('agent_id', null)
+  if (flag(input.unassigned)) query = query.is('agent_id', null)
+  // 「排除我的」：管理员在这一页找的通常是别人手上的会话，自己那些在「我的会话」页已经有一份。
+  //
+  // 写成 or(is.null, neq) 而不是单个 neq：SQL 里 agent_id <> '我' 对 agent_id 为空的行结果是 NULL，
+  // 于是待接入的会话会一起消失——而那些恰好是这一页上最需要看到的。
+  // 也不在内存里筛：那样 limit 会先被自己的会话吃掉，翻到最后也看不全别人的。
+  if (flag(input.exclude_mine)) query = query.or(`agent_id.is.null,agent_id.neq.${auth.userId}`)
   const limit = Math.min(Math.max(Number(input.limit) || 100, 1), 500)
   const { data, error } = await query.order('last_activity_at', { ascending: false }).limit(limit)
   if (error) throw new Error(`读取会话列表失败：${error.message}`)

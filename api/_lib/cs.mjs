@@ -278,3 +278,49 @@ export function staffMayServe(auth, channel) {
   if (rankOf(auth.group) >= RANK.ADMIN) return true
   return rankOf(auth.group) >= RANK.STAFF && servesChannel(auth.group, channel)
 }
+
+/**
+ * 一批 user_id 的显示名。display_name 为空时退回邮箱前缀。
+ *
+ * 为什么这件事只能在服务端做：user_profiles 上那条 profiles_read 策略是「自己那行，或者管理员全读」，
+ * 所以用户的浏览器查不到接待自己的客服叫什么，客服的浏览器也查不到用户叫什么。这些路由用的是
+ * service client，读得到——名字必须由接口带出去，前端没有第二条路。
+ *
+ * 读失败只记日志：一个会话少一个名字不该让整段对话打不开。
+ */
+export async function displayNames(db, userIds) {
+  const ids = [...new Set((userIds || []).filter(Boolean))]
+  if (!ids.length) return {}
+  const { data, error } = await db.from('user_profiles')
+    .select('user_id,display_name,email').in('user_id', ids)
+  if (error) {
+    console.error('读取显示名失败', { error: error.message })
+    return {}
+  }
+  const out = {}
+  for (const row of data || []) {
+    // 邮箱只取 @ 前面那段：把完整邮箱显示给对面等于泄露联系方式。
+    const name = String(row.display_name || '').trim() || String(row.email || '').split('@')[0].trim()
+    if (name) out[row.user_id] = name
+  }
+  return out
+}
+
+/**
+ * 给一条会话行补上显示名，再交给前端。
+ *
+ * admin_name 只给客服那一侧：用户看到的管理员消息一直是「管理员」这个身份，把具体是谁告诉他
+ * 没有用户价值，而在 §2.10 的语境里那是内部信息。
+ */
+export async function decorateSession(db, session, { staff = false } = {}) {
+  if (!session) return session
+  const names = await displayNames(db, [session.user_id, session.agent_id, session.admin_id])
+  const out = {
+    ...session,
+    // 名字取不到时给身份而不是空串：界面上「客服」比一个没有称呼的气泡好。
+    agent_name: session.agent_id ? (names[session.agent_id] || '客服') : null,
+    user_name: names[session.user_id] || '用户'
+  }
+  if (staff) out.admin_name = session.admin_id ? (names[session.admin_id] || '管理员') : null
+  return out
+}

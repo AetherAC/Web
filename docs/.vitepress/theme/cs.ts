@@ -53,7 +53,7 @@ export interface CsSession {
   order_id: string | null
   agent_id: string | null
   status: 'open' | 'closed'
-  admin_mode: 'none' | 'normal' | 'readonly' | 'blind'
+  admin_mode: 'normal' | 'blind'
   admin_id: string | null
   close_reason: string | null
   timed_out: boolean
@@ -64,6 +64,12 @@ export interface CsSession {
   last_user_message_at: string | null
   last_agent_message_at: string | null
   created_at: string
+  rating?: number | null
+  rating_comment?: string | null
+  rated_at?: string | null
+  /** 接口补上的显示名，不是表里的列。用户端要看到客服叫什么，客服端要看到用户叫什么。 */
+  agent_name?: string | null
+  user_name?: string | null
 }
 
 export interface CsCapabilities {
@@ -73,6 +79,7 @@ export interface CsCapabilities {
   can_close: boolean
   can_reopen: boolean
   can_monitor: boolean
+  can_rate: boolean
   can_see_revisions: boolean
   is_owner: boolean
   is_agent: boolean
@@ -171,7 +178,12 @@ export function useCsThread() {
   let channel: any = null
   let peerTimer: any = null
   let typingSentAt = 0
-  let refetching = false
+  /** refresh 的串行化状态：最多一次在飞 + 一次排队，见 refresh 的注释。 */
+  let running: Promise<void> | null = null
+  let pendingId: string | null = null
+  let pendingPromise: Promise<void> | null = null
+  /** 签好的附件地址，path -> { url, 到期时间 }。见 signedUrls。 */
+  const urlCache = new Map<string, { url: string; expires: number }>()
 
   loadCsConfig().then(c => { config.value = c })
 
@@ -179,16 +191,7 @@ export function useCsThread() {
   const canPost = computed(() => !!capabilities.value?.can_post)
   const isOwner = computed(() => !!capabilities.value?.is_owner)
 
-  /**
-   * 拉一遍消息。Realtime 推送之后必须走这里而不是把推来的行 push 进列表——
-   * 推来的是数据库原始行，撤回时那一行的 body 是空的但 revisions 不在里面，
-   * 而 visible_to_user=false 的行对用户根本不该出现。
-   */
-  async function refresh(sessionId?: string) {
-    const id = sessionId || session.value?.id
-    if (!id) return
-    if (refetching) return
-    refetching = true
+  async function fetchThread(id: string) {
     try {
       const data = await csApi(`/api/cs-message?session_id=${encodeURIComponent(id)}&limit=200`)
       session.value = data.session
@@ -197,9 +200,36 @@ export function useCsThread() {
       error.value = ''
     } catch (e: any) {
       error.value = e.message
-    } finally {
-      refetching = false
     }
+  }
+
+  /**
+   * 拉一遍消息。Realtime 推送之后必须走这里而不是把推来的行 push 进列表——
+   * 推来的是数据库原始行，撤回时那一行的 body 是空的但 revisions 不在里面，
+   * 而 visible_to_user=false 的行对用户根本不该出现。
+   *
+   * 并发的调用会排队，不会被丢掉。原来是「已经在拉了就直接 return」，而关闭会话这件事恰好总是
+   * 同时推两条（cs_messages 插一条系统提示 + cs_sessions 改 status），后一条被丢掉的结果就是
+   * 对方已经结束了会话，而这一侧还停在「进行中」——只有刷新页面才会发现。这里改成最多一次在飞、
+   * 一次排队，排队的那次总用最新请求的 id（工作台切会话时不会拉回上一条）。
+   */
+  function refresh(sessionId?: string): Promise<void> {
+    const id = sessionId || session.value?.id
+    if (!id) return Promise.resolve()
+    if (!running) {
+      running = fetchThread(id).finally(() => { running = null })
+      return running
+    }
+    pendingId = id
+    if (!pendingPromise) {
+      pendingPromise = running.catch(() => {}).then(() => {
+        const next = pendingId as string
+        pendingId = null
+        pendingPromise = null
+        return refresh(next)
+      })
+    }
+    return pendingPromise
   }
 
   /** 订阅这条会话。行推送触发重新拉取，broadcast 只用来传打字状态。 */
@@ -285,9 +315,11 @@ export function useCsThread() {
         })
       })
       pending.value = []
-      // 乐观追加自己那条，再拉一次拿自动回复和服务端时间戳。
+      // 乐观追加自己那条就够了。这里不再 await 第二次 refresh：那一次拉的是自动回复和服务端时间戳，
+      // 而 cs_messages 的 Realtime 推送本来就会触发同一个 refresh。await 它的唯一效果是
+      // 「发送中」按钮多按一整个往返才松开——消息早已经在列表里了。
       if (data.message) messages.value = [...messages.value, data.message]
-      await refresh()
+      refresh().catch(() => {})
       return data
     } catch (e: any) {
       error.value = e.message
@@ -370,11 +402,49 @@ export function useCsThread() {
     if (supabase) await supabase.storage.from(ATTACHMENT_BUCKET).remove([path]).catch(() => {})
   }
 
-  /** 附件的可下载地址。桶是私有的，所以要签一个短时效的 URL。 */
-  async function signedUrl(path: string, seconds = 300) {
-    if (!supabase) return ''
-    const { data } = await supabase.storage.from(ATTACHMENT_BUCKET).createSignedUrl(path, seconds)
-    return data?.signedUrl || ''
+  /**
+   * 附件的可下载地址。桶是私有的，所以要签一个短时效的 URL。
+   *
+   * 一次签一批而不是一个一个签：一条消息带十张图时，逐个签是十次往返，而且每张图都要等自己那次
+   * 回来才开始下载，看起来就是「图片加载很慢」。签好的地址缓存到快过期为止，重新拉一遍消息
+   * （撤回、编辑、对方发言都会触发）不再重签已经有的那些。
+   */
+  async function signedUrls(paths: string[], seconds = 900): Promise<Record<string, string>> {
+    const out: Record<string, string> = {}
+    const now = Date.now()
+    const missing: string[] = []
+    for (const p of paths) {
+      if (!p) continue
+      const hit = urlCache.get(p)
+      if (hit && hit.expires > now) out[p] = hit.url
+      else if (!missing.includes(p)) missing.push(p)
+    }
+    if (!missing.length || !supabase) return out
+    const { data } = await supabase.storage.from(ATTACHMENT_BUCKET).createSignedUrls(missing, seconds)
+    for (const row of (data || []) as Array<{ path?: string | null; signedUrl?: string | null }>) {
+      if (!row?.path || !row.signedUrl) continue
+      // 提前 60 秒作废，免得正好在过期那一刻点下载。
+      urlCache.set(row.path, { url: row.signedUrl, expires: now + Math.max(seconds - 60, 30) * 1000 })
+      out[row.path] = row.signedUrl
+    }
+    return out
+  }
+
+  async function signedUrl(path: string, seconds = 900) {
+    const map = await signedUrls([path], seconds)
+    return map[path] || ''
+  }
+
+  /** 会话结束后用户给客服打分（0~5），只能打一次。 */
+  async function rate(score: number, comment = '') {
+    if (!session.value) return
+    const data = await csApi('/api/cs-session', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'rate', session_id: session.value.id, rating: score, comment })
+    })
+    if (data.session) session.value = data.session
+    if (data.capabilities) capabilities.value = data.capabilities
+    return data
   }
 
   onScopeDispose(unsubscribe)
@@ -382,8 +452,8 @@ export function useCsThread() {
   return {
     session, capabilities, messages, config, loading, sending, error, peerTyping,
     uploading, pending, closed, canPost, isOwner,
-    attach, open, refresh, send, recall, edit, markRead, notifyTyping,
-    upload, dropPending, signedUrl, subscribe, unsubscribe
+    attach, open, refresh, send, recall, edit, markRead, notifyTyping, rate,
+    upload, dropPending, signedUrl, signedUrls, subscribe, unsubscribe
   }
 }
 

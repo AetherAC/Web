@@ -16,14 +16,28 @@ import { RANK, rankOf } from './groups.mjs'
 export const CHANNELS = ['presale', 'postsale']
 export const CHANNEL_LABEL = { presale: '售前咨询', postsale: '售后咨询' }
 export const SESSION_STATUS = ['open', 'closed']
-export const ADMIN_MODES = ['none', 'normal', 'readonly', 'blind']
+/**
+ * §2.10 管理员介入。只剩两种，而且两种都不遮挡任何人的视线——它现在只回答一个问题：
+ * 管理员说的话，署谁的名。
+ *
+ *   - normal：以接待客服的名义发言，用户看到的还是同一个客服。真作者记在 cs_messages.authored_by。
+ *   - blind（管理员介入，默认）：以管理员自己的名义发言。
+ *
+ * 原来还有 none（没人介入）和 readonly（把客服降为只读）。删掉它们不是为了简化界面：blind 成了默认值之后，
+ * 「blind 时客服看不见这个会话」会让每一个新会话在待接入队列里就是隐形的，谁也接不了。所以
+ * 「客服在管理员介入下仍然看得到管理员的消息」和「默认就是管理员介入」这两条，合起来只能推出
+ * 「介入不再改变可见性」。可见性的判断在 sessionCapabilities 和 SQL 的 private.can_*_session 里，
+ * 那边同步把 admin_mode 的条件全部去掉了。
+ */
+export const ADMIN_MODES = ['normal', 'blind']
 export const ADMIN_MODE_LABEL = {
-  none: '未介入',
-  normal: '管理员一同参与',
-  readonly: '客服只读',
-  blind: '管理员接管（客服不可见）'
+  normal: '正常介入',
+  blind: '管理员介入'
 }
+export const DEFAULT_ADMIN_MODE = 'blind'
 export const SENDER_ROLES = ['user', 'agent', 'admin', 'system', 'auto']
+/** §2.x 会话结束后用户给客服打分，0~5 的整数。 */
+export const RATING_RANGE = [0, 5]
 export const MESSAGE_FORMATS = ['plain', 'markdown', 'bbcode', 'html']
 export const AUTO_REPLY_TRIGGERS = ['keyword', 'order_paid', 'session_open']
 export const MATCH_MODES = ['contains', 'exact', 'starts_with', 'ends_with']
@@ -481,28 +495,46 @@ export function sessionCapabilities(session, viewer) {
   const isOwner = session?.user_id === viewer?.userId
   const isAgent = session?.agent_id === viewer?.userId
   const isAdmin = rank >= RANK.ADMIN
-  const blind = session?.admin_mode === 'blind'
-  const readonly = session?.admin_mode === 'readonly'
   const open = session?.status === 'open'
 
-  const canSee = isOwner || isAdmin ||
-    (isAgent && !blind) ||
-    (!session?.agent_id && !blind && rank >= RANK.STAFF && servesChannel(viewer?.group, session?.channel))
-  const canPost = open && (isOwner || isAdmin || (isAgent && !blind && !readonly))
+  // admin_mode 不出现在这里是有意的：介入只决定管理员署谁的名，不再决定谁看得见（见 ADMIN_MODES 的注释）。
+  const canSee = isOwner || isAdmin || isAgent ||
+    (!session?.agent_id && rank >= RANK.STAFF && servesChannel(viewer?.group, session?.channel))
+  const canPost = open && (isOwner || isAdmin || isAgent)
 
   return {
     can_see: Boolean(canSee),
     can_post: Boolean(canPost),
     // 撤回和编辑只对自己发的消息开放，具体到消息还要看时限，那部分在 api 层判。
-    can_claim: open && !session?.agent_id && !blind && rank >= RANK.STAFF && servesChannel(viewer?.group, session?.channel),
-    can_close: open && (isOwner || isAdmin || (isAgent && !blind)),
+    can_claim: open && !session?.agent_id && rank >= RANK.STAFF && servesChannel(viewer?.group, session?.channel),
+    can_close: open && (isOwner || isAdmin || isAgent),
     // §2.5：重开由用户或客服发起，但必须是同一个客服接回去，所以这里只说能不能点。
     can_reopen: !open && (isOwner || isAdmin || isAgent),
     can_monitor: isAdmin,
+    // 打分只有用户本人、只在会话结束后、而且只有一次。
+    can_rate: !open && isOwner && !session?.rated_at,
     // 客服看得见撤回原文和编辑历史，用户看不见（§2.11）。
     can_see_revisions: rank >= RANK.STAFF && Boolean(canSee),
     is_owner: isOwner, is_agent: isAgent, is_admin: isAdmin
   }
+}
+
+/**
+ * 打分入库前的取整与范围检查。返回 null 表示这个值不能用。
+ *
+ * 先卡类型再 Number()，不能反过来：Number(null)、Number('')、Number([])、Number(false) 全是 0，
+ * 而 0 在这里是一个合法的差评。直接 Number() 的话，一次 {rating: null} 会被记成 0 分，
+ * 然后 rated_at 一写上就再也改不回来了——「没打分」和「打了最低分」折成同一个值是这里最贵的错。
+ * 所以只认数字，和一段去空白后非空、整体是数字的字符串。
+ */
+export function normalizeRating(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  const text = typeof value === 'string' ? value.trim() : value
+  if (text === '') return null
+  const n = Number(text)
+  if (!Number.isFinite(n)) return null
+  const r = Math.round(n)
+  return r >= RATING_RANGE[0] && r <= RATING_RANGE[1] ? r : null
 }
 
 /**
@@ -530,7 +562,7 @@ export function presentMessage(message, viewer, revisions = null) {
       .map(r => ({ body: r.body, format: r.format, revision: r.revision, created_at: r.created_at }))
   }
   if (!staff) {
-    // 用户看不到编辑历史，也看不到 blind 模式下的真作者——后者等于把介入告诉了用户。
+    // 用户看不到编辑历史，也看不到 normal 模式下的真作者——后者等于把介入告诉了用户。
     delete base.edit_history
     delete base.recalled_body
     delete base.authored_by
