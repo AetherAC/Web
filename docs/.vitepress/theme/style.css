@@ -427,3 +427,50 @@ button { color: inherit; }
 .orders-refunds b{padding:4px 8px;border-radius:99px;background:#1a2822;color:#9fb1a8;font-family:inherit;font-size:10px;text-transform:uppercase}
 @media(max-width:1080px){.orders-filters{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:860px){.orders-table header{display:none}.orders-table>button{grid-template-columns:1fr 1fr;gap:9px;padding:15px 18px}.orders-search{flex-wrap:wrap}.orders-search select,.orders-search input{width:100%;flex:1 1 100%}}
+
+/* --- §1 优惠券管理 ---------------------------------------------------------------------------
+   条件和动作是「一行一条」的构建器：一行里塞了类型、比较方式、值，还有一句由 describeCondition
+   生成的回显。回显故意排在最后并占满整行——它是唯一能确认「界面上填的」和「求值时算的」是一回事
+   的地方，所以不能被挤到看不见。 */
+.coupon-grid{min-height:620px}
+.coupon-message{margin:12px 0 0}
+.records article b code{padding:2px 7px;border-radius:5px;background:rgba(219,255,238,.09);color:#8ef0d0;font-size:12px}
+.coupon-off{margin-left:7px;padding:1px 6px;border-radius:6px;background:rgba(240,109,109,.14);color:#ef9999;font-size:10px;font-style:normal}
+.coupon-editor{display:flex;flex-direction:column;gap:14px;overflow-y:auto;max-height:min(78vh,900px)}
+.coupon-editor .editor-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.coupon-editor .editor-title .icon-button{flex:none;width:34px;height:34px;border-radius:8px}
+.coupon-form{display:flex;flex-direction:column;gap:14px}
+.coupon-form label{display:flex;flex-direction:column;gap:7px;min-width:0;color:#a8b8b0;font-size:13px}
+.coupon-form label small{color:#6e8279;font-size:10.5px;line-height:1.6}
+.coupon-form input,.coupon-form textarea,.coupon-form select{width:100%;padding:10px 11px;border:1px solid var(--fluent-stroke);border-radius:7px;outline:0;background:#090f0d;color:#e2f1ea;font-family:inherit;font-size:13px;line-height:1.6;resize:vertical}
+.coupon-form input:focus,.coupon-form textarea:focus,.coupon-form select:focus{border-color:var(--fluent)}
+.coupon-form input:disabled,.coupon-form select:disabled,.coupon-form textarea:disabled{opacity:.5;cursor:not-allowed}
+.coupon-row{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+.coupon-rules{display:flex;flex-direction:column;gap:11px;margin:0;padding:15px 16px;border:1px solid var(--fluent-stroke);border-radius:10px;background:rgba(219,255,238,.03)}
+.coupon-rules[disabled]{opacity:.55}
+.coupon-rules legend{padding:0 7px;color:#8ea198;font-size:12px;font-weight:700}
+.coupon-rule{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:11px;border:1px solid var(--fluent-stroke);border-radius:8px;background:var(--fluent-card)}
+.coupon-rule select,.coupon-rule input{width:auto;flex:0 1 auto;min-width:96px;padding:8px 10px;border:1px solid var(--fluent-stroke);border-radius:7px;outline:0;background:#090f0d;color:#e2f1ea;font-family:inherit;font-size:12.5px}
+.coupon-rule input[type=number]{width:106px}
+.coupon-rule .coupon-cur{width:74px;text-transform:uppercase}
+.coupon-rule small{flex-basis:100%;order:4;color:#6e8279;font-size:10.5px;line-height:1.6}
+.coupon-rule em{flex-basis:100%;order:5;padding-top:8px;border-top:1px dashed var(--fluent-stroke);color:var(--fluent);font-size:12px;font-style:normal}
+.coupon-checks{display:flex;flex-wrap:wrap;gap:4px 12px;flex:1 1 100%;order:3}
+.coupon-checks label{flex-direction:row!important;align-items:center;gap:5px;color:#a9c2b8;font-size:11.5px;white-space:nowrap}
+.coupon-checks input{width:auto;min-width:0;padding:0}
+.coupon-drop{order:2;margin-left:auto;display:grid;place-items:center;width:28px;height:28px;border:1px solid var(--fluent-stroke);border-radius:7px;background:0 0;color:#8aa39a;cursor:pointer}
+.coupon-drop:hover{border-color:#ef9999;color:#ef9999}
+.coupon-add{align-self:flex-start;display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px dashed #496258;border-radius:7px;background:0 0;color:#b5c5bd;font-size:12.5px;cursor:pointer}
+.coupon-add:hover{border-color:var(--fluent);color:#d7efe6}
+.coupon-none{margin:0;color:#6e8279;font-size:11.5px;line-height:1.7}
+.coupon-preview{padding:15px 16px;border:1px solid rgba(96,225,189,.25);border-radius:10px;background:rgba(96,225,189,.06)}
+.coupon-preview h3{display:flex;align-items:center;gap:7px;margin:0 0 11px;font-size:14px}
+.coupon-preview h3 svg{color:var(--fluent)}
+.coupon-preview ol{margin:11px 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:6px}
+.coupon-preview li{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px;font-size:12.5px}
+.coupon-preview li b{color:#dfeae5;font-weight:650}
+.coupon-preview li span{margin-left:auto;color:#9db5ab;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+.coupon-preview>p{margin:0;color:#a9c2b8;font-size:12.5px;line-height:1.75}
+.coupon-preview>p b{color:var(--fluent)}
+.coupon-del{border-color:rgba(240,109,109,.4)!important;color:#ef9999!important}
+@media(max-width:1080px){.coupon-grid{grid-template-columns:1fr}.coupon-row{grid-template-columns:1fr}}
