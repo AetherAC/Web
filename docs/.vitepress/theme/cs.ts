@@ -43,7 +43,15 @@ export interface CsMessage {
   created_at: string
   read_by_user_at?: string | null
   read_by_agent_at?: string | null
-  revisions?: Array<{ kind: string; body: string; format: string; revision: number; created_at: string }>
+  /**
+   * 客服那一侧才有的两个字段，由 shared/cs.mjs 的 presentMessage 挂上（用户那侧连字段都被删掉）。
+   *
+   * 这里原来写的是 `revisions`，那个名字从来没有出现在接口的答复里——presentMessage 发的是
+   * recalled_body 和 edit_history 两个字段。名字对不上的表现不是报错，而是「查看历史」那个按钮
+   * 永远不出现：v-if 判的是一个恒为 undefined 的属性，于是 §2.11 的编辑痕迹在工作台上根本看不到。
+   */
+  recalled_body?: string
+  edit_history?: Array<{ body: string; format: string; revision: number; created_at: string }>
 }
 
 export interface CsSession {
@@ -205,7 +213,7 @@ export function useCsThread() {
 
   /**
    * 拉一遍消息。Realtime 推送之后必须走这里而不是把推来的行 push 进列表——
-   * 推来的是数据库原始行，撤回时那一行的 body 是空的但 revisions 不在里面，
+   * 推来的是数据库原始行，撤回时那一行的 body 是空的但原文不在里面，
    * 而 visible_to_user=false 的行对用户根本不该出现。
    *
    * 并发的调用会排队，不会被丢掉。原来是「已经在拉了就直接 return」，而关闭会话这件事恰好总是

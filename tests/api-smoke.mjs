@@ -3536,6 +3536,20 @@ console.log('Coupons: OK')
     'schema.sql 要把旧的 none/readonly 折成 blind，否则新 CHECK 在有数据的库上直接失败')
   assert(/check \(admin_mode in \('normal','blind'\)\)/.test(schemaSql), 'CHECK 要和 ADMIN_MODES 一致')
 
+  // Realtime 发布。两端的「实时」全靠它：cs.ts 的 subscribe 订阅一条会话，CsPage.vue 的 subscribeList
+  // 订阅整张 cs_sessions。表不在发布里的表现最难查——订阅本身成功（频道状态 SUBSCRIBED），只是永远
+  // 收不到行，没有任何报错，看起来就是「客服延迟很高」「关了会话对面不知道」。
+  const sxPubBlock = schemaSql.match(/pg_publication[\s\S]*?end \$\$;/)?.[0] || ''
+  assert(/supabase_realtime/.test(sxPubBlock), 'schema.sql 要把实时发布写进来，不能只在控制台上点过')
+  for (const table of ['cs_sessions', 'cs_messages']) {
+    assert(new RegExp(`alter publication supabase_realtime add table public\\.${table}`).test(sxPubBlock),
+      `${table} 要加进 supabase_realtime，否则那一侧的推送永远不到`)
+    assert(new RegExp(`tablename = '${table}'`).test(sxPubBlock),
+      `${table} 要先查 pg_publication_tables 再 add：已经在发布里的表再 add 一次是 42710，会让整个文件重跑时断在这里`)
+  }
+  assert(/pg_publication where pubname = 'supabase_realtime'/.test(sxPubBlock),
+    '发布本身可能不存在（自建库、或被删过），那时候 alter 是 42704，要分开判')
+
   // §2.11 撤回的呈现。撤回原文不在 cs_messages 行里——它被搬去 cs_message_revisions 了。
   const sxRecalled = { id: 'm1', body: '', recalled: true, sender_role: 'user', authored_by: 'admin-1' }
   const sxRevs = [{ message_id: 'm1', kind: 'recall', body: '我说错了', format: 'plain', revision: 1 }]
@@ -4852,6 +4866,22 @@ const swUnassigned = recorder(swDecorated([swRow]))
 await sxListAll(swUnassigned, swAdmin, { unassigned: true })
 assert(swUnassigned.calls.find(c => c.table === 'cs_sessions').is?.agent_id === null,
   "unassigned 用 is(null)")
+// 「排除我的」。这一条测的是 or 而不是 neq：SQL 里 agent_id <> '我' 对 agent_id 为空的行结果是 NULL，
+// 于是一个裸的 neq 会把待接入的会话一起筛掉——而那些恰好是这一页上最需要看到的。
+const swExclude = recorder(swDecorated([swRow]))
+await sxListAll(swExclude, swAdmin, { exclude_mine: '1' })
+const swExcludeCall = swExclude.calls.find(c => c.table === 'cs_sessions')
+assert(swExcludeCall.or === `agent_id.is.null,agent_id.neq.${swAdmin.userId}`,
+  'exclude_mine 要写成 or(is.null, neq)，单个 neq 会把没人接的会话一起漏掉')
+assert(!swExcludeCall.neq || !('agent_id' in swExcludeCall.neq),
+  '不能同时再挂一个 agent_id 的 neq——那等于把 or 的第一半又否掉了')
+// 关掉的时候一个条件都不加。'false' 和 '0' 是 GET 过来的假值，if (input.flag) 对它们都是真的。
+for (const off of [false, 'false', '0', '', undefined]) {
+  const swOff = recorder(swDecorated([swRow]))
+  await sxListAll(swOff, swAdmin, { exclude_mine: off })
+  assert(!swOff.calls.find(c => c.table === 'cs_sessions').or,
+    `exclude_mine=${JSON.stringify(off)} 是关着的，不能加条件`)
+}
 
 // §2.3 在线名单。
 const swNow = Date.now()

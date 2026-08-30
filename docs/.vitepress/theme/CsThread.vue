@@ -154,6 +154,26 @@ async function commitEdit() {
 
 const canMutate = (m: CsMessage) => mutable(m, myId.value, config.value.mutable_window_ms)
 
+/**
+ * §2.11 客服那侧的「查看历史」。
+ *
+ * 接口发过来的是两个字段而不是一个列表：recalled_body（撤回前的原文）和 edit_history（每一版的正文），
+ * 见 shared/cs.mjs 的 presentMessage。这里把它们合成一份给模板用——原来模板读的是 m.revisions，
+ * 那个名字接口从来没发过，于是这个按钮永远不出现，编辑痕迹在工作台上等于不存在。
+ *
+ * 撤回前的原文排在最前：一条被撤回的消息里，客服真正要看的就是它。
+ */
+function historyOf(m: CsMessage) {
+  const rows: Array<{ key: string; label: string; body: string; created_at: string }> = []
+  if (m.recalled_body !== undefined && m.recalled_body !== null) {
+    rows.push({ key: `${m.id}:recall`, label: '撤回前', body: m.recalled_body, created_at: m.created_at })
+  }
+  for (const r of m.edit_history || []) {
+    rows.push({ key: `${m.id}:${r.revision}`, label: `第 ${r.revision} 版`, body: r.body, created_at: r.created_at })
+  }
+  return rows
+}
+
 async function pick(event: Event) {
   const input = event.target as HTMLInputElement
   for (const file of Array.from(input.files || [])) await props.thread.upload(file)
@@ -225,15 +245,15 @@ const timeoutHint = computed(() => {
             <button v-if="canMutate(m) && !m.recalled" title="编辑" @click="startEdit(m)">
               <Pencil :size="14" />
             </button>
-            <button v-if="staff && m.revisions?.length" title="查看历史"
+            <button v-if="staff && historyOf(m).length" title="查看历史"
               @click="showHistory = { ...showHistory, [m.id]: !showHistory[m.id] }">
-              <Eye :size="14" />{{ m.revisions.length }}
+              <Eye :size="14" />{{ historyOf(m).length }}
             </button>
           </footer>
 
-          <div v-if="staff && showHistory[m.id] && m.revisions?.length" class="cs-revisions">
-            <p v-for="r in m.revisions" :key="r.revision">
-              <b>{{ r.kind === 'recall' ? '撤回前' : `第 ${r.revision} 版` }}</b>
+          <div v-if="staff && showHistory[m.id] && historyOf(m).length" class="cs-revisions">
+            <p v-for="r in historyOf(m)" :key="r.key">
+              <b>{{ r.label }}</b>
               <span>{{ r.body || '（空）' }}</span>
               <time>{{ csTime(r.created_at) }}</time>
             </p>
