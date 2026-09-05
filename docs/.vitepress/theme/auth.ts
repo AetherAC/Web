@@ -1,5 +1,6 @@
 import { computed, readonly, ref } from 'vue'
 import { createClient, type Session, type User } from '@supabase/supabase-js'
+import { safeNext } from '../../../shared/ldc.mjs'
 
 // 用户组的排名、标签和顺序都在 shared/groups.mjs 里，api/ 下的函数读的是同一个文件。这里只加 TS 类型：
 // 界面显示的权限和接口实际执行的权限不一致，比什么都不显示更糟。
@@ -61,7 +62,7 @@ export async function initializeAuth() {
   supabase.auth.onAuthStateChange((_event, session) => {
     sessionState.value = session
     userState.value = session?.user ?? null
-    queueMicrotask(async () => { await refreshProfile(); void syncGitHubGroup() })
+    setTimeout(() => { void refreshProfile(); void syncGitHubGroup() }, 0)
   })
   readyState.value = true
 }
@@ -97,5 +98,5 @@ export function useAuth() {
 }
 export function authRedirect(fallback = '/me') {
   const next = new URLSearchParams(location.search).get('next')
-  location.href = next?.startsWith('/') ? next : fallback
+  location.href = safeNext(next, fallback)
 }

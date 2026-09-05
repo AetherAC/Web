@@ -3,8 +3,8 @@
  *
  * 为什么是一个 composable 而不是每个组件各写一遍：用户端的挂件和客服端的工作台面对同一套接口，
  * 而其中三件事一旦两边不一致就会表现为难查的 bug——
- *   1. 收到 Realtime 推送后必须回头拉一次接口。推来的行是残缺的（撤回的空壳、visible_to_user=false
- *      的行），直接把它塞进列表的结果是用户看到自己撤回的原文。
+ *   1. RLS 验证过的 INSERT 用共享 presenter 即时显示；UPDATE/撤回仍回 API 拉取。
+ *      修订历史只由服务端提供，不把数据库原始推送直接当作完整消息。
  *   2. 附件路径必须是三段。自己拼字符串的一侧会上传成功而发消息被拒。
  *   3. 打字状态走 broadcast 而不是落库。两边用不同的 channel 名就是「对方永远不显示正在输入」。
  */
@@ -12,7 +12,7 @@
 import { computed, onScopeDispose, ref, type Ref } from 'vue'
 import {
   ATTACHMENT_BUCKET, MESSAGE_MAX_CHARS, attachmentKindOf, attachmentPath,
-  checkAttachmentSize, sessionCapabilities
+  checkAttachmentSize, presentMessage, sessionCapabilities
 } from '../../../shared/cs.mjs'
 import { supabase, useAuth } from './auth'
 
@@ -40,6 +40,7 @@ export interface CsMessage {
   recalled_at: string | null
   edited_at: string | null
   edit_count: number
+  delivery?: 'sending' | 'failed'
   created_at: string
   read_by_user_at?: string | null
   read_by_agent_at?: string | null
@@ -186,6 +187,12 @@ export function useCsThread() {
   let channel: any = null
   let peerTimer: any = null
   let typingSentAt = 0
+  let activeId: string | null = null
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined
+  let fallbackTimer: ReturnType<typeof setTimeout> | undefined
+  let realtimeReady = false
+  let disposed = false
+  const outbox = new Map<string, CsMessage>()
   /** refresh 的串行化状态：最多一次在飞 + 一次排队，见 refresh 的注释。 */
   let running: Promise<void> | null = null
   let pendingId: string | null = null
@@ -202,19 +209,21 @@ export function useCsThread() {
   async function fetchThread(id: string) {
     try {
       const data = await csApi(`/api/cs-message?session_id=${encodeURIComponent(id)}&limit=200`)
+      if (disposed || id !== activeId) return
       session.value = data.session
       capabilities.value = data.capabilities
-      messages.value = data.messages || []
+      const received = data.messages || []
+      const ids = new Set(received.map((m: CsMessage) => m.id))
+      for (const key of ids) outbox.delete(key as string)
+      messages.value = [...received, ...Array.from(outbox.values()).filter(m => m.session_id === id && !ids.has(m.id))]
       error.value = ''
     } catch (e: any) {
-      error.value = e.message
+      if (!disposed && id === activeId) error.value = e.message
     }
   }
 
   /**
-   * 拉一遍消息。Realtime 推送之后必须走这里而不是把推来的行 push 进列表——
-   * 推来的是数据库原始行，撤回时那一行的 body 是空的但原文不在里面，
-   * 而 visible_to_user=false 的行对用户根本不该出现。
+   * 拉取权威消息窗口。INSERT 可以先展示安全投影，但编辑/撤回历史、可见性和能力仍以 API 为准。
    *
    * 并发的调用会排队，不会被丢掉。原来是「已经在拉了就直接 return」，而关闭会话这件事恰好总是
    * 同时推两条（cs_messages 插一条系统提示 + cs_sessions 改 status），后一条被丢掉的结果就是
@@ -222,8 +231,8 @@ export function useCsThread() {
    * 一次排队，排队的那次总用最新请求的 id（工作台切会话时不会拉回上一条）。
    */
   function refresh(sessionId?: string): Promise<void> {
-    const id = sessionId || session.value?.id
-    if (!id) return Promise.resolve()
+    const id = sessionId || activeId
+    if (!id || disposed || id !== activeId) return Promise.resolve()
     if (!running) {
       running = fetchThread(id).finally(() => { running = null })
       return running
@@ -243,14 +252,33 @@ export function useCsThread() {
   /** 订阅这条会话。行推送触发重新拉取，broadcast 只用来传打字状态。 */
   function subscribe(sessionId: string) {
     unsubscribe()
+    activeId = sessionId
     if (!supabase) return
+    const scheduleRefresh = () => {
+      if (refreshTimer || activeId !== sessionId) return
+      // Coalesce message, session and read-marker events into one API fetch.
+      refreshTimer = setTimeout(() => { refreshTimer = undefined; void refresh(sessionId) }, 120)
+    }
     channel = supabase.channel(`cs:${sessionId}`, { config: { broadcast: { self: false } } })
       .on('postgres_changes',
         { event: '*', schema: 'public', table: 'cs_messages', filter: `session_id=eq.${sessionId}` },
-        () => { refresh(sessionId) })
+        (payload: any) => {
+          if (activeId !== sessionId || disposed) return
+          const row = payload.new
+          if (payload.eventType === 'INSERT' && row?.session_id === sessionId && capabilities.value?.can_see &&
+              (row.visible_to_user === true || capabilities.value?.can_see_revisions)) {
+            // INSERT has no revisions. RLS authenticates the feed; use the same presenter as the API.
+            // UPDATE still re-fetches: edited/recalled originals are staff-only, not broadcast data.
+            const message = presentMessage(row, { userId: auth.user.value?.id, group: auth.group.value }, null) as CsMessage
+            outbox.set(message.id, message)
+            messages.value = [...messages.value.filter(m => m.id !== message.id), message]
+          }
+          if (payload.eventType === 'UPDATE' || payload.eventType === 'DELETE') outbox.delete(row?.id || payload.old?.id)
+          scheduleRefresh()
+        })
       .on('postgres_changes',
         { event: 'UPDATE', schema: 'public', table: 'cs_sessions', filter: `id=eq.${sessionId}` },
-        () => { refresh(sessionId) })
+        scheduleRefresh)
       .on('broadcast', { event: 'typing' }, ({ payload }: any) => {
         // 只显示对方那一侧。自己那一侧也会收到时（self:false 之外的兜底），as_role 相同就忽略。
         const mine = capabilities.value?.is_owner ? 'user' : 'agent'
@@ -261,27 +289,60 @@ export function useCsThread() {
         // 靠超时熄灭是唯一不会卡住的做法（对方直接关掉标签页时不会发停止信号）。
         peerTimer = setTimeout(() => { peerTyping.value = false }, 3000)
       })
-      .subscribe()
+      .subscribe((status: string) => {
+        if (activeId !== sessionId) return
+        realtimeReady = status === 'SUBSCRIBED'
+        if (realtimeReady) scheduleRefresh()
+        poll()
+      })
+    function poll() {
+      clearTimeout(fallbackTimer)
+      fallbackTimer = setTimeout(() => {
+        if (activeId !== sessionId || disposed) return
+        if (typeof document !== 'undefined' && document.visibilityState === 'visible') void refresh(sessionId)
+        poll()
+      }, realtimeReady ? 30000 : 3000)
+    }
+    poll()
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', resume)
+      document.addEventListener('visibilitychange', resume)
+    }
+  }
+
+  function resume() {
+    if (document.visibilityState === 'visible') void refresh()
   }
 
   function unsubscribe() {
     if (channel && supabase) supabase.removeChannel(channel)
     channel = null
+    activeId = null
+    realtimeReady = false
+    clearTimeout(refreshTimer); refreshTimer = undefined
+    clearTimeout(fallbackTimer)
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', resume)
+      document.removeEventListener('visibilitychange', resume)
+    }
     clearTimeout(peerTimer)
     peerTyping.value = false
   }
 
   /** 切到另一条会话（工作台点列表）或第一次进入。 */
   async function attach(sessionId: string) {
+    unsubscribe()
+    activeId = sessionId
     loading.value = true
     pending.value = []
     messages.value = []
     try {
       await refresh(sessionId)
+      if (activeId !== sessionId || disposed) return
       subscribe(sessionId)
       if (capabilities.value?.can_see) markRead().catch(() => {})
     } finally {
-      loading.value = false
+      if (activeId === sessionId) loading.value = false
     }
   }
 
@@ -294,6 +355,7 @@ export function useCsThread() {
         method: 'POST',
         body: JSON.stringify({ action: 'open', channel: channelName, order_id: orderId || null })
       })
+      if (disposed) return data
       session.value = data.session
       capabilities.value = data.capabilities
       subscribe(data.session.id)
@@ -309,28 +371,53 @@ export function useCsThread() {
   }
 
   async function send(body: string, format: CsMessage['format'] = 'markdown') {
-    if (!session.value) return
+    if (!session.value || sending.value) return
+    const sessionId = session.value.id
     const text = String(body ?? '')
     if (!text.trim() && pending.value.length === 0) return
     sending.value = true
     error.value = ''
+    const localId = crypto.randomUUID()
+    const attachments = [...pending.value]
+    const optimistic: CsMessage = {
+      id: localId, session_id: sessionId, sender_id: auth.user.value?.id || null,
+      sender_role: isOwner.value ? 'user' : 'agent', body: text, format, attachments,
+      auto_reply: false, recalled: false, recalled_at: null, edited_at: null, edit_count: 0,
+      created_at: new Date().toISOString(), delivery: 'sending'
+    }
+    outbox.set(localId, optimistic)
+    messages.value = [...messages.value, optimistic]
     try {
       const data = await csApi('/api/cs-message', {
         method: 'POST',
         body: JSON.stringify({
-          action: 'send', session_id: session.value.id,
-          body: text, format, attachments: pending.value
+          action: 'send', session_id: sessionId,
+          body: text, format, attachments, client_message_id: localId
         })
       })
-      pending.value = []
+      outbox.delete(localId)
+      if (sessionId !== activeId || disposed) return data
+      pending.value = pending.value.filter(a => !attachments.some(sent => sent.path === a.path))
       // 乐观追加自己那条就够了。这里不再 await 第二次 refresh：那一次拉的是自动回复和服务端时间戳，
       // 而 cs_messages 的 Realtime 推送本来就会触发同一个 refresh。await 它的唯一效果是
       // 「发送中」按钮多按一整个往返才松开——消息早已经在列表里了。
-      if (data.message) messages.value = [...messages.value, data.message]
+      const received = [data.message, data.auto_reply].filter(Boolean)
+      for (const message of received) outbox.set(message.id, message)
+      const ids = new Set([localId, ...received.map(m => m.id)])
+      messages.value = [...messages.value.filter(m => !ids.has(m.id)), ...received]
       refresh().catch(() => {})
       return data
     } catch (e: any) {
-      error.value = e.message
+      const committed = messages.value.find(m => m.id === localId && !m.delivery)
+      if (committed && sessionId === activeId && !disposed) {
+        pending.value = pending.value.filter(a => !attachments.some(sent => sent.path === a.path))
+        return { message: committed }
+      }
+      outbox.delete(localId)
+      if (sessionId === activeId && !disposed) {
+        messages.value = messages.value.filter(m => m.id !== localId)
+        error.value = e.message
+      }
       throw e
     } finally {
       sending.value = false
@@ -455,7 +542,7 @@ export function useCsThread() {
     return data
   }
 
-  onScopeDispose(unsubscribe)
+  onScopeDispose(() => { disposed = true; outbox.clear(); unsubscribe() })
 
   return {
     session, capabilities, messages, config, loading, sending, error, peerTyping,
@@ -523,6 +610,7 @@ export function useCsPresence(intervalMs = 45000) {
 
 /** 组件里判「这条消息能不能撤回/编辑」。和服务端同一套条件，少一条就是一个点了报错的按钮。 */
 export function mutable(message: CsMessage, userId: string | undefined, windowMs: number) {
+  if (message.delivery) return false
   if (!userId || message.sender_id !== userId) return false
   if (message.recalled || message.auto_reply) return false
   if (message.sender_role === 'system') return false

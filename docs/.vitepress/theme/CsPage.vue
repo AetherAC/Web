@@ -19,6 +19,7 @@ import { orderPath } from './routes'
 
 const auth = useAuth()
 const thread = useCsThread()
+let listRealtimeReady = false
 const presence = useCsPresence()
 
 type Tab = 'queue' | 'mine' | 'all' | 'agents' | 'dashboard'
@@ -312,7 +313,10 @@ function subscribeList() {
   listChannel = supabase.channel('cs:workbench')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'cs_sessions' }, () => scheduleReload())
     .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'cs_messages' }, () => scheduleReload())
-    .subscribe()
+    .subscribe((status: string) => {
+      listRealtimeReady = status === 'SUBSCRIBED'
+      if (listRealtimeReady) scheduleReload(0)
+    })
 }
 
 function onVisibility() {
@@ -321,10 +325,14 @@ function onVisibility() {
 }
 
 onMounted(() => {
+  let lastPoll = 0
   pollTimer = setInterval(() => {
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-    if (!loading.value) load()
-  }, 60000)
+    if (!loading.value && Date.now() - lastPoll >= (listRealtimeReady ? 60000 : 5000)) {
+      lastPoll = Date.now()
+      void load()
+    }
+  }, 5000)
   if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
 })
 

@@ -13,6 +13,7 @@ import {
 import { renderRichBody } from './markdown'
 import { csTime, formatBytes, mutable, type CsMessage } from './cs'
 import { useAuth } from './auth'
+import LdcPanel from './LdcPanel.vue'
 
 const props = defineProps<{
   thread: any
@@ -23,6 +24,7 @@ const props = defineProps<{
 
 const auth = useAuth()
 const draft = ref('')
+const ldcOpen = ref(false)
 const editing = ref<string | null>(null)
 const editDraft = ref('')
 const scroller = ref<HTMLElement | null>(null)
@@ -68,6 +70,7 @@ const ROLE_LABEL: Record<string, string> = {
  * 那一行），所以那两个字段是唯一来源，取不到时退回身份名。
  */
 const roleName = (m: CsMessage) => {
+  if (m.delivery === 'sending') return '发送中…'
   if (m.auto_reply) return '自动回复'
   if (m.sender_role === 'user') return ownerSide.value ? '我' : (session.value?.user_name || '用户')
   if (m.sender_role === 'admin') return isMyAccount(m) ? '我' : '管理员'
@@ -123,10 +126,12 @@ onMounted(() => {
 })
 
 async function submit() {
+  if (props.thread.sending.value) return
   const text = draft.value
   if (!text.trim() && props.thread.pending.value.length === 0) return
   draft.value = ''
-  try { await props.thread.send(text) } catch { draft.value = text }
+  const id = session.value?.id
+  try { await props.thread.send(text) } catch { if (session.value?.id === id) draft.value = text }
 }
 
 function keydown(event: KeyboardEvent) {
@@ -194,6 +199,7 @@ const timeoutHint = computed(() => {
 
 <template>
 <div class="cs-thread">
+  <details v-if="session?.id" class="cs-ldc" @toggle="ldcOpen = ($event.target as HTMLDetailsElement).open"><summary>LDC 服务请求与付款确认</summary><LdcPanel v-if="ldcOpen" :key="session.id" :session-id="session.id" :staff="staff" :can-request="canPost"/></details>
   <div ref="scroller" class="cs-scroll">
     <p v-if="thread.loading.value && !messages.length" class="cs-hint">正在载入对话…</p>
     <p v-else-if="!messages.length" class="cs-hint">还没有消息。说明你的问题，客服会尽快回复。</p>
@@ -309,3 +315,7 @@ const timeoutHint = computed(() => {
   </form>
 </div>
 </template>
+<style scoped>
+.cs-ldc{flex:none;max-height:55%;overflow:auto;border-bottom:1px solid var(--fluent-stroke)}
+.cs-ldc>summary{padding:10px 16px;cursor:pointer;color:var(--fluent);background:var(--fluent-layer);font-size:13px}
+</style>

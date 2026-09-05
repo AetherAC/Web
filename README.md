@@ -52,7 +52,14 @@ This one statement is unavoidable: changing `group_name` requires an existing ad
 
 The Admin environment editor needs `VERCEL_API_TOKEN`, `VERCEL_PROJECT_ID` and, for team-owned projects, `VERCEL_TEAM_ID` to be configured once in Vercel. All remaining runtime and build variables can then be managed in `/admin`; environment changes require a redeployment.
 
-## Payments
+## Linux.DO, LDC and customer-service payments
+
+See [LINUXDO-LDC.md](LINUXDO-LDC.md) for OAuth setup, the additive database installation,
+configurable LDC discount/coupon offers, owner-confirmed customer-service payment requests,
+message-latency changes, verification steps and safe rollback. The new features default to off.
+Offline mocked regression tests: `npm run test:ldc`.
+
+## Existing payment providers
 
 Eight of the eleven providers are pure configuration: `payment_providers.public_config` supplies either a `checkout_url_template` or a `create_url` request whose response is mapped through `checkout_url_path` and `provider_order_id_path`, and their callbacks are authenticated by an HMAC over the JSON body.
 

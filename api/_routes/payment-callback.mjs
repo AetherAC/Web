@@ -25,7 +25,10 @@ export default async function handler(req, res) {
     // a forged callback cannot mark an unpaid order as paid, and anything still in flight stays `pending`.
     const driver = driverFor(config)
     if (driver) {
-      const outcome = await driver.verify({ payload, headers: req.headers, config })
+      // `provider` is the row id the callback arrived on. One driver can back several rows (虎皮椒 has
+      // one for Alipay and one for WeChat), and such a driver needs to know which row it is answering
+      // for — the id is in the URL, never in the body.
+      const outcome = await driver.verify({ payload, headers: req.headers, config, provider })
       if (!outcome) return send(res, 200, { ok: true, ignored: true })
       const ack = outcome.ack || {}
       // 一条与订单无关的通知（支付宝的退款、对账通知就没有 trade_status）：什么都不改，但仍要回执，

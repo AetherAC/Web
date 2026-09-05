@@ -1,8 +1,20 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { Github, LockKeyhole, Mail, ShieldCheck, ArrowRight, BadgeCheck } from 'lucide-vue-next'
 import SiteHeader from './SiteHeader.vue'
 import { authRedirect, supabase, useAuth } from './auth'
+import { ldcApi, linuxdoLogin } from './ldc'
+const linuxdoEnabled = ref(false)
+onMounted(async () => {
+  const error = new URLSearchParams(location.hash.slice(1)).get('error_description') || new URLSearchParams(location.search).get('error_description')
+  if (error) message.value = error
+  try { linuxdoEnabled.value = (await ldcApi({}, '?view=config')).linuxdo_enabled } catch { /* Existing login methods remain available. */ }
+})
+async function linuxdo() {
+  busy.value = true; message.value = ''
+  try { await linuxdoLogin() } catch (e: any) { message.value = e.message }
+  finally { busy.value = false }
+}
 const props = defineProps<{ mode: 'login' | 'register' }>()
 const { configured } = useAuth()
 const email = ref(''); const password = ref(''); const displayName = ref('')
@@ -49,5 +61,31 @@ async function github() {
   await supabase?.auth.signInWithOAuth({ provider: 'github', options: { redirectTo: `${location.origin}/me` } })
 }
 </script>
-<template><div class="fluent-page"><SiteHeader/><main class="auth-layout"><section class="auth-brand"><div class="auth-brand-mark"><ShieldCheck :size="34"/></div><p class="eyebrow">AETHER IDENTITY</p><h1>一个账户，连接产品、订单与协作空间。</h1><p>使用 Supabase Auth 持久化登录态。密码、邮箱验证与 GitHub OAuth 使用同一个账户体系。</p><div class="auth-proof"><BadgeCheck/><span><b>受保护的访问</b><small>订单归属、退款证据和管理员操作均由 RLS 校验。</small></span></div></section>
-<section class="auth-card"><div v-if="!configured" class="fluent-notice">尚未配置 Supabase 浏览器环境变量。</div><template v-else><header><p>{{ mode === 'login' ? '欢迎回来' : '创建 AetherAC 账户' }}</p><h2>{{ mode === 'login' ? '登录' : '注册' }}</h2></header><form v-if="step==='form'" @submit.prevent="submit"><label v-if="mode==='register'">显示名称<div class="field"><input v-model="displayName" autocomplete="name" placeholder="你的名称"></div></label><label>邮箱<div class="field"><Mail :size="18"/><input v-model="email" type="email" autocomplete="email" required placeholder="name@example.com"></div></label><label>密码<div class="field"><LockKeyhole :size="18"/><input v-model="password" type="password" :autocomplete="mode==='login'?'current-password':'new-password'" minlength="8" required placeholder="至少 8 位"></div></label><button class="fluent-primary" :disabled="busy">{{ busy ? '正在处理…' : (mode==='login'?'登录':'创建账户') }}<ArrowRight :size="17"/></button><button class="fluent-secondary" type="button" @click="sendLink"><Mail :size="17"/>通过邮箱链接登录</button><div class="auth-divider"><span>或</span></div><button class="github-auth" type="button" @click="github"><Github :size="19"/>使用 GitHub 继续</button></form><form v-else @submit.prevent="sendLink"><p class="verify-copy">我们已向 <b>{{email}}</b> 发送了一封邮件。点开里面的链接即可完成验证并登录，不需要输入验证码。没收到就检查垃圾邮件，或者重新发送一次。</p><button class="fluent-primary" :disabled="busy"><Mail :size="17"/>{{ busy ? '正在发送…' : '重新发送链接' }}</button><button class="fluent-secondary" type="button" @click="step='form'">返回</button></form><p class="form-message">{{message}}</p><footer>{{mode==='login'?'还没有账户？':'已经有账户？'}} <a :href="mode==='login'?'/register':'/login'">{{mode==='login'?'立即注册':'返回登录'}}</a></footer></template></section></main></div></template>
+<template>
+  <div class="fluent-page"><SiteHeader/><main class="auth-layout">
+    <section class="auth-brand">
+      <div class="auth-brand-mark"><ShieldCheck :size="34"/></div><p class="eyebrow">AETHER IDENTITY</p>
+      <h1>一个账户，连接产品、订单与协作空间。</h1>
+      <p>密码、邮箱验证、GitHub 与 Linux.DO 登录使用同一套 Supabase 账户体系。已有账户可登录后绑定 Linux.DO，保留订单。</p>
+      <div class="auth-proof"><BadgeCheck/><span><b>受保护的访问</b><small>订单归属、退款证据和管理员操作均由 RLS 校验。</small></span></div>
+    </section>
+    <section class="auth-card">
+      <div v-if="!configured" class="fluent-notice">尚未配置 Supabase 浏览器环境变量。</div>
+      <template v-else>
+        <header><p>{{ mode === 'login' ? '欢迎回来' : '创建 AetherAC 账户' }}</p><h2>{{ mode === 'login' ? '登录' : '注册' }}</h2></header>
+        <form v-if="step==='form'" @submit.prevent="submit">
+          <label v-if="mode==='register'">显示名称<div class="field"><input v-model="displayName" autocomplete="name" placeholder="你的名称"></div></label>
+          <label>邮箱<div class="field"><Mail :size="18"/><input v-model="email" type="email" autocomplete="email" required placeholder="name@example.com"></div></label>
+          <label>密码<div class="field"><LockKeyhole :size="18"/><input v-model="password" type="password" :autocomplete="mode==='login'?'current-password':'new-password'" minlength="8" required placeholder="至少 8 位"></div></label>
+          <button class="fluent-primary" :disabled="busy">{{ busy ? '正在处理…' : (mode==='login'?'登录':'创建账户') }}<ArrowRight :size="17"/></button>
+          <button class="fluent-secondary" type="button" :disabled="busy" @click="sendLink"><Mail :size="17"/>通过邮箱链接登录</button>
+          <div class="auth-divider"><span>或</span></div>
+          <button class="github-auth" type="button" :disabled="busy" @click="github"><Github :size="19"/>使用 GitHub 继续</button>
+          <button v-if="linuxdoEnabled" class="fluent-secondary" type="button" :disabled="busy" @click="linuxdo"><ShieldCheck :size="19"/>使用 Linux.DO 继续</button>
+        </form>
+        <form v-else @submit.prevent="sendLink"><p class="verify-copy">我们已向 <b>{{email}}</b> 发送了一封邮件。点开里面的链接即可完成验证并登录。没收到请检查垃圾邮件，或重新发送。</p><button class="fluent-primary" :disabled="busy"><Mail :size="17"/>{{ busy ? '正在发送…' : '重新发送链接' }}</button><button class="fluent-secondary" type="button" @click="step='form'">返回</button></form>
+        <p class="form-message" role="status">{{message}}</p><footer>{{mode==='login'?'还没有账户？':'已经有账户？'}} <a :href="mode==='login'?'/register':'/login'">{{mode==='login'?'立即注册':'返回登录'}}</a></footer>
+      </template>
+    </section>
+  </main></div>
+</template>

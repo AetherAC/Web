@@ -160,9 +160,10 @@ export async function assignAgent(db, channel, settings) {
  */
 export async function insertMessage(db, session, {
   senderId, senderRole, body, format = 'markdown', attachments = [],
-  autoReply = false, autoReplyRuleId = null, authoredBy = null, visibleToUser = true
+  autoReply = false, autoReplyRuleId = null, authoredBy = null, visibleToUser = true, id
 }) {
   const { data, error } = await db.from('cs_messages').insert({
+    ...(id ? { id } : {}),
     session_id: session.id, sender_id: senderId ?? null, sender_role: senderRole,
     body, format, attachments,
     auto_reply: autoReply, auto_reply_rule_id: autoReplyRuleId,

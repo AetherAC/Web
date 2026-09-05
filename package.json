@@ -8,7 +8,8 @@
     "preview": "vitepress preview docs",
     "test:api": "node tests/api-smoke.mjs",
     "test:routes": "node tests/route-resolve.mjs",
-    "test": "npm run test:api && npm run build && npm run test:routes"
+    "test:ldc": "node tests/ldc-smoke.mjs",
+    "test": "npm run test:api && npm run test:ldc && npm run build && npm run test:routes"
   },
   "dependencies": {
     "@fontsource-variable/manrope": "^5.2.6",

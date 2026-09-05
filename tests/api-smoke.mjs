@@ -3,15 +3,15 @@ import usersHandler, { isBanned } from '../api/_routes/admin-users.mjs'
 import {
   DRIVERS,
   ALIPAY_GATEWAY,
-  alipayBytes,
-  alipayCharge,
+  utf8Clip,
+  cnyCharge,
   alipayCheckoutUrl,
-  alipayFx,
-  alipayOrderId,
-  alipayOutTradeNo,
+  fxLocked,
+  fxOrderId,
+  fxMerchantNo,
   alipayPem,
   alipayProduct,
-  alipayRate,
+  cnyRate,
   alipayRequestParams,
   alipaySign,
   alipaySignContent,
@@ -26,7 +26,19 @@ import {
   payerurlSign,
   payerurlSignedFields,
   paypalOrderBody,
-  stripeSessionForm
+  stripeSessionForm,
+  minorAmount,
+  cnyTitle,
+  isMobileUa,
+  NOWPAYMENTS_BASE,
+  NOWPAYMENTS_SANDBOX_BASE,
+  nowpaymentsInvoiceBody,
+  XUNHUPAY_BASE,
+  xunhupayBody,
+  xunhupayHash,
+  xunhupayPlugins,
+  xunhupayQuery,
+  xunhupaySignContent
 } from '../api/_lib/payments.mjs'
 import {
   SCHEMA,
@@ -513,49 +525,49 @@ assert(alipaySignContent({ sign_type: 'RSA2', a: '1' }, ['sign', 'sign_type']) =
   'an async notify excludes sign_type — getting these two rules backwards makes every callback fail to verify')
 assert(alipaySignContent({ subject: '入门版 Starter' }) === 'subject=入门版 Starter', 'the sign content is not URL-encoded; encoding it would break every signature')
 
-assert(alipayOutTradeNo(order.id) === 'a1b2c3d4000040008000000000000001' && !alipayOutTradeNo(order.id).includes('-'),
+assert(fxMerchantNo(order.id) === 'a1b2c3d4000040008000000000000001' && !fxMerchantNo(order.id).includes('-'),
   'out_trade_no accepts only letters, digits and underscores, so the UUID hyphens must go')
-assert(alipayOrderId(alipayOutTradeNo(order.id)) === order.id, 'the mapping must be reversible, or a paid callback cannot find its order')
-assert(alipayOrderId('LEGACY_REF_1') === 'LEGACY_REF_1' && alipayOrderId('') === null, 'anything that is not 32 hex digits passes through instead of becoming null')
+assert(fxOrderId(fxMerchantNo(order.id)) === order.id, 'the mapping must be reversible, or a paid callback cannot find its order')
+assert(fxOrderId('LEGACY_REF_1') === 'LEGACY_REF_1' && fxOrderId('') === null, 'anything that is not 32 hex digits passes through instead of becoming null')
 
 // 换算过的订单把「原币_原币金额_人民币金额」锁在单号尾部，因为 verify 只拿到通知正文，拿不到订单行。
-const fxRef = alipayOutTradeNo(order.id, { currency: 'USD', amountMinor: 1999, cnyMinor: 14294 })
+const fxRef = fxMerchantNo(order.id, { currency: 'USD', amountMinor: 1999, cnyMinor: 14294 })
 assert(fxRef === 'a1b2c3d4000040008000000000000001_USD_1999_14294' && fxRef.length <= 64 && /^[A-Za-z0-9_]+$/.test(fxRef),
   'the locked rate rides in out_trade_no, and it must still be letters/digits/underscore inside 64 bytes')
-assert(alipayOrderId(fxRef) === order.id, 'the suffix must not stop a paid callback from finding its order')
-assert(alipayFx(fxRef).cnyMinor === 14294 && alipayFx(fxRef).currency === 'USD' && alipayFx(fxRef).amountMinor === 1999,
+assert(fxOrderId(fxRef) === order.id, 'the suffix must not stop a paid callback from finding its order')
+assert(fxLocked(fxRef).cnyMinor === 14294 && fxLocked(fxRef).currency === 'USD' && fxLocked(fxRef).amountMinor === 1999,
   'the three segments must come back exactly, or a converted payment cannot be checked against the order')
-assert(alipayFx(alipayOutTradeNo(order.id)) === null && alipayFx('LEGACY_REF_1') === null && alipayFx('x_usd_1_2') === null,
+assert(fxLocked(fxMerchantNo(order.id)) === null && fxLocked('LEGACY_REF_1') === null && fxLocked('x_usd_1_2') === null,
   'a CNY order carries no conversion, and a malformed suffix must read as none rather than as a made-up rate')
 
-assert(alipayBytes('入门版专业版', 9) === '入门版', 'subject is capped in bytes, and a half-cut character would garble the cashier title')
-assert(alipayBytes('abc', 9) === 'abc', 'a short subject is left alone')
+assert(utf8Clip('入门版专业版', 9) === '入门版', 'subject is capped in bytes, and a half-cut character would garble the cashier title')
+assert(utf8Clip('abc', 9) === 'abc', 'a short subject is left alone')
 
 const cnyOrder = { ...order, currency: 'CNY' }
-assert(alipayCharge(cnyOrder).total === '19.99' && alipayCharge(cnyOrder).fx === null, 'total_amount is yuan, not the minor unit, and a CNY order needs no conversion')
+assert(cnyCharge(cnyOrder).total === '19.99' && cnyCharge(cnyOrder).fx === null, 'total_amount is yuan, not the minor unit, and a CNY order needs no conversion')
 // 支付宝国内商户结算的是人民币，所以非人民币订单按汇率折成人民币再发出去。分位向上取整：向下取整会让每
 // 一笔换算订单少收最多一分，而那一分回来就是一个 409。
-const usdCharge = alipayCharge(order, 7.1503)
+const usdCharge = cnyCharge(order, 7.1503)
 assert(usdCharge.total === '142.94' && usdCharge.fx.cnyMinor === 14294 && usdCharge.fx.currency === 'USD' && usdCharge.fx.amountMinor === 1999,
   'a USD order is converted at the rate rather than charged the same number in yuan — that would be a silent 86% undercharge that never errors')
 assert(Math.floor(usdCharge.fx.amountMinor * (usdCharge.fx.cnyMinor - 1) / usdCharge.fx.cnyMinor) < 1999,
   'one fen short must fold back to below the order amount, or payment-callback would release an underpaid order')
 let alipayThrew = false
-try { alipayCharge(order, 0) } catch { alipayThrew = true }
+try { cnyCharge(order, 0) } catch { alipayThrew = true }
 assert(alipayThrew, 'with no rate the order must not go out at all; charging 1:1 is the failure this conversion exists to prevent')
 
 // 汇率来源：钉死的优先且不联网，否则查接口并缓存，查不到就抛而不是回落到 1。
 const fxCalls = []
 const fxStub = async (url) => { fxCalls.push(url); return { rates: { CNY: 7.2 } } }
-assert(await alipayRate('CNY', {}, { fetchJson: fxStub }) === 1 && fxCalls.length === 0, 'a CNY order must never touch the rate feed')
-assert(await alipayRate('USD', { fx_rates: { USD: 7.1 } }, { fetchJson: fxStub }) === 7.1 && fxCalls.length === 0,
+assert(await cnyRate('CNY', {}, { fetchJson: fxStub }) === 1 && fxCalls.length === 0, 'a CNY order must never touch the rate feed')
+assert(await cnyRate('USD', { fx_rates: { USD: 7.1 } }, { fetchJson: fxStub }) === 7.1 && fxCalls.length === 0,
   'public_config.fx_rates pins the rate without a network call, so a third-party outage cannot block checkout')
-assert(Math.abs(await alipayRate('USD', { fx_rates: { USD: 7.1 }, fx_markup: 0.02 }, { fetchJson: fxStub }) - 7.242) < 1e-9,
+assert(Math.abs(await cnyRate('USD', { fx_rates: { USD: 7.1 }, fx_markup: 0.02 }, { fetchJson: fxStub }) - 7.242) < 1e-9,
   'fx_markup adds the spread on top of the mid-market rate')
-assert(await alipayRate('SEK', {}, { fetchJson: fxStub }) === 7.2 && fxCalls[0].includes('from=SEK&to=CNY'), 'the feed is asked for the order currency against CNY')
-assert(await alipayRate('SEK', {}, { fetchJson: fxStub }) === 7.2 && fxCalls.length === 1, 'the rate is cached inside the instance rather than fetched on every checkout')
+assert(await cnyRate('SEK', {}, { fetchJson: fxStub }) === 7.2 && fxCalls[0].includes('from=SEK&to=CNY'), 'the feed is asked for the order currency against CNY')
+assert(await cnyRate('SEK', {}, { fetchJson: fxStub }) === 7.2 && fxCalls.length === 1, 'the rate is cached inside the instance rather than fetched on every checkout')
 let fxThrew = false
-try { await alipayRate('ZWL', {}, { fetchJson: async () => ({ rates: {} }) }) } catch { fxThrew = true }
+try { await cnyRate('ZWL', {}, { fetchJson: async () => ({ rates: {} }) }) } catch { fxThrew = true }
 assert(fxThrew, 'a currency the feed does not quote must throw; falling back to 1 turns "no rate" into "charge 1:1"')
 
 assert(alipayProduct({}, {}).method === 'alipay.trade.page.pay', 'a desktop browser gets 电脑网站支付')
@@ -569,7 +581,7 @@ assert(alipayParams.version === '1.0' && alipayParams.format === 'JSON' && alipa
 assert(alipayParams.notify_url === `${site}/v1/callback/alipay`, 'the notify must reach our own endpoint')
 assert(alipayParams.return_url === `${site}/order?order_id=${order.id}&paid=1`, 'the buyer must land back on the order page')
 const alipayBiz = JSON.parse(alipayParams.biz_content)
-assert(alipayBiz.out_trade_no === alipayOutTradeNo(order.id) && alipayBiz.total_amount === '19.99', 'biz_content carries the order reference and the yuan amount')
+assert(alipayBiz.out_trade_no === fxMerchantNo(order.id) && alipayBiz.total_amount === '19.99', 'biz_content carries the order reference and the yuan amount')
 assert(alipayBiz.product_code === 'FAST_INSTANT_TRADE_PAY', 'product_code is what selects 电脑网站支付; the wrong one is refused by the gateway')
 assert(alipayBiz.subject === '入门版', 'the buyer must see the artifact name on the cashier page, not the SKU')
 assert(alipayBiz.timeout_express === '30m' && alipayBiz.quit_url === undefined, 'an unpaid order must close itself, and page.pay has no quit_url')
@@ -594,7 +606,7 @@ const alipayNotifySign = (data) =>
 const notify = {
   notify_time: '2026-08-30 09:05:00', notify_type: 'trade_status_sync', notify_id: 'n_smoke_1',
   app_id: '2021000000000001', auth_app_id: '2021000000000001', charset: 'utf-8', version: '1.0', sign_type: 'RSA2',
-  trade_no: '2026083022001400000000000001', out_trade_no: alipayOutTradeNo(order.id),
+  trade_no: '2026083022001400000000000001', out_trade_no: fxMerchantNo(order.id),
   trade_status: 'TRADE_SUCCESS', total_amount: '19.99', receipt_amount: '19.99', buyer_id: '2088000000000001'
 }
 const signedNotify = (data) => ({ ...data, sign: alipayNotifySign(data) })
@@ -641,9 +653,232 @@ const alipayIgnored = await DRIVERS.alipay.verify({ payload: signedNotify({ ...a
 assert(alipayIgnored.ignore === true && alipayIgnored.ack.ok === 'success',
   'a notify with no trade_status touches no order but must still be acknowledged, or Alipay redelivers it for a full day')
 
+// 虎皮椒（聚合支付）。协议全部来自厂商自己的两个 WooCommerce 插件源码，所以这里钉的是那份实现：待签名串
+// 错一个字符的后果不是报错，而是每一笔付款的通知都验不过、订单永远停在待支付。
+process.env.XUNHUPAY_APPID = '201906120000'
+process.env.XUNHUPAY_APP_SECRET = 'smoke_app_secret'
+
+// ksort → 跳过 hash / null / ''，k=v& 拼接，值不编码；再 md5(串 + 密钥)。
+assert(xunhupaySignContent({ b: '2', a: '1', hash: 'x', blank: '', missing: null }) === 'a=1&b=2',
+  'the sign content sorts keys and drops hash, empty strings and nulls — exactly what the vendor ksort loop does')
+assert(xunhupaySignContent({ zero: 0, str: '0' }) === 'str=0&zero=0',
+  'the vendor skips only null and the empty string, so a 0 must stay in the string')
+assert(xunhupaySignContent({ title: '入门版 Starter' }) === 'title=入门版 Starter',
+  'values are not URL-encoded; encoding them would break every signature')
+// 固定输入 → 固定摘要。这一条把整套签名（拼串 + md5 + 密钥拼在后面）钉死。
+assert(xunhupayHash({ appid: 'a', total_fee: '1.00' }, 'k') === nodeCrypto.createHash('md5').update('appid=a&total_fee=1.00k').digest('hex'),
+  'the digest is md5(signContent + appSecret) with the secret appended, not prefixed')
+assert(xunhupayHash({ a: '1', hash: 'stale' }, 'k') === xunhupayHash({ a: '1' }, 'k'),
+  'a hash already on the body must not feed itself into the new digest')
+
+const xhCny = { ...cnyOrder, provider: 'xunhupay_alipay' }
+const { body: xhBody } = xunhupayBody({ order: xhCny, artifact, siteUrl: site, now: 1_756_515_723_000 })
+assert(xhBody.version === '1.1' && xhBody.appid === '201906120000', 'the vendor pins api version 1.1')
+assert(xhBody.trade_order_id === fxMerchantNo(order.id), 'the merchant reference is the same encoding the CNY channels share')
+assert(xhBody.total_fee === '19.99' && typeof xhBody.total_fee === 'string',
+  'total_fee must be a string: as a JSON number 19.90 serialises to 19.9 and the server would sign a different string than we did')
+assert(xhBody.time === '1756515723' && xhBody.nonce_str.length === 10 && /^\d+$/.test(xhBody.nonce_str),
+  'time is unix seconds, and nonce_str keeps the digits-only shape the vendor produces')
+assert(xhBody.title === '入门版', 'the buyer must see the artifact name on the cashier page, not the SKU')
+assert(xhBody.notify_url === `${site}/v1/callback/xunhupay_alipay`,
+  'the notify carries the provider row id, so the Alipay row and the WeChat row cannot cross wires')
+assert(xhBody.return_url === `${site}/order?order_id=${order.id}&paid=1` && xhBody.callback_url === `${site}/order?order_id=${order.id}`,
+  'a paid buyer lands on the order page, and cancelling returns there without the paid flag')
+assert(xhBody.type === undefined && xhBody.wap_url === undefined, 'a desktop browser gets no WAP fields')
+assert(xhBody.plugins === 'xunhupay_alipay' && xunhupayPlugins({ provider: 'xunhupay_wechat' }, {}) === 'xunhupay_wechat'
+  && xunhupayPlugins({ provider: 'x' }, { plugins: 'woo-alipay' }) === 'woo-alipay',
+  'plugins defaults to the row id and stays overridable, in case the server ever validates it')
+
+const { body: xhWap } = xunhupayBody({ order: xhCny, artifact, siteUrl: site, headers: { 'user-agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)' } })
+assert(xhWap.type === 'WAP' && xhWap.wap_url === site && xhWap.wap_name === 'aetherac.abnt.it',
+  'a phone needs the three WAP fields, or the cashier cannot open the payment app')
+assert(xunhupayBody({ order: xhCny, artifact, siteUrl: site, config: { wap: true } }).body.type === 'WAP'
+  && xunhupayBody({ order: xhCny, artifact, siteUrl: site, config: { wap: false }, headers: { 'user-agent': 'iPhone' } }).body.type === undefined,
+  'public_config.wap must be able to pin the choice in both directions')
+assert(isMobileUa({ 'user-agent': 'Android' }) === true && isMobileUa({}) === false, 'the UA test is shared by the CNY channels')
+assert(cnyTitle({ name: '  入门版\n专业版  ' }, order) === '入门版 专业版', 'a newline in the title would wrap the cashier headline')
+
+// 换算过的订单：金额锁进单号，回调时折回原币种。
+const { body: xhFxBody } = xunhupayBody({ order: { ...order, provider: 'xunhupay_alipay' }, artifact, siteUrl: site, rate: 7.1503 })
+assert(xhFxBody.total_fee === '142.94' && xhFxBody.trade_order_id === fxRef,
+  'a USD order is charged the converted yuan amount, with the rate locked into the reference')
+
+// 下单：签名与正文必须来自同一个对象，且正文是 JSON、Content-Type 是表单——厂商用 curl 的 POSTFIELDS 发
+// 一个 JSON 字符串却从未设过 header，而那是唯一被真实交易验证过的组合。
+const xhCreateCalls = []
+const xhCreate = await DRIVERS.xunhupay.create({
+  order: xhCny, artifact, siteUrl: site, config: {}, headers: {},
+  fetchJson: async (url, options) => { xhCreateCalls.push({ url, options }); return { errcode: 0, errmsg: 'success', url: 'https://pay.xunhupay.com/c/abc', url_qrcode: 'https://pay.xunhupay.com/qr/abc.png' } }
+})
+assert(xhCreateCalls[0].url === `${XUNHUPAY_BASE}/payment/do.html`, 'the create call goes to /payment/do.html')
+assert(xhCreateCalls[0].options.headers['Content-Type'] === 'application/x-www-form-urlencoded',
+  'the vendor never sets a Content-Type, so curl labels its JSON body as a form; that is the combination the server is known to accept')
+const xhSent = JSON.parse(xhCreateCalls[0].options.body)
+assert(xhSent.hash === xunhupayHash(xhSent, 'smoke_app_secret'),
+  'the posted body must be exactly what was signed — a field changed between signing and serialising fails on the server, not here')
+assert(xhCreate.checkoutUrl === 'https://pay.xunhupay.com/c/abc', 'the buyer is sent to the cashier page')
+assert(xhCreate.providerOrderId === fxMerchantNo(order.id), 'before payment there is no transaction id, so the row holds the merchant reference')
+// 电脑端 url 是不是可用的收银台没有官方说明（厂商插件在电脑端渲染的是 url_qrcode 那张图），所以留一个键。
+const xhQr = await DRIVERS.xunhupay.create({
+  order: xhCny, artifact, siteUrl: site, config: { checkout_field: 'url_qrcode' }, headers: {},
+  fetchJson: async () => ({ errcode: 0, url: 'https://pay.xunhupay.com/c/abc', url_qrcode: 'https://pay.xunhupay.com/qr/abc.png' })
+})
+assert(xhQr.checkoutUrl === 'https://pay.xunhupay.com/qr/abc.png', 'public_config.checkout_field must be able to switch to the QR image without a code change')
+let xhCreateThrew = ''
+try { await DRIVERS.xunhupay.create({ order: xhCny, artifact, siteUrl: site, config: {}, headers: {}, fetchJson: async () => ({ errcode: 1, errmsg: 'appid 不存在' }) }) }
+catch (error) { xhCreateThrew = error.message }
+assert(xhCreateThrew === 'appid 不存在', 'a non-zero errcode must surface the vendor message at checkout rather than produce a dead order')
+
+// 查单：表单编码，不是 JSON。
+const xhQueryCalls = []
+const xhQueried = await xunhupayQuery('ref_1', {}, { now: 1_756_515_723_000, nonce: '1234567890', fetchJson: async (url, options) => { xhQueryCalls.push({ url, options }); return { errcode: 0, data: { status: 'OD', transaction_id: 'tx_1', total_fee: '19.99' } } } })
+assert(xhQueryCalls[0].url === `${XUNHUPAY_BASE}/payment/query.html`, 'the query call goes to /payment/query.html')
+const xhQueryForm = new URLSearchParams(xhQueryCalls[0].options.body)
+assert(xhQueryForm.get('out_trade_order') === 'ref_1' && xhQueryForm.get('appid') === '201906120000' && xhQueryForm.get('time') === '1756515723',
+  'the query is form-encoded (http_build_query in the vendor plugin), unlike the JSON create call')
+assert(xhQueryForm.get('hash') === xunhupayHash({ appid: '201906120000', out_trade_order: 'ref_1', time: '1756515723', nonce_str: '1234567890' }, 'smoke_app_secret'),
+  'the query is signed with the same scheme as the create call')
+assert(xhQueried.status === 'OD' && xhQueried.transaction_id === 'tx_1', 'the query returns the data object, not the envelope')
+
+// 异步通知。
+const xhSign = (data) => ({ ...data, hash: xunhupayHash(data, 'smoke_app_secret') })
+const xhNotify = {
+  trade_order_id: fxMerchantNo(order.id), plugins: 'xunhupay_alipay', appid: '201906120000',
+  status: 'OD', total_fee: '19.99', transaction_id: 'tx_smoke_1', open_order_id: 'oo_1', time: '1756515723'
+}
+const xhRemote = { errcode: 0, data: { status: 'OD', transaction_id: 'tx_remote_1', total_fee: '19.99' } }
+const xhVerify = (payload, config = {}, remote = xhRemote) =>
+  DRIVERS.xunhupay.verify({ payload, config, provider: 'xunhupay_alipay', fetchJson: async () => remote })
+
+const xhPaid = await xhVerify(xhSign(xhNotify))
+assert(xhPaid.paid === true && xhPaid.orderId === order.id, 'a hash-verified OD notify releases the order')
+assert(xhPaid.ack.ok === 'success' && xhPaid.ack.fail === 'failure',
+  'the vendor prints the literal success; any other body is read as a failed notify and redelivered')
+assert(xhPaid.expect.amountMinor === 1999 && xhPaid.expect.currency === 'CNY', 'total_fee is yuan and is compared against the order row')
+assert(xhPaid.providerOrderId === 'tx_remote_1', 'the authoritative transaction id comes from the re-query, not from the unverified body')
+assert(xhPaid.failed === false, 'no documented status means "failed", so a status we have never seen must never kill a pending order')
+
+const xhTampered = await xhVerify({ ...xhSign(xhNotify), total_fee: '0.01' })
+assert(xhTampered.reject?.status === 401 && xhTampered.ack.fail === 'failure', 'editing a signed field must fail the hash, not lower the price')
+assert((await xhVerify(xhNotify)).reject?.status === 401, 'a notify carrying no hash at all must be refused')
+assert((await xhVerify({ ...xhSign(xhNotify), hash: xunhupayHash(xhNotify, 'wrong_secret') })).reject?.status === 401, 'a hash computed with another secret must be refused')
+const xhNoRef = { status: 'OD', total_fee: '19.99' }
+assert((await xhVerify(xhSign(xhNoRef))).reject?.status === 400, 'a notify with no trade_order_id cannot be reconciled')
+const xhForeign = { ...xhNotify, plugins: 'xunhupay_wechat' }
+assert((await xhVerify(xhSign(xhForeign))).reject?.status === 401,
+  "the WeChat row's notify arriving on the Alipay endpoint must be refused, or the payment is booked against the wrong channel")
+const xhPending = await xhVerify(xhSign({ ...xhNotify, status: 'WP' }), {}, { errcode: 0, data: { status: 'WP' } })
+assert(xhPending.paid === false && xhPending.failed === false, 'a buyer who opened the cashier but has not paid stays pending')
+
+// 回查是补强而不是安全边界：验签已经证明「握有密钥」，所以查不通时不阻塞一笔已验签的足额付款。
+const xhOffline = await DRIVERS.xunhupay.verify({
+  payload: xhSign(xhNotify), config: {}, provider: 'xunhupay_alipay',
+  fetchJson: async () => { throw new Error('ETIMEDOUT') }
+})
+assert(xhOffline.paid === true && xhOffline.expect.amountMinor === 1999 && xhOffline.providerOrderId === 'tx_smoke_1',
+  'a hash-verified notify must still settle when the query endpoint is unreachable, falling back to the signed body')
+// 通知里带不带 total_fee 没有公开说明，所以回查是「金额从哪来」的兜底。
+const { total_fee: _noFee, ...xhFeeless } = xhNotify
+const xhViaQuery = await xhVerify(xhSign(xhFeeless))
+assert(xhViaQuery.paid === true && xhViaQuery.expect.amountMinor === 1999,
+  'with no total_fee on the notify the amount must come from the re-query, or an underpayment could not be caught at all')
+const xhNoAmount = await DRIVERS.xunhupay.verify({
+  payload: xhSign(xhFeeless), config: {}, provider: 'xunhupay_alipay',
+  fetchJson: async () => { throw new Error('ETIMEDOUT') }
+})
+assert(xhNoAmount.paid === true && xhNoAmount.expect === null, 'with no amount from either source the driver must claim none rather than invent one')
+// 查单权威：通知说 OD 而查单说没付，则按查单走。
+const xhContradicted = await xhVerify(xhSign(xhNotify), {}, { errcode: 0, data: { status: 'WP' } })
+assert(xhContradicted.paid === false, "the re-query is authoritative on status when it answers")
+assert((await xhVerify(xhSign(xhNotify), { requery: false })).providerOrderId === 'tx_smoke_1', 'public_config.requery=false must skip the extra read')
+
+// 换算过的订单走完整一圈。
+const xhFxNotify = { ...xhNotify, trade_order_id: fxRef, total_fee: '142.94' }
+const xhFxPaid = await xhVerify(xhSign(xhFxNotify), {}, { errcode: 0, data: { status: 'OD', transaction_id: 'tx_fx', total_fee: '142.94' } })
+assert(xhFxPaid.orderId === order.id && xhFxPaid.expect.currency === 'USD' && xhFxPaid.expect.amountMinor === 1999,
+  'the yuan actually paid folds back to the order currency at the rate locked at checkout, not at the rate on the day the notify arrives')
+const xhFxShort = await xhVerify(xhSign({ ...xhFxNotify, total_fee: '142.93' }), {}, { errcode: 0, data: { status: 'OD', total_fee: '142.93' } })
+assert(xhFxShort.expect.amountMinor < 1999, 'one fen short of the converted price must still be refused')
+// 厂商插件里 transacton_id 少一个 i，同一个文件另一处又写对了，所以两个都读。
+const xhTypo = await xhVerify(xhSign(xhNotify), {}, { errcode: 0, data: { status: 'OD', transacton_id: 'tx_typo' } })
+assert(xhTypo.providerOrderId === 'tx_typo', "the vendor's own misspelled field must still yield a transaction id")
+
+// NOWPayments（加密货币）。回调走回查而不是验签：它的 IPN 签名是 HMAC-SHA512 over json_encode(ksort(body))，
+// 而 PHP 的 json_encode 转义 / 和非 ASCII、JS 的 JSON.stringify 不转义，所以任何带 URL 的字段都对不上——
+// 厂商自己的插件为此要试四种序列化变体，而 Vercel 连原始字节都不留。
+process.env.NOWPAYMENTS_API_KEY = 'smoke_np_key'
+const npOrder = { ...order, provider: 'nowpayments' }
+const npBody = nowpaymentsInvoiceBody({ order: npOrder, artifact, siteUrl: site, config: {} })
+assert(npBody.price_amount === 19.99 && typeof npBody.price_amount === 'number' && npBody.price_currency === 'usd',
+  'price_amount is the fiat decimal as a number, which is what the SDK and the plugin both send')
+assert(nowpaymentsInvoiceBody({ order: { ...npOrder, amount_minor: 1999, currency: 'JPY' }, artifact, siteUrl: site }).price_amount === 1999,
+  'a zero-decimal currency must not be divided by 100')
+assert(npBody.order_id === order.id && npBody.ipn_callback_url === `${site}/v1/callback/nowpayments`,
+  'the IPN must reach our own endpoint on the row that created the invoice')
+assert(npBody.success_url === `${site}/order?order_id=${order.id}&paid=1` && npBody.cancel_url === `${site}/order?order_id=${order.id}`,
+  'the buyer must land back on the order page either way')
+assert(npBody.pay_currency === undefined && nowpaymentsInvoiceBody({ order, artifact, siteUrl: site, config: { pay_currency: 'USDTTRC20' } }).pay_currency === 'usdttrc20',
+  'the coin is the buyer\'s choice unless public_config pins one')
+
+const npCalls = []
+const npCreated = await DRIVERS.nowpayments.create({
+  order: npOrder, artifact, siteUrl: site, config: {},
+  fetchJson: async (url, options) => { npCalls.push({ url, options }); return { id: 5524759814, invoice_url: 'https://nowpayments.io/payment/?iid=5524759814' } }
+})
+assert(npCalls[0].url === `${NOWPAYMENTS_BASE}/invoice` && npCalls[0].options.headers['x-api-key'] === 'smoke_np_key',
+  'the key rides in x-api-key, which is the header the generic create_url path cannot send — hence a driver')
+assert(npCalls[0].options.headers['Content-Type'] === 'application/json', 'the invoice endpoint takes JSON')
+assert(npCreated.checkoutUrl === 'https://nowpayments.io/payment/?iid=5524759814' && npCreated.providerOrderId === '5524759814',
+  'the buyer goes to the hosted invoice, and the row holds the invoice id until a payment exists')
+let npThrew = ''
+try { await DRIVERS.nowpayments.create({ order: npOrder, artifact, siteUrl: site, config: {}, fetchJson: async () => ({ message: 'Invalid API key' }) }) } catch (error) { npThrew = error.message }
+assert(npThrew === 'Invalid API key', 'an invoice that came back without a URL must fail loudly rather than leave a dead order')
+
+const npSandbox = []
+await DRIVERS.nowpayments.create({
+  order: npOrder, artifact, siteUrl: site, config: { environment: 'sandbox' },
+  fetchJson: async (url) => { npSandbox.push(url); return { id: 1, invoice_url: 'https://sandbox.nowpayments.io/payment/?iid=1' } }
+})
+assert(npSandbox[0] === `${NOWPAYMENTS_SANDBOX_BASE}/invoice` && NOWPAYMENTS_SANDBOX_BASE === 'https://api-sandbox.nowpayments.io/v1',
+  "api-sandbox.nowpayments.io is the host that answers; the SDK's api.sandbox spelling does not complete a TLS handshake at all")
+
+const npRemote = {
+  payment_id: 5077125051, payment_status: 'finished', order_id: order.id,
+  price_amount: 19.99, price_currency: 'usd', actually_paid: 0.00031, pay_currency: 'btc'
+}
+const npVerify = (payload, remote = npRemote, config = {}) => {
+  const calls = []
+  return DRIVERS.nowpayments.verify({ payload, config, fetchJson: async (url, options) => { calls.push({ url, options }); return remote } })
+    .then((outcome) => ({ outcome, calls }))
+}
+const { outcome: npPaid, calls: npReads } = await npVerify({ payment_id: 5077125051, payment_status: 'waiting', order_id: 'not-this-one' })
+assert(npReads[0].url === `${NOWPAYMENTS_BASE}/payment/5077125051`, 'the callback is only a trigger; the state is read back from the API')
+assert(npPaid.paid === true && npPaid.orderId === order.id,
+  'the order id and the status both come from the re-query, so a forged callback body cannot redirect a payment or invent one')
+assert(npPaid.expect.amountMinor === 1999 && npPaid.expect.currency === 'USD',
+  'the invoiced fiat amount is what the order row can be compared against; actually_paid is denominated in the coin')
+assert(npPaid.providerOrderId === '5077125051', 'the row ends up holding the payment id, which is what the NOWPayments dashboard searches on')
+assert((await npVerify({ payment_id: 1 }, { ...npRemote, price_amount: 2000, price_currency: 'jpy' })).outcome.expect.amountMinor === 2000,
+  'a zero-decimal currency must not be multiplied by 100, or an exact payment would 409')
+for (const pending of ['waiting', 'confirming', 'confirmed', 'sending']) {
+  const { outcome } = await npVerify({ payment_id: 1 }, { ...npRemote, payment_status: pending })
+  assert(outcome.paid === false && outcome.failed === false, `${pending} is still in flight on-chain and must stay pending rather than be guessed either way`)
+}
+const { outcome: npPartial } = await npVerify({ payment_id: 1 }, { ...npRemote, payment_status: 'partially_paid', actually_paid: 0.0001 })
+assert(npPartial.paid === false, 'partially_paid means the money arrived and is not enough — it must never release the order')
+for (const dead of ['failed', 'expired', 'refunded']) {
+  const { outcome } = await npVerify({ payment_id: 1 }, { ...npRemote, payment_status: dead })
+  assert(outcome.failed === true && outcome.paid === false, `${dead} must be marked failed rather than left pending forever`)
+}
+const { outcome: npNoId } = await npVerify({ invoice_id: 5524759814, payment_status: 'finished' })
+assert(npNoId.reject?.status === 400, 'an invoice-level callback carries nothing that can be re-queried — /invoice/{id} does not exist as a read endpoint — so it must be refused rather than acknowledged')
+
 assert(driverFor({ driver: 'stripe' }) === DRIVERS.stripe && driverFor({ driver: 'PayPal' }) === DRIVERS.paypal, 'the driver name in public_config must resolve case-insensitively')
 assert(driverFor({ driver: 'Alipay' }) === DRIVERS.alipay, 'alipay resolves through the driver table now that it signs its own requests; on the generic path it could only ever get Invalid signature')
-assert(driverFor({}) === null && driverFor(null) === null && driverFor({ driver: 'wechat' }) === null, 'the remaining seven providers must keep using the generic create_url path')
+assert(driverFor({ driver: 'XunHuPay' }) === DRIVERS.xunhupay && driverFor({ driver: 'nowpayments' }) === DRIVERS.nowpayments,
+  'the two new rows resolve to drivers; a payment_providers row without one cannot verify a callback at all')
+assert(driverFor({}) === null && driverFor(null) === null && driverFor({ driver: 'wechat' }) === null,
+  'the seven placeholder rows resolve to nothing, which is the honest answer: the generic create_url path can post a body but its callback branch hashes a re-serialized one, so it cannot verify any real provider')
 for (const [name, driver] of Object.entries(DRIVERS)) {
   assert(typeof driver.create === 'function' && typeof driver.verify === 'function', `${name} driver must be able to create a checkout and verify a callback`)
 }
@@ -941,6 +1176,28 @@ assert(rankOf('read') >= RANK.MEMBER, 'read must clear the order-visibility floo
 assert(rankOf('default') < RANK.MEMBER, 'an ordinary buyer must not clear it, or every buyer sees every order')
 assert(/create policy own_orders_read[\s\S]{0,200}can_view_orders\(\)/.test(schemaSql),
   'the orders read policy must go through can_view_orders(), which is where §12.2 is decided')
+
+// 支付渠道行和驱动表必须对得上。这一段是拿 schema.sql 对 DRIVERS，因为两边分开写：一个 driver 名字打错了
+// 不会报错，只会让那一行安静地退回没有驱动的状态——买家点「去支付」拿到一个走不通的地址，或者更糟，回调落进
+// 通用 HMAC 分支，一笔已付款永远标不上。
+const seededDrivers = [...schemaSql.matchAll(/"driver"\s*:\s*"([^"]+)"/g)].map((m) => m[1])
+assert(seededDrivers.length >= 6, 'schema.sql 必须把每个有驱动的渠道的 public_config.driver 都种进去')
+for (const name of new Set(seededDrivers)) {
+  assert(DRIVERS[name], `schema.sql 里种了 driver="${name}"，但 payments.mjs 的 DRIVERS 里没有这个名字`)
+}
+for (const name of Object.keys(DRIVERS)) {
+  assert(seededDrivers.includes(name), `payments.mjs 有 ${name} 驱动，但 schema.sql 里没有任何一行用它——那这个驱动谁都调不到`)
+}
+// 虎皮椒两行共用一套密钥，靠 plugins 分通道；两行的 plugins 相同就等于两个端点互认对方的通知。
+assert(/"plugins"\s*:\s*"xunhupay_alipay"/.test(schemaSql) && /"plugins"\s*:\s*"xunhupay_wechat"/.test(schemaSql),
+  '虎皮椒的支付宝行和微信行必须各有自己的 plugins，否则一个通道的通知能在另一个通道的端点上验过')
+// 每一行都要列出自己要的环境变量，那一列是「环境变量」页据以生成输入框的唯一来源，漏一个就没有地方填。
+for (const secret of ['XUNHUPAY_APPID', 'XUNHUPAY_APP_SECRET', 'NOWPAYMENTS_API_KEY']) {
+  assert(schemaSql.includes(secret), `${secret} 必须出现在 secret_env_names 里，否则后台没有它的输入框`)
+}
+// 那七个占位行不能删：orders.provider 有外键指向这张表，删一行就带走历史订单的渠道信息。
+assert(/provider\s+text\s+not null\s+references public\.payment_providers\(id\)/.test(schemaSql),
+  'orders.provider 的外键是「占位行只能改说明、不能删」的原因，这条断言就是这句话的凭据')
 
 // 枚举事务陷阱：alter type ... add value 之后，同一事务里不能把新值当字面量用，而 schema.sql 是整段跑的。
 // 所以三个新组名不能出现在任何 = 'xxx' 或 in ('xxx') 的比较里——只能经过 g::text。
@@ -4390,8 +4647,15 @@ console.log('CS logic: OK')
   await sxListMessages(sxDbCap, sxAsUser, { session_id: sxSid, limit: 99999 })
   const sxCapSel = sxDbCap.calls.find(c => c.table === 'cs_messages' && c.op === 'select')
   assert(sxCapSel.limit === 500, '超大 limit 夹到 500')
-  assert(sxCapSel.order?.col === 'created_at' && sxCapSel.order.ascending === true,
-    '按时间正序——倒序的话前端得自己翻一遍，而翻错了对话顺序就乱了')
+  assert(sxCapSel.orders[0]?.col === 'created_at' && sxCapSel.orders[0].ascending === false,
+    '先取最新消息窗口，避免长会话永远停留在最早 200 条')
+  assert(sxCapSel.orders[1]?.col === 'id', '同一时间的消息用 ID 稳定排序')
+  const sxLatest = await sxListMessages(recorder({
+    cs_sessions: { data: sxOpen, error: null },
+    cs_messages: { data: [{ ...sxMsgRow, body: 'message 201' }, { ...sxMsgRow, body: 'message 200' }], error: null }
+  }), sxAsUser, { session_id: sxSid, limit: 2 })
+  assert(sxLatest.body.messages.map(m => m.body).join(',') === 'message 200,message 201',
+    '倒序查询的最新窗口在 API 内恢复为时间正序')
 
   // 已读：两侧各一列。共用一列的话，客服打开会话会把用户那侧也标成已读，
   // 于是用户的红点在他没看的时候消失了。
@@ -5309,6 +5573,5 @@ assert(!cronFlat.includes("setting_num('audit_log_retention_days'"),
 assert(cronSql.includes('audit_log_retention_days'), 'cron.sql 要写明这个空缺是有意留的')
 
 console.log('cron.sql: OK')
-
 
 

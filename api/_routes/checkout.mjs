@@ -26,7 +26,7 @@ export default async function handler(req, res) {
       auth.db.from('artifacts').select('*').eq('id', input.artifact_id).eq('active', true).single(),
       auth.db.from('payment_providers').select('*').eq('id', input.provider).eq('enabled', true).single()
     ])
-    if (!artifact || !provider) return send(res, 404, { error: 'Artifact or payment provider unavailable' })
+    if (!artifact) return send(res, 404, { error: 'Artifact unavailable' })
     // One pending order per account. This check is for the message — the guarantee is the partial
     // unique index `one_pending_order_per_user`, which is what holds when two clicks race. Without a
     // cap, an abandoned checkout leaves a row nobody will ever pay, and the buyer accumulates orders
@@ -41,6 +41,17 @@ export default async function handler(req, res) {
       code: input.coupon_code, artifact, userId: auth.user.id, userGroup: auth.group
     })
     if (!priced.ok) return send(res, priced.status, { error: priced.error })
+
+    if (priced.fields.amount_minor === 0) {
+      const { data: order, error } = await auth.db.rpc('checkout_zero_order', {
+        p_user: auth.user.id, p_artifact: artifact.id, p_coupon: priced.coupon?.id || null,
+        p_code: priced.fields.coupon_code, p_list: artifact.price_minor
+      })
+      if (error) return send(res, error.code === '23505' || error.code === 'P0001' ? 409 : 503,
+        { error: '零元订单创建失败，请刷新商品和优惠券后重试' })
+      return send(res, 201, { order, configured: true })
+    }
+    if (!provider) return send(res, 404, { error: 'Payment provider unavailable' })
 
     const { data: order, error } = await auth.db.from('orders').insert({
       user_id: auth.user.id, artifact_id: artifact.id, sku: artifact.sku, quantity: 1,

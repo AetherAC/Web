@@ -55,9 +55,10 @@ export async function listMessages(db, auth, input) {
   const caps = sessionCapabilities(session, auth)
   if (!caps.can_see) return { status: 403, body: { error: '无权查看该会话' } }
 
-  const limit = Math.min(Math.max(Number(input?.limit) || 200, 1), 500)
+  const limit = Math.min(Math.max(Math.trunc(Number(input?.limit)) || 200, 1), 500)
+  if (input?.after && !Number.isFinite(Date.parse(input.after))) return { status: 400, body: { error: 'Invalid message cursor' } }
   let query = db.from('cs_messages').select(MESSAGE_COLUMNS)
-    .eq('session_id', sessionId).order('created_at', { ascending: true }).limit(limit)
+    .eq('session_id', sessionId).order('created_at', { ascending: Boolean(input?.after) }).order('id', { ascending: Boolean(input?.after) }).limit(limit)
   if (!caps.can_see_revisions) query = query.eq('visible_to_user', true)
   if (input?.after) query = query.gt('created_at', String(input.after))
 
@@ -74,7 +75,9 @@ export async function listMessages(db, auth, input) {
     revisions = revRows || []
   }
 
-  const messages = (rows || []).map(row => presentMessage(
+  // Initial refresh must show the latest window, not permanently stop at message 200.
+  const chronological = input?.after ? (rows || []) : [...(rows || [])].reverse()
+  const messages = chronological.map(row => presentMessage(
     row, auth, revisions ? revisions.filter(r => r.message_id === row.id) : null))
   // 这个接口是两侧唯一每次都会拉的东西（Realtime 推送之后前端也回到这里），所以显示名挂在它的响应上：
   // 用户要看到接待自己的客服叫什么，客服要看到用户叫什么，而两边的浏览器都被 profiles_read 挡在外面。
@@ -93,6 +96,7 @@ export async function listMessages(db, auth, input) {
  * 在读 admin_mode。
  */
 export async function sendMessage(db, auth, input) {
+  if (input?.client_message_id && !UUID.test(input.client_message_id)) return { status: 400, body: { error: 'Invalid message ID' } }
   const sessionId = String(input?.session_id || '')
   if (!UUID.test(sessionId)) return { status: 400, body: { error: 'session_id 必须是 UUID' } }
   const session = await loadSession(db, sessionId)
@@ -131,6 +135,7 @@ export async function sendMessage(db, auth, input) {
   const senderId = speakAsAgent ? session.agent_id : auth.userId
 
   const message = await insertMessage(db, session, {
+    id: input?.client_message_id,
     senderId, senderRole,
     body: prepared.body, format: prepared.format, attachments: prepared.attachments,
     authoredBy: senderId === auth.userId ? null : auth.userId
@@ -140,9 +145,14 @@ export async function sendMessage(db, auth, input) {
   // §3.1 关键词自动回复：只对用户发的消息触发。客服说了「退款」不该弹一段退款说明给用户。
   let auto = null
   if (caps.is_owner) {
-    auto = await deliverAutoReply(db, { ...session, agent_id: session.agent_id }, {
-      trigger: 'keyword', text: prepared.body
-    })
+    try {
+      auto = await deliverAutoReply(db, { ...session, agent_id: session.agent_id }, {
+        trigger: 'keyword', text: prepared.body
+      })
+    } catch (error) {
+      // The user's message is already committed. A failed bot reply must not invite duplicate sends.
+      console.error('Auto reply failed after message commit', { session: session.id, message: message.id })
+    }
   }
 
   return {
